@@ -9,6 +9,10 @@ def connection-completer [] {
   cfg show | transpose database configuration | get database | uniq
 }
 
+def driver-completer [] {
+  cfg show | transpose connection spec | get spec.driver | uniq
+}
+
 
 def database-completer [] {
   let c = cfg show -r -c | default {} | get -o conf
@@ -40,6 +44,7 @@ export def main [
   --file(-f): string@queryfile-completer
   --connection(-c): string@connection-completer
 
+  --driver(-D): string@driver-completer
   --database(-d): string@database-completer
   --port(-p): int
   --user(-u): string
@@ -78,8 +83,9 @@ export def main [
     $conf = cfg show -r -c | get conf
   }
 
-  let executor = closures executors | get $conf.driver
-  let formatter = closures formatters | get $conf.driver
+  let driver = $driver | default $conf.driver
+  let executor = closures executors | get $driver
+  let formatter = closures formatters | get $driver
 
   let result = do $executor $conf $q $database $port $user $host
   if $result.exit_code != 0 {
