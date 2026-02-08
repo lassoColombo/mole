@@ -42,45 +42,47 @@ export def danger-regex [] {
 export def executors [] {
   {
 
-    mysql: {|conf, query, database?, port?, user?, host?|
+    mysql: {|conf, query, database?, port?, user?, host?, password?|
       with-env {
-        MYSQL_PWD: $conf.password
+        MYSQL_PWD: ($password | default $conf.password)
       } {
         $query | mysql -u ($user | default $conf.user) -h ($host | default $conf.host) -P ($port | default $conf.port) -D ($database | default $conf.database)
         | complete
-
       }
     }
 
-    postgres: {|conf, query, database?, port?, user?, host?|
+    postgres: {|conf, query, database?, port?, user?, host?, password?|
       with-env {
-        PGPASSWORD: $conf.password
+        PGPASSWORD: ($password | default $conf.password)
       } {
         psql -h ($host | default $conf.host) -p ($port | default $conf.port) -U ($user | default $conf.user) -d ($database | default $conf.database) --csv -q -c $query 
         | complete
       }
     }
 
-    vlogs: {|conf, query, database?, port?, user?, host?|
-      curl -k --user $"($conf.user):($conf.password)" -d $"query=($query)" ($host | default $conf.host) | complete
+    vlogs: {|conf, query, database?, port?, user?, host?, password?|
+      curl -k --user $"($user | default $conf.user):($password | default $conf.password)" -d $"query=($query)" ($host | default $conf.host) | complete
     }
 
-    mongo: {|conf, query, database?, port?, user?, host?|
-      | mongosh $"mongodb://($user | default $conf.user):($conf.password)@($host | default $conf.host):($port | default $conf.port)/($database | default $conf.database)?authSource=($conf.database)" --quiet --eval (
-        {query: $query} | format pattern '
-        EJSON.stringify(
-          {query},
-          null,
-          2
-        )
-        '
-      )
+    mongo: {|conf, query, database?, port?, user?, host?, password?|
+      let uri = $"mongodb://($user | default $conf.user):($password | default $conf.password)@($host | default $conf.host):($port | default $conf.port)/($database | default $conf.database)?authSource=($conf.database)"
+
+      let js = {query: $query} | format pattern "
+      (() => {{
+      const result = {query};
+      if (result?.toArray) {{
+      return EJSON.stringify(result.toArray(), null, 2);
+      }}
+      return EJSON.stringify(result, null, 2);
+      }})()"
+
+      mongosh $uri --quiet --eval $js
       | complete
     }
 
-    redis: {|conf, query, database?, port?, user?, host?|
+    redis: {|conf, query, database?, port?, user?, host?, password?|
       with-env {
-        REDISCLI_AUTH: $conf.password
+        REDISCLI_AUTH: ($password | default $conf.password)
       } {
         let s = $query | split row -r '\s+'
         let command = $s.0
@@ -88,6 +90,10 @@ export def executors [] {
         redis-cli -h ($host | default $conf.host) -p ($port | default $conf.port) -n ($database | default $conf.database) --raw $command ...$args
         | complete
       }
+    }
+
+    alertmanager: {|conf, query, database?, port?, user?, host?, password?|
+      http get $"($host | default $conf.host)/api/v2/alerts?active=true&silenced=true&inhibited=true&unprocessed=true"
     }
 
   }
@@ -114,6 +120,10 @@ export def formatters [] {
       }
     }
 
+    alertmanager: {
+      $in | from json
+    }
+
     mongo: {
       $in | from json
     }
@@ -135,7 +145,7 @@ export def formatters [] {
 export def database-formatters [] {
   {
 
-    mysql: {$in | lines}
+    mysql: {$in | from tsv | get Database}
 
     postgres: {$in | from csv | get Name}
 

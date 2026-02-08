@@ -49,6 +49,7 @@ export def main [
   --port(-p): int
   --user(-u): string
   --host(-h): string
+  --password(-P): string
 ] {
   if ($connection | is-not-empty) {
     cfg set $connection
@@ -87,7 +88,7 @@ export def main [
   let executor = closures executors | get $driver
   let formatter = closures formatters | get $driver
 
-  let result = do $executor $conf $q $database $port $user $host
+  let result = do $executor $conf $q $database $port $user $host $password
   if $result.exit_code != 0 {
     error make {msg: $"($result.stderr)\n($result.stdout)"}
   }

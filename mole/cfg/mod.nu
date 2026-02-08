@@ -41,7 +41,8 @@ export def --env set [
   let dbname = if ($dbname | is-not-empty) {$dbname} else {
     show 
     | transpose database configuration 
-    | sk --format {$in.database} --preview {$in.configuration}
+    | input list --fuzzy --display database
+    # | sk --format {$in.database} --preview {$in.configuration}
     | get database
   }
   $env.SQL_CURRENT_DATABASE = $dbname
