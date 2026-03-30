@@ -3,11 +3,11 @@ def connection-completer [] {
 }
 
 export def querydir [] {
-  [$env.HOME .config moles] | path join
+  [$env.HOME .config mole] | path join
 }
 
 export def file [] {
-  [$env.HOME .config moles.yml] | path join
+  [$env.HOME .config mole.yml] | path join
 }
 
 export def show [db?: string@connection-completer, --current(-c), --raw(-r)] {
@@ -20,10 +20,10 @@ export def show [db?: string@connection-completer, --current(-c), --raw(-r)] {
   if $current {
     let name = $env.SQL_CURRENT_DATABASE? | default ""
     let conf = $cfg | get -o $name | do $fmt
-    return {name: $name conf: $conf}
+    if ($conf | is-empty) {return {}} else {return {$name: $conf}}
   }
   if ($db | is-not-empty) {
-    return ($cfg | get -o $db | do $fmt)
+    return {$db: ($cfg | get -o $db | do $fmt)}
   }
   $cfg 
   | transpose connection conf 
@@ -42,7 +42,6 @@ export def --env set [
     show 
     | transpose database configuration 
     | input list --fuzzy --display database
-    # | sk --format {$in.database} --preview {$in.configuration}
     | get database
   }
   $env.SQL_CURRENT_DATABASE = $dbname
