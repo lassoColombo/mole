@@ -1,4 +1,4 @@
-export use ./cfg
+use ./cfg
 use ./helpers.nu
 
 export def queryfile [] {

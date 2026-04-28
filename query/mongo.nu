@@ -17,7 +17,7 @@ export def main [
   let conf = helpers resolve-conf $connection
   let q = helpers resolve-query $query $file (cfg querydir)
   helpers danger-check $q
-  let uri = $"mongodb://($user | default $conf.user):($password | default $conf.password)@($host | default $conf.host):($port | default $conf.port)/($database | default $conf.database)?authSource=($conf.database)"
+  let uri = $"mongodb://($user | default $conf.user):($password | default $conf.password)@($host | default $conf.host):($port | default $conf.port)/($database | default $conf.database)?authSource=($conf.database)&socketTimeoutMS=0"
   let js = {query: $q} | format pattern "(() => {{
     const result = {query};
     if (result?.toArray) {{ return EJSON.stringify(result.toArray(), null, 2); }}
