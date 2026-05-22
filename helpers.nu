@@ -24,7 +24,7 @@ export def resolve-query [query?: string, file?: string, basedir?: string] {
   open -r $tmp
 }
 
-export def danger-check [q: string] {
+export def danger-check [q: string, --yes(-y)] {
   let danger_regex = '(?i)\b(
   delete|drop|truncate|remove|erase|destroy|purge|
   update|insert|replace|merge|
@@ -45,7 +45,7 @@ export def danger-check [q: string] {
   collection\.|index\.drop|index\.rebuild|
   rmdir|unlink
   )\b'
-  if $q =~ $danger_regex {
+  if $q =~ $danger_regex and (not $yes) {
     let res = input $"(ansi yellow)This query might contain dangerous instructions. Execute? [y/N](ansi reset)" --numchar 1 --default 'n'
     if $res != y {
       print $"(ansi cyan)Aborting(ansi reset)"

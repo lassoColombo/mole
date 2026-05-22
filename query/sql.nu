@@ -13,6 +13,7 @@ export def main [
   --user(-u): string
   --host(-h): string
   --password(-P): string
+  --yes(-y) # Skip dangerous query confirmation prompt
 ] {
   if ($connection | is-not-empty) { cfg set $connection }
   let conf = helpers resolve-conf $connection
@@ -21,7 +22,7 @@ export def main [
     error make {msg: $"'($driver)' is not a SQL driver. Use `mole mongo`, `mole redis`, etc."}
   }
   let q = helpers resolve-query $query $file (cfg querydir)
-  helpers danger-check $q
+  if $yes { helpers danger-check -y $q } else { helpers danger-check $q }
   let result = match $driver {
     "mysql" => (
       with-env { MYSQL_PWD: ($password | default $conf.password) } {
