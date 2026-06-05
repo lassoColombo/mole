@@ -1,3 +1,5 @@
+use ../../picky
+
 def connection-completer [] {
   show | transpose database configuration | get database | uniq
 }
@@ -38,11 +40,13 @@ export def edit [] {
 export def --env set [
   dbname?: string@connection-completer
 ] {
-  let dbname = if ($dbname | is-not-empty) {$dbname} else {
-    show 
-    | transpose database configuration 
-    | sk --format {$in.database} --preview {$in.configuration | to text}
-    | get database
+  let dbname = if ($dbname | is-not-empty) { $dbname } else {
+    show
+    | transpose database configuration
+    | picky --fuzzy --display database
+    | get -o database
   }
-  $env.SQL_CURRENT_DATABASE = $dbname
+  if ($dbname | is-not-empty) {
+    $env.SQL_CURRENT_DATABASE = $dbname
+  }
 }
