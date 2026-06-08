@@ -1,4 +1,5 @@
 use ./cfg
+use ./drivers.nu
 
 export def resolve-conf [connection?: string] {
   if ($connection | is-not-empty) {
@@ -52,4 +53,40 @@ export def danger-check [q: string, --yes(-y)] {
       exit 0
     }
   }
+}
+
+# Merge non-null fields from `overrides` into the input record (right-biased).
+export def apply-overrides [overrides: record]: record -> record {
+  let base = $in
+  $overrides
+  | items {|k, v| {key: $k, value: $v}}
+  | where value != null
+  | reduce --fold $base {|it, acc| $acc | upsert $it.key $it.value }
+}
+
+# Bundle the common per-query prelude: connection lookup, CLI-override merge, query resolution, danger check.
+# Returns { conf, base, query } where `conf` is the merged config and `base` is the original (for fields like mongo authSource).
+export def prepare [
+  --connection(-c): string  # Named connection from mole.yml
+  --query(-q): string       # Inline query string
+  --file(-f): string        # Path to a query file
+  --overrides: record = {}  # CLI flag values to merge over the named connection
+  --yes(-y)                 # Skip the dangerous-query confirmation prompt
+]: nothing -> record {
+  if ($connection | is-not-empty) { cfg set $connection }
+  let base = resolve-conf $connection
+  let conf = $base | apply-overrides $overrides
+  let q = resolve-query $query $file (cfg querydir)
+  danger-check $q --yes=$yes
+  { conf: $conf, base: $base, query: $q }
+}
+
+# Execute a prepared ctx ({conf, base, query}) against the given driver.
+# Looks up the driver entry in the registry, runs its `exec`, then `parse`.
+export def run [driver: string]: record -> any {
+  let ctx = $in
+  let d = drivers lookup $driver
+  let result = do $d.exec $ctx
+  if $result.exit_code != 0 { error make {msg: $"($result.stderr)\n($result.stdout)"} }
+  try { do $d.parse $result.stdout } catch { $result.stdout }
 }

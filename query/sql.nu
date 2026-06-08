@@ -1,45 +1,29 @@
 use "../cfg"
 use "../helpers.nu"
 use "../completers.nu"
+use "../drivers.nu"
 
 # Run a query against a SQL datasource (mysql, postgres)
 export def main [
-  --query(-q): string
-  --file(-f): string@"completers queryfile"
-  --connection(-c): string@"completers sql-connection"
-  --driver(-D): string@"completers sql-driver"
-  --database(-d): string@"completers sql-database"
-  --port(-p): int
-  --user(-u): string
-  --host(-h): string
-  --password(-P): string
-  --yes(-y) # Skip dangerous query confirmation prompt
+  --query(-q): string                                  # Inline SQL query
+  --file(-f): string@"completers queryfile"            # Path to a query file (relative to mole config dir)
+  --connection(-c): string@"completers sql-connection" # Named connection from ~/.config/mole.yml
+  --driver(-D): string@"completers sql-driver"         # Override the driver (mysql or postgres)
+  --database(-d): string@"completers sql-database"     # Override the database name
+  --port(-p): int                                      # Override the port
+  --user(-u): string                                   # Override the user
+  --host(-h): string                                   # Override the host
+  --password(-P): string                               # Override the password
+  --yes(-y)                                            # Skip the dangerous-query confirmation prompt
 ] {
-  if ($connection | is-not-empty) { cfg set $connection }
-  let conf = helpers resolve-conf $connection
-  let driver = $driver | default $conf.driver
-  if $driver not-in [mysql postgres] {
-    error make {msg: $"'($driver)' is not a SQL driver. Use `mole mongo`, `mole redis`, etc."}
+  let overrides = {
+    driver: $driver, database: $database, port: $port,
+    user: $user, host: $host, password: $password
   }
-  let q = helpers resolve-query $query $file (cfg querydir)
-  if $yes { helpers danger-check -y $q } else { helpers danger-check $q }
-  let result = match $driver {
-    "mysql" => (
-      with-env { MYSQL_PWD: ($password | default $conf.password) } {
-        $q | mysql -u ($user | default $conf.user) -h ($host | default $conf.host) -P ($port | default $conf.port) -D ($database | default $conf.database) | complete
-      }
-    )
-    "postgres" => (
-      with-env { PGPASSWORD: ($password | default $conf.password) } {
-        psql -h ($host | default $conf.host) -p ($port | default $conf.port) -U ($user | default $conf.user) -d ($database | default $conf.database) --csv -q -c $q | complete
-      }
-    )
+  let prep = helpers prepare --connection $connection --query $query --file $file --yes=$yes --overrides $overrides
+  let sql_drivers = drivers family "sql"
+  if $prep.conf.driver not-in $sql_drivers {
+    error make {msg: $"'($prep.conf.driver)' is not a SQL driver. Use `mole mongo`, `mole redis`, etc."}
   }
-  if $result.exit_code != 0 { error make {msg: $"($result.stderr)\n($result.stdout)"} }
-  try {
-    match $driver {
-      "mysql" => ($result.stdout | from tsv)
-      "postgres" => ($result.stdout | from csv)
-    }
-  } catch { $result.stdout }
+  $prep | helpers run $prep.conf.driver
 }

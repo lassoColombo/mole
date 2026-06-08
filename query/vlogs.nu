@@ -4,26 +4,15 @@ use "../completers.nu"
 
 # Run a LogsQL query against a VictoriaLogs datasource
 export def main [
-  --query(-q): string
-  --file(-f): string@"completers queryfile"
-  --connection(-c): string@"completers vlogs-connection"
-  --host(-h): string
-  --user(-u): string
-  --password(-P): string
+  --query(-q): string                                    # Inline LogsQL query
+  --file(-f): string@"completers queryfile"              # Path to a query file (relative to mole config dir)
+  --connection(-c): string@"completers vlogs-connection" # Named connection from ~/.config/mole.yml
+  --host(-h): string                                     # Override the host (full URL)
+  --user(-u): string                                     # Override the user
+  --password(-P): string                                 # Override the password
+  --yes(-y)                                              # Skip the dangerous-query confirmation prompt
 ] {
-  if ($connection | is-not-empty) { cfg set $connection }
-  let conf = helpers resolve-conf $connection
-  let q = helpers resolve-query $query $file (cfg querydir)
-  helpers danger-check $q
-  let result = curl -k -"($user | default $conf.user):($password | default $conf.password)" -d $"query=($q)" ($host | default $conf.host) | complete
-  if $result.exit_code != 0 { error make {msg: $"($result.stderr)\n($result.stdout)"} }
-  try {
-    $result.stdout
-    | from json -o
-    | each {|l|
-      $l
-      | update _time ($l._time | into datetime)
-      | update _stream ($l._stream | str trim --left --char '{' | str trim --right --char '}' | parse --regex '(?<label>[^=,]+)="(?<value>[^"]*)"')
-    }
-  } catch { $result.stdout }
+  let overrides = { host: $host, user: $user, password: $password }
+  let prep = helpers prepare --connection $connection --query $query --file $file --yes=$yes --overrides $overrides
+  $prep | helpers run "vlogs"
 }

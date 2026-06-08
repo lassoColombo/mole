@@ -1,5 +1,6 @@
 use ./cfg
 use ./helpers.nu
+use ./drivers.nu
 
 export def queryfile [] {
   let base = cfg querydir
@@ -14,36 +15,23 @@ def connection-completer-for [drivers: list<string>] {
   | get connection
 }
 
-export def sql-driver [] { [mysql postgres] }
-export def sql-connection [] { connection-completer-for (sql-driver) }
-export def mongo-connection [] { connection-completer-for [mongo] }
-export def redis-connection [] { connection-completer-for [redis] }
+export def sql-driver [] { drivers family "sql" }
+export def sql-connection [] { connection-completer-for (drivers family "sql") }
+export def mongo-connection [] { connection-completer-for (drivers family "mongo") }
+export def redis-connection [] { connection-completer-for (drivers family "redis") }
+export def vlogs-connection [] { connection-completer-for (drivers family "vlogs") }
 export def alertmanager-connection [] { connection-completer-for [alertmanager] }
-export def vlogs-connection [] { connection-completer-for [vlogs] }
 
 export def sql-database [] {
   let c = cfg show -r -c | transpose name conf | first | get -o conf
   if ($c | is-empty) { return [] }
-  let q = match $c.driver {
-    "mysql" => "show databases;"
-    "postgres" => "\\l"
-    _ => { return [] }
-  }
-  let result = match $c.driver {
-    "mysql" => (
-      with-env { MYSQL_PWD: $c.password } {
-        $q | mysql -u $c.user -h $c.host -P $c.port | complete
-      }
-    )
-    "postgres" => (
-      with-env { PGPASSWORD: $c.password } {
-        psql -h $c.host -p $c.port -U $c.user --csv -q -c $q | complete
-      }
-    )
-  }
+  let d = try { drivers lookup $c.driver } catch { return [] }
+  if ($d.list_databases? | is-empty) { return [] }
+  let result = do $d.list_databases $c
   if $result.exit_code != 0 { return [] }
-  match $c.driver {
-    "mysql" => ($result.stdout | from tsv | get Database)
-    "postgres" => ($result.stdout | from csv | get Name)
+  match $d.db_parser {
+    "tsv" => ($result.stdout | from tsv | get $d.db_column)
+    "csv" => ($result.stdout | from csv | get $d.db_column)
+    _ => []
   }
 }

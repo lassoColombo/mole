@@ -4,30 +4,19 @@ use "../completers.nu"
 
 # Run a command against a Redis datasource
 export def main [
-  --query(-q): string
-  --file(-f): string@"completers queryfile"
-  --connection(-c): string@"completers redis-connection"
-  --database(-d): string
-  --port(-p): int
-  --user(-u): string
-  --host(-h): string
-  --password(-P): string
+  --query(-q): string                                    # Inline Redis command
+  --file(-f): string@"completers queryfile"              # Path to a query file (relative to mole config dir)
+  --connection(-c): string@"completers redis-connection" # Named connection from ~/.config/mole.yml
+  --database(-d): string                                 # Override the database index
+  --port(-p): int                                        # Override the port
+  --user(-u): string                                     # Override the user
+  --host(-h): string                                     # Override the host
+  --password(-P): string                                 # Override the password
+  --yes(-y)                                              # Skip the dangerous-query confirmation prompt
 ] {
-  if ($connection | is-not-empty) { cfg set $connection }
-  let conf = helpers resolve-conf $connection
-  let q = helpers resolve-query $query $file (cfg querydir)
-  helpers danger-check $q
-  let s = $q | split row -r '\s+'
-  let result = with-env { REDISCLI_AUTH: ($password | default $conf.password) } {
-    redis-cli -h ($host | default $conf.host) -p ($port | default $conf.port) -n ($database | default $conf.database) --raw $s.0 ...($s | skip 1) | complete
+  let overrides = {
+    database: $database, port: $port, user: $user, host: $host, password: $password
   }
-  if $result.exit_code != 0 { error make {msg: $"($result.stderr)\n($result.stdout)"} }
-  try {
-    $result.stdout | lines | each {|l|
-      try { return ($l | into int) }
-      try { return ($l | into float) }
-      try { return ($l | from json) }
-      $l
-    }
-  } catch { $result.stdout }
+  let prep = helpers prepare --connection $connection --query $query --file $file --yes=$yes --overrides $overrides
+  $prep | helpers run "redis"
 }

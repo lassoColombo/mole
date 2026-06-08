@@ -4,26 +4,19 @@ use "../completers.nu"
 
 # Run a query against a MongoDB datasource
 export def main [
-  --query(-q): string
-  --file(-f): string@"completers queryfile"
-  --connection(-c): string@"completers mongo-connection"
-  --database(-d): string
-  --port(-p): int
-  --user(-u): string
-  --host(-h): string
-  --password(-P): string
+  --query(-q): string                                    # Inline Mongo/JavaScript query
+  --file(-f): string@"completers queryfile"              # Path to a query file (relative to mole config dir)
+  --connection(-c): string@"completers mongo-connection" # Named connection from ~/.config/mole.yml
+  --database(-d): string                                 # Override the database name (auth source stays from the connection)
+  --port(-p): int                                        # Override the port
+  --user(-u): string                                     # Override the user
+  --host(-h): string                                     # Override the host
+  --password(-P): string                                 # Override the password
+  --yes(-y)                                              # Skip the dangerous-query confirmation prompt
 ] {
-  if ($connection | is-not-empty) { cfg set $connection }
-  let conf = helpers resolve-conf $connection
-  let q = helpers resolve-query $query $file (cfg querydir)
-  helpers danger-check $q
-  let uri = $"mongodb://($user | default $conf.user):($password | default $conf.password)@($host | default $conf.host):($port | default $conf.port)/($database | default $conf.database)?authSource=($conf.database)&socketTimeoutMS=0"
-  let js = {query: $q} | format pattern "(() => {{
-    const result = {query};
-    if (result?.toArray) {{ return EJSON.stringify(result.toArray(), null, 2); }}
-    return EJSON.stringify(result, null, 2);
-  }})()"
-  let result = mongosh $uri --quiet --eval $js | complete
-  if $result.exit_code != 0 { error make {msg: $"($result.stderr)\n($result.stdout)"} }
-  try { $result.stdout | from json } catch { $result.stdout }
+  let overrides = {
+    database: $database, port: $port, user: $user, host: $host, password: $password
+  }
+  let prep = helpers prepare --connection $connection --query $query --file $file --yes=$yes --overrides $overrides
+  $prep | helpers run "mongo"
 }
