@@ -1,5 +1,4 @@
-use ./cfg
-use ./helpers.nu
+use ./cfg.nu
 use ./drivers.nu
 
 export def queryfile [] {
@@ -15,17 +14,13 @@ def connection-completer-for [drivers: list<string>] {
   | get connection
 }
 
-export def sql-driver [] { drivers family "sql" }
-export def sql-connection [] { connection-completer-for (drivers family "sql") }
-export def mongo-connection [] { connection-completer-for (drivers family "mongo") }
-export def redis-connection [] { connection-completer-for (drivers family "redis") }
-export def vlogs-connection [] { connection-completer-for (drivers family "vlogs") }
-export def alertmanager-connection [] { connection-completer-for [alertmanager] }
+export def sql-driver [] { drivers registry | columns }
+export def sql-connection [] { connection-completer-for (drivers registry | columns) }
 
 export def sql-database [] {
   let c = cfg show -r -c | transpose name conf | first | get -o conf
   if ($c | is-empty) { return [] }
-  let d = try { drivers lookup $c.driver } catch { return [] }
+  let d = try { drivers registry | get $c.driver } catch { return [] }
   if ($d.list_databases? | is-empty) { return [] }
   let result = do $d.list_databases $c
   if $result.exit_code != 0 { return [] }
