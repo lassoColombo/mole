@@ -48,11 +48,11 @@ export def edit [queryfile?: string@"completers queryfile"] {
 
 def resolve-conf [connection?: string] {
   if ($connection | is-not-empty) {
-    let conf = cfg show -r | get -o $connection
+    let conf = cfg show -r $connection
     if ($conf | is-empty) { error make {msg: $"unknown connection: ($connection)"} }
     return $conf
   }
-  let current = cfg show -r -c | transpose name conf | first | get -o conf
+  let current = cfg show -r -c
   if ($current | is-empty) {
     error make {msg: "cannot run query: no connection set. Use --connection or `mole cfg set`"}
   }

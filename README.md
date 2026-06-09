@@ -32,10 +32,10 @@ mole --help
 
 ## Configuration
 
-Connections live in `~/.config/mole.yml`. Each top-level key is a connection name; the value is a record matching the driver's expected fields.
+Connections live in `~/.config/mole.yml` as a list of records, each with a `name` field plus the driver's expected fields. List order is preserved — it shows up in `mole cfg show`, in `translate-to` output, and in any `cfg show | to yaml` round-trip. `database` is optional — omit it for server-level connections (handy for `SHOW DATABASES`, cross-db queries, or queries that name databases explicitly).
 
 ```yaml
-my-postgres:
+- name: my-postgres
   driver: postgres
   user: alice
   password: hunter2
@@ -43,7 +43,7 @@ my-postgres:
   port: 5432
   database: app_production
 
-my-mysql:
+- name: my-mysql
   driver: mysql
   user: alice
   password: hunter2

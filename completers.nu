@@ -8,17 +8,14 @@ export def queryfile [] {
 }
 
 def connection-completer-for [drivers: list<string>] {
-  cfg show
-  | transpose connection conf
-  | where conf.driver in $drivers
-  | get connection
+  cfg show | where driver in $drivers | get name
 }
 
 export def sql-driver [] { drivers registry | columns }
 export def sql-connection [] { connection-completer-for (drivers registry | columns) }
 
 export def sql-database [] {
-  let c = cfg show -r -c | transpose name conf | first | get -o conf
+  let c = cfg show -r -c
   if ($c | is-empty) { return [] }
   let d = try { drivers registry | get $c.driver } catch { return [] }
   if ($d.list_databases? | is-empty) { return [] }

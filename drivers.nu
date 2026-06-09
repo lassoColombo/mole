@@ -10,8 +10,10 @@ export def registry [] {
     mysql: {
       dangerous_keywords: '(?i)\b(delete|drop|truncate|update|insert|replace|create|alter|rename|grant|revoke|lock|unlock|analyze|optimize|repair|flush|kill|shutdown|load\s+data|outfile|dumpfile|call|execute|prepare|deallocate|set\s+global)\b'
       exec: {|ctx|
+        let db = $ctx.conf | get -o database
+        let db_args = if ($db | is-not-empty) { ["-D" $db] } else { [] }
         with-env { MYSQL_PWD: $ctx.conf.password } {
-          $ctx.query | ^mysql -u $ctx.conf.user -h $ctx.conf.host -P $ctx.conf.port -D $ctx.conf.database | complete
+          $ctx.query | ^mysql -u $ctx.conf.user -h $ctx.conf.host -P $ctx.conf.port ...$db_args | complete
         }
       }
       parse: {|stdout| $stdout | from tsv }
@@ -26,8 +28,10 @@ export def registry [] {
     postgres: {
       dangerous_keywords: '(?i)\b(delete|drop|truncate|update|insert|copy|create|alter|rename|grant|revoke|lock|analyze|vacuum|reindex|cluster|commit|rollback|savepoint|release|attach|detach|prepare|deallocate|execute|notify|listen|do\s+\$\$)\b'
       exec: {|ctx|
+        let db = $ctx.conf | get -o database
+        let db_args = if ($db | is-not-empty) { ["-d" $db] } else { [] }
         with-env { PGPASSWORD: $ctx.conf.password } {
-          ^psql -h $ctx.conf.host -p $ctx.conf.port -U $ctx.conf.user -d $ctx.conf.database --csv -q -c $ctx.query | complete
+          ^psql -h $ctx.conf.host -p $ctx.conf.port -U $ctx.conf.user ...$db_args --csv -q -c $ctx.query | complete
         }
       }
       parse: {|stdout| $stdout | from csv }

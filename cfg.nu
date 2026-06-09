@@ -1,7 +1,7 @@
 use ../picky
 
 def connection-completer [] {
-  show | transpose database configuration | get database | uniq
+  show | get name
 }
 
 export def querydir [] {
@@ -12,25 +12,24 @@ export def file [] {
   [$env.HOME .config mole.yml] | path join
 }
 
+# Mask the password field on a connection record. Returns the input unchanged
+# when it's empty/null or when --raw is set by the caller.
+def mask-password [raw: bool]: any -> any {
+  let c = $in
+  if ($c | is-empty) or $raw { return $c }
+  $c | upsert password "***"
+}
+
 export def show [db?: string@connection-completer, --current(-c), --raw(-r)] {
-  let fmt = {
-    let c = $in
-    if ($c | is-empty) or $raw { return $c }
-    $c | upsert password "***"
-  }
   let cfg = open (file)
   if $current {
     let name = $env.SQL_CURRENT_DATABASE? | default ""
-    let conf = $cfg | get -o $name | do $fmt
-    if ($conf | is-empty) {return {}} else {return {$name: $conf}}
+    return ($cfg | where name == $name | first | default null | mask-password $raw)
   }
   if ($db | is-not-empty) {
-    return {$db: ($cfg | get -o $db | do $fmt)}
+    return ($cfg | where name == $db | first | default null | mask-password $raw)
   }
-  $cfg
-  | transpose connection conf
-  | each {|c| $c | update conf ($c.conf | do $fmt)}
-  | reduce --fold {} {|elt acc| $acc | merge {$elt.connection: $elt.conf} }
+  $cfg | each {|c| $c | mask-password $raw }
 }
 
 export def edit [] {
@@ -41,10 +40,7 @@ export def --env set [
   dbname?: string@connection-completer
 ] {
   let dbname = if ($dbname | is-not-empty) { $dbname } else {
-    show
-    | transpose database configuration
-    | picky --fuzzy --display database
-    | get -o database
+    show | picky --fuzzy --display name | get -o name
   }
   if ($dbname | is-not-empty) {
     $env.SQL_CURRENT_DATABASE = $dbname
@@ -65,18 +61,17 @@ export def translate-to [spec: string@translate-to-spec] {
 def translate-sqls [] {
   let driver_map = { postgres: "postgresql", mysql: "mysql" }
   let connections = open (file)
-  | transpose alias conf
-  | where conf.driver in ($driver_map | columns)
+  | where driver in ($driver_map | columns)
   | each {|c|
     {
-      alias: $c.alias
-      driver: ($driver_map | get $c.conf.driver)
+      alias: $c.name
+      driver: ($driver_map | get $c.driver)
       proto: "tcp"
-      user: $c.conf.user
-      passwd: $c.conf.password
-      host: $c.conf.host
-      port: $c.conf.port
-      dbName: $c.conf.database
+      user: $c.user
+      passwd: $c.password
+      host: $c.host
+      port: $c.port
+      dbName: ($c | get -o database)
     }
   }
   { lowercaseKeywords: true, connections: $connections }
