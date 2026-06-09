@@ -1,5 +1,3 @@
-use ../picky
-
 def connection-completer [] {
   show | get name
 }
@@ -40,7 +38,7 @@ export def --env set [
   dbname?: string@connection-completer
 ] {
   let dbname = if ($dbname | is-not-empty) { $dbname } else {
-    show | picky --fuzzy --display name | get -o name
+    show | input list --fuzzy --display name | get -o name
   }
   if ($dbname | is-not-empty) {
     $env.SQL_CURRENT_DATABASE = $dbname
