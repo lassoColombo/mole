@@ -12,14 +12,23 @@ def build-mongo-uri [conf: record, --no-db] {
     $"($conf.user):($pw)@"
   } else { "" }
   let db = if $no_db { "" } else { $conf | get -o database | default "" }
-  let qs = $conf | get -o authSource
-  let qpart = if ($qs | is-not-empty) { $"?authSource=($qs)" } else { "" }
+  let params = [
+    {k: "authSource",     v: ($conf | get -o authSource)}
+    {k: "tls",            v: (if ($conf | get -o tls | default false) { "true" } else { null })}
+    {k: "tlsCAFile",      v: ($conf | get -o tlsCAFile)}
+    {k: "replicaSet",     v: ($conf | get -o replicaSet)}
+    {k: "readPreference", v: ($conf | get -o readPreference)}
+  ] | where v != null and v != ""
+  let qpart = if ($params | is-empty) { "" } else {
+    "?" + ($params | each {|p| $"($p.k)=($p.v | url encode)"} | str join "&")
+  }
   $"mongodb://($auth)($conf.host):($conf.port)/($db)($qpart)"
 }
 
 export def registry [] {
   {
     mysql: {
+      family: "sql"
       dangerous_keywords: '(?i)\b(delete|drop|truncate|update|insert|replace|create|alter|rename|grant|revoke|lock|unlock|analyze|optimize|repair|flush|kill|shutdown|load\s+data|outfile|dumpfile|call|execute|prepare|deallocate|set\s+global)\b'
       exec: {|ctx|
         let db = $ctx.conf | get -o database
@@ -38,6 +47,7 @@ export def registry [] {
       db_parser: "tsv"
     }
     postgres: {
+      family: "sql"
       dangerous_keywords: '(?i)\b(delete|drop|truncate|update|insert|copy|create|alter|rename|grant|revoke|lock|analyze|vacuum|reindex|cluster|commit|rollback|savepoint|release|attach|detach|prepare|deallocate|execute|notify|listen|do\s+\$\$)\b'
       exec: {|ctx|
         let db = $ctx.conf | get -o database
@@ -56,6 +66,7 @@ export def registry [] {
       db_parser: "csv"
     }
     mongo: {
+      family: "mongo"
       dangerous_keywords: '(?i)(\binsert(One|Many)?\b|\bupdate(One|Many)?\b|\bdelete(One|Many)?\b|\breplaceOne\b|\bfindAndModify\b|\bbulkWrite\b|\bdrop(Database|Indexe?s?)?\b|\brenameCollection\b|\bcreate(Collection|Index|User|Role)\b|\$out\b|\$merge\b)'
       exec: {|ctx|
         let uri = (build-mongo-uri $ctx.conf)

@@ -18,8 +18,17 @@ def hide-password [raw: bool]: any -> any {
   $c | reject password
 }
 
+# Read mole.yml and flatten both sections into a single list of records,
+# attaching the `driver` field for mongo entries (which omit it).
+def all-connections [] {
+  let raw = open (file)
+  let sql = $raw | get -o sql | default []
+  let mongo = ($raw | get -o mongo | default []) | each {|c| $c | upsert driver "mongo" }
+  $sql ++ $mongo
+}
+
 export def show [db?: string@connection-completer, --current(-c), --raw(-r)] {
-  let cfg = open (file)
+  let cfg = all-connections
   if $current {
     let name = $env.SQL_CURRENT_DATABASE? | default ""
     return ($cfg | where name == $name | first | default null | hide-password $raw)
@@ -58,7 +67,7 @@ export def translate-to [spec: string@translate-to-spec] {
 # sqls language-server config.yml — https://github.com/sqls-server/sqls
 def translate-sqls [] {
   let driver_map = { postgres: "postgresql", mysql: "mysql" }
-  let connections = open (file)
+  let connections = all-connections
   | where driver in ($driver_map | columns)
   | each {|c|
     {

@@ -7,17 +7,23 @@ export def queryfile [] {
   | each {|f| $f | str replace $"($base)/" "" }
 }
 
-def connection-completer-for [drivers: list<string>] {
-  cfg show | where driver in $drivers | get name
+def drivers-by-family [family: string] {
+  drivers registry
+  | items {|name, d| {name: $name, family: ($d | get -o family | default "sql")} }
+  | where family == $family
+  | get name
 }
 
-export def sql-driver [] { drivers registry | columns }
-export def sql-connection [] { connection-completer-for (drivers registry | columns) }
+def connections-for-family [family: string] {
+  let allowed = drivers-by-family $family
+  cfg show | where driver in $allowed | get name
+}
 
-export def sql-database [] {
+def database-for-family [family: string] {
   let c = cfg show -r -c
   if ($c | is-empty) { return [] }
   let d = try { drivers registry | get $c.driver } catch { return [] }
+  if (($d | get -o family | default "sql") != $family) { return [] }
   if ($d.list_databases? | is-empty) { return [] }
   let result = do $d.list_databases $c
   if $result.exit_code != 0 { return [] }
@@ -31,3 +37,10 @@ export def sql-database [] {
     _ => []
   }
 }
+
+export def sql-driver [] { drivers-by-family "sql" }
+export def sql-connection [] { connections-for-family "sql" }
+export def sql-database [] { database-for-family "sql" }
+
+export def mongo-connection [] { connections-for-family "mongo" }
+export def mongo-database [] { database-for-family "mongo" }
