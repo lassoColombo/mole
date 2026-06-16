@@ -1,10 +1,22 @@
-# Registry of SQL drivers. Each entry declares everything that varies per-driver:
+# Registry of database drivers. Each entry declares everything that varies per-driver:
 #   dangerous_keywords:  regex of statements that trigger the danger-prompt
 #   exec:                closure {|ctx| ... } returning a `complete` record; ctx = {conf, base, query, functions}
 #   parse:               closure {|stdout| ... } that turns raw stdout into a table
 #   list_databases:      (optional) closure {|conf| ... } returning a `complete` record listing DBs
-#   db_column:           (optional) column name to pluck from the parsed list_databases stdout
-#   db_parser:           (optional) "tsv" | "csv" — how to parse list_databases stdout
+#   db_column:           (optional) column name to pluck from the parsed list_databases stdout; null = stdout is already flat
+#   db_parser:           (optional) "tsv" | "csv" | "json" — how to parse list_databases stdout
+#   query_suffix:        (optional) file extension for editor-temp queries (default ".sql")
+def build-mongo-uri [conf: record, --no-db] {
+  let auth = if (($conf | get -o user) | is-not-empty) {
+    let pw = ($conf | get -o password | default "" | url encode)
+    $"($conf.user):($pw)@"
+  } else { "" }
+  let db = if $no_db { "" } else { $conf | get -o database | default "" }
+  let qs = $conf | get -o authSource
+  let qpart = if ($qs | is-not-empty) { $"?authSource=($qs)" } else { "" }
+  $"mongodb://($auth)($conf.host):($conf.port)/($db)($qpart)"
+}
+
 export def registry [] {
   {
     mysql: {
@@ -42,6 +54,21 @@ export def registry [] {
       }
       db_column: "Name"
       db_parser: "csv"
+    }
+    mongo: {
+      dangerous_keywords: '(?i)(\binsert(One|Many)?\b|\bupdate(One|Many)?\b|\bdelete(One|Many)?\b|\breplaceOne\b|\bfindAndModify\b|\bbulkWrite\b|\bdrop(Database|Indexe?s?)?\b|\brenameCollection\b|\bcreate(Collection|Index|User|Role)\b|\$out\b|\$merge\b)'
+      exec: {|ctx|
+        let uri = (build-mongo-uri $ctx.conf)
+        ^mongosh $uri --quiet --json=relaxed --eval $ctx.query | complete
+      }
+      parse: {|stdout| $stdout | from json }
+      list_databases: {|conf|
+        let uri = (build-mongo-uri $conf --no-db)
+        ^mongosh $uri --quiet --json=relaxed --eval 'EJSON.stringify(db.adminCommand({listDatabases:1}).databases.map(d => d.name))' | complete
+      }
+      db_column: null
+      db_parser: "json"
+      query_suffix: ".js"
     }
   }
 }

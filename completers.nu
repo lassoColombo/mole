@@ -24,6 +24,10 @@ export def sql-database [] {
   match $d.db_parser {
     "tsv" => ($result.stdout | from tsv | get $d.db_column)
     "csv" => ($result.stdout | from csv | get $d.db_column)
+    "json" => (do {
+      let parsed = ($result.stdout | from json)
+      if (($d | get -o db_column) | is-empty) { $parsed } else { $parsed | get $d.db_column }
+    })
     _ => []
   }
 }

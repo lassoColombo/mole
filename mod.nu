@@ -22,7 +22,7 @@ export def main [
     user: $user, host: $host, password: $password
   }
   let functions = drivers registry | get $conf.driver
-  let q = resolve-query $query $file (cfg querydir)
+  let q = resolve-query $query $file (cfg querydir) ($functions | get -o query_suffix | default ".sql")
   if $q =~ $functions.dangerous_keywords and (not $yes) {
     let res = input $"(ansi yellow)This query might contain dangerous instructions. Execute? [y/N](ansi reset)" --numchar 1 --default 'n'
     if $res != y {
@@ -59,13 +59,13 @@ def resolve-conf [connection?: string] {
   $current
 }
 
-def resolve-query [query?: string, file?: string, basedir?: string] {
+def resolve-query [query?: string, file?: string, basedir?: string, suffix: string = ".sql"] {
   if ($query | is-not-empty) { return $query }
   if ($file | is-not-empty) {
     let full = if ($basedir | is-not-empty) { [$basedir $file] | path join } else { $file }
     return (open -r $full)
   }
-  let tmp = mktemp --suffix .sql
+  let tmp = mktemp --suffix $suffix
   nu -c $"($env.EDITOR) ($tmp)"
   open -r $tmp
 }
