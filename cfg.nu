@@ -6,13 +6,18 @@ def connection-file [] {
 }
 
 
-# Flat list of all connections with the `driver` field attached (mongo entries
-# omit it in the file).
+# Flat list of all connections with the `driver` field attached. Mongo entries
+# always tag as `mongo` (the only driver in that family). Redis entries default
+# to `redis` when unset so a user can pick a RESP-compatible variant
+# (`driver: valkey`, etc.) without breaking older configs.
 def connection-list [] {
   let raw = open (file)
   let sql = $raw | get -o sql | default []
   let mongo = ($raw | get -o mongo | default []) | each {|c| $c | upsert driver "mongo" }
-  $sql ++ $mongo
+  let redis = ($raw | get -o redis | default []) | each {|c|
+    if (($c | get -o driver) | is-empty) { $c | upsert driver "redis" } else { $c }
+  }
+  $sql ++ $mongo ++ $redis
 }
 
 def connection-completer [] {
@@ -34,14 +39,14 @@ export def file []: nothing -> string {
 def hide-password [raw: bool]: any -> any {
   let c = $in
   if ($c | is-empty) or $raw { return $c }
-  $c | reject password
+  $c | reject password?
 }
 
 # Show connections from mole.yml.
 #
-# With no arguments, returns a record `{sql: <table>, mongo: <table>}` so each
-# section stays internally consistent (sections have different keys, so a
-# flat list would be heterogeneous).
+# With no arguments, returns a record `{sql: <table>, mongo: <table>, redis:
+# <table>}` so each section stays internally consistent (sections have
+# different keys, so a flat list would be heterogeneous).
 #
 # With a name or `--current`, returns the single matching connection record,
 # or null if not found. Passwords are stripped unless `--raw` is set.
@@ -61,6 +66,7 @@ export def show [
   {
     sql: ($raw_yml | get -o sql | default [] | each {|c| $c | hide-password $raw })
     mongo: ($raw_yml | get -o mongo | default [] | each {|c| $c | hide-password $raw })
+    redis: ($raw_yml | get -o redis | default [] | each {|c| $c | hide-password $raw })
   }
 }
 

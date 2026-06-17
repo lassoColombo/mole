@@ -19,7 +19,10 @@ def connections-for-family [family: string] {
   let allowed = drivers-by-family $family
   let c = cfg show
   let mongo = $c.mongo | each {|x| $x | upsert driver "mongo" }
-  $c.sql ++ $mongo | where driver in $allowed | get name
+  let redis = $c.redis | each {|x|
+    if (($x | get -o driver) | is-empty) { $x | upsert driver "redis" } else { $x }
+  }
+  $c.sql ++ $mongo ++ $redis | where driver in $allowed | get name
 }
 
 # Extract `--connection <name>` / `-c <name>` from the typed command line, if
@@ -56,21 +59,10 @@ def database-for-family [context: string, family: string] {
     cfg show $override -r
   }
   if ($c | is-empty) { return [] }
-  let c = if ($c | get -o driver | is-empty) { $c | upsert driver "mongo" } else { $c }
   let d = try { drivers registry | get $c.driver } catch { return [] }
   if (($d | get -o family | default "sql") != $family) { return [] }
   if ($d.list_databases? | is-empty) { return [] }
-  let result = do $d.list_databases $c
-  if $result.exit_code != 0 { return [] }
-  match $d.db_parser {
-    "tsv" => ($result.stdout | from tsv | get $d.db_column)
-    "csv" => ($result.stdout | from csv | get $d.db_column)
-    "json" => (do {
-      let parsed = ($result.stdout | from json)
-      if (($d | get -o db_column) | is-empty) { $parsed } else { $parsed | get $d.db_column }
-    })
-    _ => []
-  }
+  do $d.list_databases $c
 }
 
 export def sql-driver [] { drivers-by-family "sql" }
@@ -79,6 +71,10 @@ export def sql-database [context: string] { database-for-family $context "sql" }
 
 export def mongo-connection [] { connections-for-family "mongo" }
 export def mongo-database [context: string] { database-for-family $context "mongo" }
+
+export def redis-driver [] { drivers-by-family "redis" }
+export def redis-connection [] { connections-for-family "redis" }
+export def redis-database [context: string] { database-for-family $context "redis" }
 
 # Tables in the cached schema for the effective SQL connection. Reads from
 # the cache file only — no DB roundtrip — so it stays fast in the REPL.

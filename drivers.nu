@@ -4,9 +4,7 @@ use ./ejson.nu
 #   dangerous_keywords:  regex of statements that trigger the danger-prompt
 #   exec:                closure {|ctx| ... } returning a `complete` record; ctx = {conf, base, query, functions}
 #   parse:               closure {|stdout| ... } that turns raw stdout into a table
-#   list_databases:      (optional) closure {|conf| ... } returning a `complete` record listing DBs
-#   db_column:           (optional) column name to pluck from the parsed list_databases stdout; null = stdout is already flat
-#   db_parser:           (optional) "tsv" | "csv" | "json" — how to parse list_databases stdout
+#   list_databases:      (optional) closure {|conf| ... } returning a `list<string>` of database identifiers
 #   query_suffix:        (optional) file extension for editor-temp queries (default ".sql")
 def build-mongo-uri [conf: record, --no-db] {
   let auth = if (($conf | get -o user) | is-not-empty) {
@@ -27,6 +25,59 @@ def build-mongo-uri [conf: record, --no-db] {
   $"mongodb://($auth)($conf.host):($conf.port)/($db)($qpart)"
 }
 
+def redis-base-args [conf: record]: nothing -> list<string> {
+  let user_args = if (($conf | get -o user) | is-not-empty) { ["--user" $conf.user] } else { [] }
+  ["-h" $conf.host "-p" ($conf.port | into string) ...$user_args "--no-auth-warning"]
+}
+
+def redis-env [conf: record]: nothing -> record {
+  if (($conf | get -o password) | is-not-empty) { { REDISCLI_AUTH: $conf.password } } else { {} }
+}
+
+# Builds a RESP-family driver entry parameterized by CLI binary (redis-cli,
+# valkey-cli, keydb-cli, …). All RESP-compatible CLIs accept the same flags,
+# danger surface, and database model, so the registry record only varies on
+# which executable to spawn.
+def make-resp-driver [bin: string]: nothing -> record {
+  {
+    family: "redis"
+    # Mutating commands and admin verbs. Read-only commands (GET, KEYS, SCAN,
+    # HGETALL, LRANGE, INFO, TYPE, TTL, …) are intentionally excluded.
+    dangerous_keywords: '(?i)\b(set|setex|setnx|psetex|mset|msetnx|getset|getdel|append|del|unlink|flushdb|flushall|rename|renamenx|copy|move|migrate|expire|pexpire|expireat|pexpireat|persist|incr|decr|incrby|decrby|incrbyfloat|hset|hmset|hsetnx|hdel|hincrby|hincrbyfloat|lpush|lpushx|rpush|rpushx|lpop|rpop|lmpop|blpop|brpop|blmpop|brpoplpush|lset|lrem|ltrim|linsert|lmove|blmove|sadd|srem|spop|smove|sinterstore|sunionstore|sdiffstore|zadd|zrem|zincrby|zpopmin|zpopmax|bzpopmin|bzpopmax|zmpop|bzmpop|zrangestore|zunionstore|zinterstore|zdiffstore|bitop|setbit|setrange|restore|dump|xadd|xdel|xtrim|xsetid|xack|xclaim|xautoclaim|xgroup|geoadd|pfadd|pfmerge|debug|shutdown|bgsave|bgrewriteaof|save|reset|sync|psync|replicaof|slaveof|failover|eval|evalsha|fcall|fcall_ro)\b|(?i)\b(config|client|cluster|script|function|acl)\s+(set|kill|pause|unpause|no-evict|reset|failover|addslots|delslots|flushslots|forget|meet|replicate|setslot|resetstat|rewrite|flush|load|create|delete|restore|deluser|setuser|save)\b'
+    exec: {|ctx|
+      let db = $ctx.conf | get -o database
+      let db_args = if ($db | is-not-empty) { ["-n" ($db | into string)] } else { [] }
+      with-env (redis-env $ctx.conf) {
+        $ctx.query | ^$bin ...(redis-base-args $ctx.conf) ...$db_args --json | complete
+      }
+    }
+    parse: {|stdout|
+      let lines = $stdout | lines | where {|l| ($l | str trim) != "" }
+      if (($lines | length) == 0) {
+        null
+      } else if (($lines | length) == 1) {
+        let only = $lines | first
+        try { $only | from json } catch { $only }
+      } else {
+        $lines | each {|l| try { $l | from json } catch { $l } }
+      }
+    }
+    list_databases: {|conf|
+      let r = with-env (redis-env $conf) {
+        ^$bin ...(redis-base-args $conf) --json CONFIG GET databases | complete
+      }
+      if $r.exit_code != 0 { [] } else {
+        let parsed = try { $r.stdout | from json } catch { null }
+        if $parsed == null { [] } else {
+          let n = try { $parsed.databases | into int } catch { 0 }
+          if $n <= 0 { [] } else { 0..($n - 1) | each {|i| $i | into string} }
+        }
+      }
+    }
+    query_suffix: ".redis"
+  }
+}
+
 export def registry [] {
   {
     mysql: {
@@ -41,12 +92,11 @@ export def registry [] {
       }
       parse: {|stdout| $stdout | from tsv }
       list_databases: {|conf|
-        with-env { MYSQL_PWD: $conf.password } {
+        let r = with-env { MYSQL_PWD: $conf.password } {
           "show databases;" | ^mysql -u $conf.user -h $conf.host -P $conf.port | complete
         }
+        if $r.exit_code != 0 { [] } else { $r.stdout | from tsv | get Database }
       }
-      db_column: "Database"
-      db_parser: "tsv"
       schema_queries: {
         tables: (mysql-tables-sql)
         columns: (mysql-columns-sql)
@@ -65,12 +115,11 @@ export def registry [] {
       }
       parse: {|stdout| $stdout | from csv }
       list_databases: {|conf|
-        with-env { PGPASSWORD: $conf.password } {
+        let r = with-env { PGPASSWORD: $conf.password } {
           ^psql -h $conf.host -p $conf.port -U $conf.user --csv -q -c '\l' | complete
         }
+        if $r.exit_code != 0 { [] } else { $r.stdout | from csv | get Name }
       }
-      db_column: "Name"
-      db_parser: "csv"
       schema_queries: {
         tables: (postgres-tables-sql)
         columns: (postgres-columns-sql)
@@ -87,12 +136,13 @@ export def registry [] {
       parse: {|stdout| $stdout | from json | ejson decode }
       list_databases: {|conf|
         let uri = (build-mongo-uri $conf --no-db)
-        ^mongosh $uri --quiet --json=relaxed --eval 'EJSON.stringify(db.adminCommand({listDatabases:1}).databases.map(d => d.name))' | complete
+        let r = ^mongosh $uri --quiet --json=relaxed --eval 'EJSON.stringify(db.adminCommand({listDatabases:1}).databases.map(d => d.name))' | complete
+        if $r.exit_code != 0 { [] } else { $r.stdout | from json }
       }
-      db_column: null
-      db_parser: "json"
       query_suffix: ".js"
     }
+    redis:  (make-resp-driver "redis-cli")
+    valkey: (make-resp-driver "valkey-cli")
   }
 }
 

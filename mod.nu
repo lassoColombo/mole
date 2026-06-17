@@ -92,6 +92,29 @@ def "mongo-read-preference" [] {
   ["primary" "primaryPreferred" "secondary" "secondaryPreferred" "nearest"]
 }
 
+# Run commands against a configured redis/valkey connection (any RESP-
+# compatible CLI). Multi-line --query / --file input is passed to the CLI on
+# stdin, so each line runs as a separate command.
+export def redis [
+  --query(-q): string                                    # Inline command(s)
+  --file(-f): string@"completers queryfile"              # Path to a query file (relative to mole config dir)
+  --connection(-c): string@"completers redis-connection" # Named connection from ~/.config/mole.yml
+  --driver(-D): string@"completers redis-driver"         # Override the driver (redis or valkey)
+  --database(-d): string@"completers redis-database"     # Override the database index (0..N-1)
+  --port(-p): int                                        # Override the port
+  --user(-u): string                                     # Override the user (Redis ACL)
+  --host(-h): string                                     # Override the host
+  --password(-P): string                                 # Override the password
+  --yes(-y)                                              # Skip the dangerous-query confirmation prompt
+] {
+  let conf = resolve-and-override $connection {
+    driver: $driver, database: $database, port: $port,
+    user: $user, host: $host, password: $password
+  }
+  assert-family $conf "redis"
+  run $conf --query $query --file $file --yes=$yes
+}
+
 # Show the cached schema for a SQL connection.
 #
 # Without --table: a summary row per table (schema, name, type, n_columns,

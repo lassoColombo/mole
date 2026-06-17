@@ -15,6 +15,9 @@ Define your MySQL/PostgreSQL connections in `~/.config/mole.yml`, point at one, 
 | [Nushell](https://www.nushell.sh/) | Host shell |
 | [`mysql`](https://dev.mysql.com/doc/refman/en/mysql.html) | CLI used by the `mysql` driver |
 | [`psql`](https://www.postgresql.org/docs/current/app-psql.html) | CLI used by the `postgres` driver |
+| [`mongosh`](https://www.mongodb.com/docs/mongodb-shell/) | CLI used by the `mongo` driver |
+| [`redis-cli`](https://redis.io/docs/latest/develop/connect/cli/) | CLI used by the `redis` driver |
+| [`valkey-cli`](https://valkey.io/) | CLI used by the `valkey` driver (RESP-compatible) |
 
 You only need the CLI(s) for the drivers you actually use.
 
@@ -35,21 +38,45 @@ mole --help
 Connections live in `~/.config/mole.yml` as a list of records, each with a `name` field plus the driver's expected fields. List order is preserved — it shows up in `mole cfg show`, in `translate-to` output, and in any `cfg show | to yaml` round-trip. `database` is optional — omit it for server-level connections (handy for `SHOW DATABASES`, cross-db queries, or queries that name databases explicitly).
 
 ```yaml
-- name: my-postgres
-  driver: postgres
-  user: alice
-  password: hunter2
-  host: db.example.com
-  port: 5432
-  database: app_production
+sql:
+  - name: my-postgres
+    driver: postgres
+    user: alice
+    password: hunter2
+    host: db.example.com
+    port: 5432
+    database: app_production
 
-- name: my-mysql
-  driver: mysql
-  user: alice
-  password: hunter2
-  host: mysql.example.com
-  port: 3306
-  database: app
+  - name: my-mysql
+    driver: mysql
+    user: alice
+    password: hunter2
+    host: mysql.example.com
+    port: 3306
+    database: app
+
+mongo:
+  - name: my-mongo
+    user: alice
+    password: hunter2
+    host: mongo.example.com
+    port: 27017
+    database: app
+
+redis:
+  - name: my-redis
+    driver: redis          # or `valkey` — any RESP-compatible CLI
+    user: default          # optional — ACL user (omit to skip)
+    password: hunter2      # optional
+    host: redis.example.com
+    port: 6379
+    database: "0"          # optional — db index (0..N-1)
+
+  - name: my-valkey
+    driver: valkey         # uses valkey-cli instead of redis-cli
+    password: hunter2
+    host: valkey.example.com
+    port: 6379
 ```
 
 Query files live under `~/.config/mole/` (recursively); reference them with `-f path/to/query.sql`.
@@ -122,6 +149,9 @@ Built-in drivers:
 |--------|----------|------------------|
 | `mysql` | `mysql` | TSV |
 | `postgres` | `psql --csv` | CSV |
+| `mongo` | `mongosh --json=canonical` | EJSON |
+| `redis` | `redis-cli --json` | JSON per line (raw fallback) |
+| `valkey` | `valkey-cli --json` | JSON per line (raw fallback) |
 
 Adding a driver is a matter of adding one entry to the registry in `drivers.nu`. The pipeline in `mod.nu` dispatches through the registry — no command code changes needed.
 
