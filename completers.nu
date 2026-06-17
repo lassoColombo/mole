@@ -16,7 +16,9 @@ def drivers-by-family [family: string] {
 
 def connections-for-family [family: string] {
   let allowed = drivers-by-family $family
-  cfg show | where driver in $allowed | get name
+  let c = cfg show
+  let mongo = $c.mongo | each {|x| $x | upsert driver "mongo" }
+  $c.sql ++ $mongo | where driver in $allowed | get name
 }
 
 def database-for-family [family: string] {
