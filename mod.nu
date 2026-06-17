@@ -1,9 +1,11 @@
 export use ./cfg.nu
+use ./types.nu
 use ./completers.nu
 use ./drivers.nu
+use ./cache.nu
 
 # Run a SQL query against a configured mysql/postgres connection.
-export def sql [
+export def "sql run" [
   --query(-q): string                                  # Inline SQL query
   --file(-f): string@"completers queryfile"            # Path to a query file (relative to mole config dir)
   --connection(-c): string@"completers sql-connection" # Named connection from ~/.config/mole.yml
@@ -21,6 +23,42 @@ export def sql [
   }
   assert-family $conf "sql"
   run $conf --query $query --file $file --yes=$yes
+}
+
+# Compose and run a SELECT query with completion-aware flags.
+#
+# Examples:
+#   mole sql select --from customers
+#   mole sql select id email --from customers --where "active" --limit 5
+#   mole sql select --from orders --order-by "placed_at DESC" --limit 10
+#
+# Column tab-completion is context-aware: once --from <table> is set, columns
+# are scoped to that table. Cached column types of --from are applied to the
+# result automatically (booleans → bool, dates → datetime, ints → int, ...);
+# pass --raw to skip the conversion.
+export def "sql select" [
+  ...columns: string@"completers sql-column"             # Columns to project (default: *)
+  --from(-f): string@"completers schema-table"           # Source table
+  --where(-w): string                                    # WHERE clause (without the WHERE keyword)
+  --order-by(-o): string                                 # ORDER BY clause (without the ORDER BY keyword)
+  --limit(-l): int                                       # LIMIT N
+  --connection(-c): string@"completers sql-connection"   # Named connection (default: current)
+  --raw(-R)                                              # Skip cached-type conversion of the result
+  --print(-p)                                            # Print the assembled SQL instead of running it
+] {
+  if ($from | is-empty) { error make {msg: "--from <table> is required"} }
+  let cols = if ($columns | is-empty) { "*" } else { $columns | str join ", " }
+  let sql = [
+    $"SELECT ($cols) FROM ($from)"
+    (if ($where | is-not-empty) { $"WHERE ($where)" } else { null })
+    (if ($order_by | is-not-empty) { $"ORDER BY ($order_by)" } else { null })
+    (if $limit != null { $"LIMIT ($limit)" } else { null })
+  ] | where {|x| $x != null } | str join " "
+  if $print { return $sql }
+  let conf = resolve-and-override $connection {}
+  assert-family $conf "sql"
+  let result = run $conf --query $sql
+  if $raw { $result } else { $result | types apply $from --connection $conf.name }
 }
 
 # Run a query against a configured mongo connection (via mongosh).
@@ -52,6 +90,125 @@ export def mongo [
 
 def "mongo-read-preference" [] {
   ["primary" "primaryPreferred" "secondary" "secondaryPreferred" "nearest"]
+}
+
+# Show the cached schema for a SQL connection.
+#
+# Without --table: a summary row per table (schema, name, type, n_columns,
+# primary key, row_estimate, comment).
+#
+# With --table NAME: a detailed record { table, columns, constraints } for the
+# matching table. NAME may be "table" or "schema.table"; the latter is required
+# when the same name exists in multiple schemas.
+#
+# --refresh forces a cache rebuild before reading. --full returns the entire
+# cache record {connection, database, driver, tables, columns, constraints}
+# instead of the per-table summary.
+export def schema [
+  --connection(-c): string@"completers sql-connection"   # Named connection (default: current)
+  --table(-t): string@"completers schema-table"          # Detail view for one table
+  --find: string                                         # Find tables/columns whose name or comment matches (case-insensitive)
+  --refresh(-r)                                          # Rebuild the cache before reading
+  --full                                                 # Return the full cache record
+] {
+  let conf = resolve-and-override $connection {}
+  assert-family $conf "sql"
+  if $refresh { cache refresh $conf }
+  let data = cache load $conf
+  if $full { return $data }
+  if ($find | is-not-empty) {
+    schema-find $data $find
+  } else if ($table | is-not-empty) {
+    schema-table-detail $data $table
+  } else {
+    schema-table-list $data
+  }
+}
+
+def schema-find [data: record, pat: string]: nothing -> any {
+  let p = $pat | str downcase
+  let table_hits = $data.tables
+    | where {|t| (matches $t.name $p) or (matches ($t.comment | default "") $p) }
+    | each {|t|
+        let name_hit = (matches $t.name $p)
+        {
+          schema: $t.schema
+          table: $t.name
+          column: ""
+          kind: (if $name_hit { "table" } else { "table-comment" })
+          match: (if $name_hit { $t.name } else { ($t.comment | default "") })
+        }
+      }
+  let column_hits = $data.columns
+    | where {|c| (matches $c.name $p) or (matches ($c.comment | default "") $p) }
+    | each {|c|
+        let name_hit = (matches $c.name $p)
+        {
+          schema: $c.schema
+          table: $c.table
+          column: $c.name
+          kind: (if $name_hit { "column" } else { "column-comment" })
+          match: (if $name_hit { $c.name } else { ($c.comment | default "") })
+        }
+      }
+  $table_hits ++ $column_hits
+}
+
+def matches [haystack: string, needle: string]: nothing -> bool {
+  $haystack | str downcase | str contains $needle
+}
+
+def schema-table-list [data: record]: nothing -> any {
+  $data.tables | each {|t|
+    let cols = $data.columns | where schema == $t.schema and table == $t.name
+    let pk = $data.constraints
+      | where schema == $t.schema and table == $t.name and type == "PRIMARY KEY"
+      | first
+      | default null
+    {
+      schema: $t.schema
+      name: $t.name
+      type: $t.type
+      columns: ($cols | length)
+      pk: (if $pk == null { "" } else { $pk.columns | str join ", " })
+      rows: $t.row_estimate
+      comment: $t.comment
+    }
+  }
+}
+
+def schema-table-detail [data: record, name: string]: nothing -> any {
+  let parts = $name | split row "."
+  let matches = if ($parts | length) >= 2 {
+    let sch = $parts | first
+    let tbl = $parts | skip 1 | str join "."
+    $data.tables | where schema == $sch and name == $tbl
+  } else {
+    $data.tables | where name == $name
+  }
+  if ($matches | is-empty) {
+    error make {msg: $"table not found in cache: ($name)"}
+  }
+  if (($matches | length) > 1) {
+    let names = $matches | each {|t| $"($t.schema).($t.name)"} | str join ", "
+    error make {msg: $"ambiguous table name '($name)' — matched: ($names). Use schema.table form."}
+  }
+  let t = $matches | first
+  let cols = $data.columns
+    | where schema == $t.schema and table == $t.name
+    | select position name display_type nullable default comment
+  let cons = $data.constraints
+    | where schema == $t.schema and table == $t.name
+    | select type name columns ref_schema ref_table ref_columns
+  {
+    schema: $t.schema
+    name: $t.name
+    type: $t.type
+    comment: $t.comment
+    row_estimate: $t.row_estimate
+    columns: $cols
+    constraints: $cons
+  }
 }
 
 # Open the query directory (or a specific query file) in the default editor.
@@ -89,7 +246,11 @@ def run [conf: record, --query: string, --file: string, --yes] {
   }
   let result = do $functions.exec { conf: $conf, query: $q }
   if $result.exit_code != 0 { error make {msg: $"($result.stderr)\n($result.stdout)"} }
-  try { do $functions.parse $result.stdout } catch { $result.stdout }
+  let parsed = try { do $functions.parse $result.stdout } catch { $result.stdout }
+  if (($functions | get -o family | default "sql") == "sql") {
+    job spawn { try { cache refresh-if-stale $conf } catch { } } | ignore
+  }
+  $parsed
 }
 
 def resolve-conf [connection?: string] {

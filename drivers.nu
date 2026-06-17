@@ -45,6 +45,11 @@ export def registry [] {
       }
       db_column: "Database"
       db_parser: "tsv"
+      schema_queries: {
+        tables: (mysql-tables-sql)
+        columns: (mysql-columns-sql)
+        constraints: (mysql-constraints-sql)
+      }
     }
     postgres: {
       family: "sql"
@@ -64,6 +69,11 @@ export def registry [] {
       }
       db_column: "Name"
       db_parser: "csv"
+      schema_queries: {
+        tables: (postgres-tables-sql)
+        columns: (postgres-columns-sql)
+        constraints: (postgres-constraints-sql)
+      }
     }
     mongo: {
       family: "mongo"
@@ -82,4 +92,151 @@ export def registry [] {
       query_suffix: ".js"
     }
   }
+}
+
+# ---- schema introspection SQL -------------------------------------------------
+# Raw strings (r#'...'#) so the embedded single-quotes in SQL don't need
+# escaping. Column aliases use the exact names cache.nu expects.
+
+def postgres-tables-sql [] {
+  r#'
+    SELECT
+      n.nspname AS "schema",
+      c.relname AS "name",
+      CASE c.relkind
+        WHEN 'r' THEN 'BASE TABLE'
+        WHEN 'v' THEN 'VIEW'
+        WHEN 'm' THEN 'MATERIALIZED VIEW'
+        WHEN 'f' THEN 'FOREIGN TABLE'
+        WHEN 'p' THEN 'PARTITIONED TABLE'
+      END AS "type",
+      obj_description(c.oid) AS "comment",
+      c.reltuples::bigint AS "row_estimate"
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r','v','m','f','p')
+      AND n.nspname NOT IN ('pg_catalog','information_schema')
+    ORDER BY n.nspname, c.relname
+  '#
+}
+
+def postgres-columns-sql [] {
+  r#'
+    SELECT
+      c.table_schema AS "schema",
+      c.table_name AS "table",
+      c.column_name AS "name",
+      c.ordinal_position AS "position",
+      c.data_type AS "data_type",
+      c.udt_name AS "udt_name",
+      c.is_nullable AS "is_nullable",
+      c.column_default AS "default",
+      c.character_maximum_length AS "char_max_length",
+      c.numeric_precision AS "numeric_precision",
+      c.numeric_scale AS "numeric_scale",
+      pgd.description AS "comment"
+    FROM information_schema.columns c
+    LEFT JOIN pg_catalog.pg_class pc
+      ON pc.relname = c.table_name
+     AND pc.relnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = c.table_schema)
+    LEFT JOIN pg_catalog.pg_description pgd
+      ON pgd.objoid = pc.oid AND pgd.objsubid = c.ordinal_position
+    WHERE c.table_schema NOT IN ('pg_catalog','information_schema')
+    ORDER BY c.table_schema, c.table_name, c.ordinal_position
+  '#
+}
+
+def postgres-constraints-sql [] {
+  r#'
+    SELECT
+      n.nspname AS "schema",
+      c.relname AS "table",
+      con.conname AS "name",
+      CASE con.contype
+        WHEN 'p' THEN 'PRIMARY KEY'
+        WHEN 'f' THEN 'FOREIGN KEY'
+        WHEN 'u' THEN 'UNIQUE'
+      END AS "type",
+      (SELECT string_agg(att.attname, ',' ORDER BY u.ord)
+         FROM unnest(con.conkey) WITH ORDINALITY AS u(attnum, ord)
+         JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = u.attnum) AS "columns",
+      fn.nspname AS "ref_schema",
+      fc.relname AS "ref_table",
+      CASE WHEN con.contype = 'f' THEN
+        (SELECT string_agg(fatt.attname, ',' ORDER BY u.ord)
+           FROM unnest(con.confkey) WITH ORDINALITY AS u(attnum, ord)
+           JOIN pg_attribute fatt ON fatt.attrelid = con.confrelid AND fatt.attnum = u.attnum)
+      END AS "ref_columns"
+    FROM pg_constraint con
+    JOIN pg_class c ON c.oid = con.conrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_class fc ON fc.oid = con.confrelid AND con.contype = 'f'
+    LEFT JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+    WHERE con.contype IN ('p','f','u')
+      AND n.nspname NOT IN ('pg_catalog','information_schema')
+    ORDER BY n.nspname, c.relname, con.contype, con.conname
+  '#
+}
+
+def mysql-tables-sql [] {
+  r#'
+    SELECT
+      table_schema   AS `schema`,
+      table_name     AS `name`,
+      table_type     AS `type`,
+      table_comment  AS `comment`,
+      COALESCE(table_rows, 0) AS `row_estimate`
+    FROM information_schema.tables
+    WHERE table_schema = COALESCE(DATABASE(), table_schema)
+      AND table_schema NOT IN ('mysql','information_schema','performance_schema','sys')
+    ORDER BY table_schema, table_name
+  '#
+}
+
+def mysql-columns-sql [] {
+  r#'
+    SELECT
+      table_schema  AS `schema`,
+      table_name    AS `table`,
+      column_name   AS `name`,
+      ordinal_position AS `position`,
+      data_type     AS `data_type`,
+      column_type   AS `udt_name`,
+      is_nullable   AS `is_nullable`,
+      column_default AS `default`,
+      character_maximum_length AS `char_max_length`,
+      numeric_precision AS `numeric_precision`,
+      numeric_scale AS `numeric_scale`,
+      column_comment AS `comment`
+    FROM information_schema.columns
+    WHERE table_schema = COALESCE(DATABASE(), table_schema)
+      AND table_schema NOT IN ('mysql','information_schema','performance_schema','sys')
+    ORDER BY table_schema, table_name, ordinal_position
+  '#
+}
+
+def mysql-constraints-sql [] {
+  r#'
+    SELECT
+      tc.table_schema  AS `schema`,
+      tc.table_name    AS `table`,
+      tc.constraint_name AS `name`,
+      tc.constraint_type AS `type`,
+      GROUP_CONCAT(kcu.column_name ORDER BY kcu.ordinal_position) AS `columns`,
+      MAX(kcu.referenced_table_schema) AS `ref_schema`,
+      MAX(kcu.referenced_table_name)   AS `ref_table`,
+      CASE WHEN tc.constraint_type = 'FOREIGN KEY'
+        THEN GROUP_CONCAT(kcu.referenced_column_name ORDER BY kcu.ordinal_position)
+      END AS `ref_columns`
+    FROM information_schema.table_constraints tc
+    JOIN information_schema.key_column_usage kcu
+      ON kcu.table_schema    = tc.table_schema
+     AND kcu.table_name      = tc.table_name
+     AND kcu.constraint_name = tc.constraint_name
+    WHERE tc.constraint_type IN ('PRIMARY KEY','FOREIGN KEY','UNIQUE')
+      AND tc.table_schema = COALESCE(DATABASE(), tc.table_schema)
+      AND tc.table_schema NOT IN ('mysql','information_schema','performance_schema','sys')
+    GROUP BY tc.table_schema, tc.table_name, tc.constraint_name, tc.constraint_type
+    ORDER BY tc.table_schema, tc.table_name, FIELD(tc.constraint_type,'PRIMARY KEY','UNIQUE','FOREIGN KEY'), tc.constraint_name
+  '#
 }

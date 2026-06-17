@@ -1,3 +1,6 @@
+use ./cache.nu
+use ./drivers.nu
+
 def connection-file [] {
   [$env.HOME .config mole connections.yaml] | path join
 }
@@ -66,7 +69,7 @@ export def edit []: nothing -> nothing {
   nu -c $"($env.EDITOR) (file)"
 }
 
-# Select the active connection used by `mole sql`/`mole mongo` when no
+# Select the active connection used by `mole sql run`/`mole mongo` when no
 # `--connection` flag is passed. Sets `$env.SQL_CURRENT_DATABASE`.
 # Without an argument, opens an interactive fuzzy picker.
 export def --env set [
@@ -77,6 +80,13 @@ export def --env set [
   }
   if ($dbname | is-not-empty) {
     $env.SQL_CURRENT_DATABASE = $dbname
+    let conf = connection-list | where name == $dbname | first | default null
+    if ($conf | is-not-empty) {
+      let family = drivers registry | get -o $conf.driver | get -o family | default "sql"
+      if $family == "sql" {
+        job spawn { try { cache refresh-if-stale $conf } catch { } } | ignore
+      }
+    }
   }
 }
 
