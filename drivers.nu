@@ -1,3 +1,5 @@
+use ./ejson.nu
+
 # Registry of database drivers. Each entry declares everything that varies per-driver:
 #   dangerous_keywords:  regex of statements that trigger the danger-prompt
 #   exec:                closure {|ctx| ... } returning a `complete` record; ctx = {conf, base, query, functions}
@@ -80,9 +82,9 @@ export def registry [] {
       dangerous_keywords: '(?i)(\binsert(One|Many)?\b|\bupdate(One|Many)?\b|\bdelete(One|Many)?\b|\breplaceOne\b|\bfindAndModify\b|\bbulkWrite\b|\bdrop(Database|Indexe?s?)?\b|\brenameCollection\b|\bcreate(Collection|Index|User|Role)\b|\$out\b|\$merge\b)'
       exec: {|ctx|
         let uri = (build-mongo-uri $ctx.conf)
-        ^mongosh $uri --quiet --json=relaxed --eval $ctx.query | complete
+        ^mongosh $uri --quiet --json=canonical --eval $ctx.query | complete
       }
-      parse: {|stdout| $stdout | from json }
+      parse: {|stdout| $stdout | from json | ejson decode }
       list_databases: {|conf|
         let uri = (build-mongo-uri $conf --no-db)
         ^mongosh $uri --quiet --json=relaxed --eval 'EJSON.stringify(db.adminCommand({listDatabases:1}).databases.map(d => d.name))' | complete
