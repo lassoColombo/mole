@@ -127,7 +127,7 @@ export def redis [
 # --refresh forces a cache rebuild before reading. --full returns the entire
 # cache record {connection, database, driver, tables, columns, constraints}
 # instead of the per-table summary.
-export def schema [
+export def "sql schema" [
   --connection(-c): string@"completers sql-connection"   # Named connection (default: current)
   --table(-t): string@"completers schema-table"          # Detail view for one table
   --find: string                                         # Find tables/columns whose name or comment matches (case-insensitive)
