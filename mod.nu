@@ -1,16 +1,17 @@
 export use ./cfg.nu
+export use ./schema.nu *
 use ./types.nu
-use ./completers.nu
+use ./complete.nu
 use ./drivers.nu
 use ./cache.nu
 
 # Run a SQL query against a configured mysql/postgres connection.
 export def "sql run" [
   --query(-q): string                                  # Inline SQL query
-  --file(-f): string@"completers queryfile"            # Path to a query file (relative to mole config dir)
-  --connection(-c): string@"completers sql-connection" # Named connection from ~/.config/mole.yml
-  --driver(-D): string@"completers sql-driver"         # Override the driver (mysql or postgres)
-  --database(-d): string@"completers sql-database"     # Override the database name
+  --file(-f): string@"complete queryfile"            # Path to a query file (relative to mole config dir)
+  --connection(-c): string@"complete sql-connection" # Named connection from ~/.config/mole.yml
+  --driver(-D): string@"complete sql-driver"         # Override the driver (mysql or postgres)
+  --database(-d): string@"complete sql-database"     # Override the database name
   --port(-p): int                                      # Override the port
   --user(-u): string                                   # Override the user
   --host(-h): string                                   # Override the host
@@ -37,12 +38,12 @@ export def "sql run" [
 # result automatically (booleans → bool, dates → datetime, ints → int, ...);
 # pass --raw to skip the conversion.
 export def "sql select" [
-  ...columns: string@"completers sql-column"             # Columns to project (default: *)
-  --from(-f): string@"completers schema-table"           # Source table
+  ...columns: string@"complete sql-column"             # Columns to project (default: *)
+  --from(-f): string@"complete schema-table"           # Source table
   --where(-w): string                                    # WHERE clause (without the WHERE keyword)
   --order-by(-o): string                                 # ORDER BY clause (without the ORDER BY keyword)
   --limit(-l): int                                       # LIMIT N
-  --connection(-c): string@"completers sql-connection"   # Named connection (default: current)
+  --connection(-c): string@"complete sql-connection"   # Named connection (default: current)
   --raw(-R)                                              # Skip cached-type conversion of the result
   --print(-p)                                            # Print the assembled SQL instead of running it
 ] {
@@ -64,9 +65,9 @@ export def "sql select" [
 # Run a query against a configured mongo connection (via mongosh).
 export def mongo [
   --query(-q): string                                    # Inline mongosh expression
-  --file(-f): string@"completers queryfile"              # Path to a query file (relative to mole config dir)
-  --connection(-c): string@"completers mongo-connection" # Named connection from ~/.config/mole.yml
-  --database(-d): string@"completers mongo-database"     # Override the default database
+  --file(-f): string@"complete queryfile"              # Path to a query file (relative to mole config dir)
+  --connection(-c): string@"complete mongo-connection" # Named connection from ~/.config/mole.yml
+  --database(-d): string@"complete mongo-database"     # Override the default database
   --port(-p): int                                        # Override the port
   --user(-u): string                                     # Override the user
   --host(-h): string                                     # Override the host
@@ -97,10 +98,10 @@ def "mongo-read-preference" [] {
 # stdin, so each line runs as a separate command.
 export def redis [
   --query(-q): string                                    # Inline command(s)
-  --file(-f): string@"completers queryfile"              # Path to a query file (relative to mole config dir)
-  --connection(-c): string@"completers redis-connection" # Named connection from ~/.config/mole.yml
-  --driver(-D): string@"completers redis-driver"         # Override the driver (redis or valkey)
-  --database(-d): string@"completers redis-database"     # Override the database index (0..N-1)
+  --file(-f): string@"complete queryfile"              # Path to a query file (relative to mole config dir)
+  --connection(-c): string@"complete redis-connection" # Named connection from ~/.config/mole.yml
+  --driver(-D): string@"complete redis-driver"         # Override the driver (redis or valkey)
+  --database(-d): string@"complete redis-database"     # Override the database index (0..N-1)
   --port(-p): int                                        # Override the port
   --user(-u): string                                     # Override the user (Redis ACL)
   --host(-h): string                                     # Override the host
@@ -115,127 +116,8 @@ export def redis [
   run $conf --query $query --file $file --yes=$yes
 }
 
-# Show the cached schema for a SQL connection.
-#
-# Without --table: a summary row per table (schema, name, type, n_columns,
-# primary key, row_estimate, comment).
-#
-# With --table NAME: a detailed record { table, columns, constraints } for the
-# matching table. NAME may be "table" or "schema.table"; the latter is required
-# when the same name exists in multiple schemas.
-#
-# --refresh forces a cache rebuild before reading. --full returns the entire
-# cache record {connection, database, driver, tables, columns, constraints}
-# instead of the per-table summary.
-export def "sql schema" [
-  --connection(-c): string@"completers sql-connection"   # Named connection (default: current)
-  --table(-t): string@"completers schema-table"          # Detail view for one table
-  --find: string                                         # Find tables/columns whose name or comment matches (case-insensitive)
-  --refresh(-r)                                          # Rebuild the cache before reading
-  --full                                                 # Return the full cache record
-] {
-  let conf = resolve-and-override $connection {}
-  assert-family $conf "sql"
-  if $refresh { cache refresh $conf }
-  let data = cache load $conf
-  if $full { return $data }
-  if ($find | is-not-empty) {
-    schema-find $data $find
-  } else if ($table | is-not-empty) {
-    schema-table-detail $data $table
-  } else {
-    schema-table-list $data
-  }
-}
-
-def schema-find [data: record, pat: string]: nothing -> any {
-  let p = $pat | str downcase
-  let table_hits = $data.tables
-    | where {|t| (matches $t.name $p) or (matches ($t.comment | default "") $p) }
-    | each {|t|
-        let name_hit = (matches $t.name $p)
-        {
-          schema: $t.schema
-          table: $t.name
-          column: ""
-          kind: (if $name_hit { "table" } else { "table-comment" })
-          match: (if $name_hit { $t.name } else { ($t.comment | default "") })
-        }
-      }
-  let column_hits = $data.columns
-    | where {|c| (matches $c.name $p) or (matches ($c.comment | default "") $p) }
-    | each {|c|
-        let name_hit = (matches $c.name $p)
-        {
-          schema: $c.schema
-          table: $c.table
-          column: $c.name
-          kind: (if $name_hit { "column" } else { "column-comment" })
-          match: (if $name_hit { $c.name } else { ($c.comment | default "") })
-        }
-      }
-  $table_hits ++ $column_hits
-}
-
-def matches [haystack: string, needle: string]: nothing -> bool {
-  $haystack | str downcase | str contains $needle
-}
-
-def schema-table-list [data: record]: nothing -> any {
-  $data.tables | each {|t|
-    let cols = $data.columns | where schema == $t.schema and table == $t.name
-    let pk = $data.constraints
-      | where schema == $t.schema and table == $t.name and type == "PRIMARY KEY"
-      | first
-      | default null
-    {
-      schema: $t.schema
-      name: $t.name
-      type: $t.type
-      columns: ($cols | length)
-      pk: (if $pk == null { "" } else { $pk.columns | str join ", " })
-      rows: $t.row_estimate
-      comment: $t.comment
-    }
-  }
-}
-
-def schema-table-detail [data: record, name: string]: nothing -> any {
-  let parts = $name | split row "."
-  let matches = if ($parts | length) >= 2 {
-    let sch = $parts | first
-    let tbl = $parts | skip 1 | str join "."
-    $data.tables | where schema == $sch and name == $tbl
-  } else {
-    $data.tables | where name == $name
-  }
-  if ($matches | is-empty) {
-    error make {msg: $"table not found in cache: ($name)"}
-  }
-  if (($matches | length) > 1) {
-    let names = $matches | each {|t| $"($t.schema).($t.name)"} | str join ", "
-    error make {msg: $"ambiguous table name '($name)' — matched: ($names). Use schema.table form."}
-  }
-  let t = $matches | first
-  let cols = $data.columns
-    | where schema == $t.schema and table == $t.name
-    | select position name display_type nullable default comment
-  let cons = $data.constraints
-    | where schema == $t.schema and table == $t.name
-    | select type name columns ref_schema ref_table ref_columns
-  {
-    schema: $t.schema
-    name: $t.name
-    type: $t.type
-    comment: $t.comment
-    row_estimate: $t.row_estimate
-    columns: $cols
-    constraints: $cons
-  }
-}
-
 # Open the query directory (or a specific query file) in the default editor.
-export def edit [queryfile?: string@"completers queryfile"] {
+export def edit [queryfile?: string@"complete queryfile"] {
   let d = cfg querydir
   let t = if ($queryfile | is-not-empty) {
     [$d $queryfile] | path join

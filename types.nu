@@ -1,7 +1,7 @@
 use ./cfg.nu
 use ./cache.nu
 use ./drivers.nu
-use ./completers.nu
+use ./complete.nu
 
 # Conversion tables: db-side type name → closure that converts one cell value
 # to a native nushell value. Used internally by `mole sql select` to coerce
@@ -61,7 +61,7 @@ def mysql-registry [] {
 }
 
 # The full data_type → closure map for a given driver. Unknown drivers yield {}.
-export def registry [driver: string@"completers sql-driver"]: nothing -> record {
+export def registry [driver: string@"complete sql-driver"]: nothing -> record {
   match $driver {
     "postgres" => (postgres-registry)
     "mysql" => (mysql-registry)
@@ -83,8 +83,8 @@ export def column-converter [driver: string, col: record]: nothing -> any {
 # Columns absent from the result or whose db type has no registered converter
 # are left untouched.
 export def "apply" [
-  table: string@"completers schema-table"        # Table whose types should be applied
-  --connection(-c): string@"completers sql-connection"
+  table: string@"complete schema-table"        # Table whose types should be applied
+  --connection(-c): string@"complete sql-connection"
 ]: any -> any {
   let rows = $in
   let conf = resolve-conf $connection

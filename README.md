@@ -155,6 +155,48 @@ Built-in drivers:
 
 Adding a driver is a matter of adding one entry to the registry in `drivers.nu`. The pipeline in `mod.nu` dispatches through the registry — no command code changes needed.
 
+## Schema
+
+`mole` caches each SQL connection's schema (tables, columns, constraints) under `~/.cache/mole/` and refreshes it in the background after queries. Two commands read that cache; both live in `schema.nu`.
+
+### `mole sql schema`
+
+Inspect the cached schema as Nushell data.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--connection` | `-c` | Named connection (default: current) |
+| `--table` | `-t` | Detailed record `{schema, name, columns, constraints}` for one table (`table` or `schema.table`) |
+| `--find` | | Tables/columns whose name or comment matches (case-insensitive) |
+| `--refresh` | `-r` | Rebuild the cache before reading |
+| `--full` | | Return the entire cache record |
+
+```nushell
+mole sql schema                       # one summary row per table
+mole sql schema -t orders             # columns + constraints for `orders`
+mole sql schema --find email          # where does "email" show up?
+mole sql schema -r                    # force a refresh first
+```
+
+### `mole sql dumpschema`
+
+Serialize the cached schema to a diagram/text format. The result is a string, so redirect or pipe it where you need it.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--connection` | `-c` | Named connection (default: current) |
+| `--format` | `-F` | Output format (default: `mermaid`) |
+| `--refresh` | `-r` | Rebuild the cache before dumping |
+
+```nushell
+mole sql dumpschema | save schema.mmd
+mole sql dumpschema -c my-pg --format mermaid
+```
+
+The `mermaid` format renders a [Mermaid](https://mermaid.js.org/) `erDiagram`: one entity per table with its columns (type plus `PK`/`FK`/`UK` markers and comments) and one relationship per foreign key — the relationship cardinality reflects whether the FK is mandatory (`||`) or nullable (`|o`).
+
+Like the driver registry, formats are pluggable: add an entry to the `dump-formatters` record in `schema.nu` and the `--format` flag, its completer, and the dispatch all pick it up — no command changes needed.
+
 ## Translate-to
 
 `mole cfg translate-to <spec>` returns a structured record matching the target tool's config schema. The user picks the encoding:
@@ -177,8 +219,12 @@ Each driver carries a regex of statements that warrant a confirmation prompt —
 
 ```
 mole/
-├── mod.nu          # `main` (SQL runner), `edit`, re-exports cfg
-├── cfg.nu          # connection-file management, translate-to
-├── drivers.nu      # per-driver registry
-└── completers.nu   # tab completers
+├── mod.nu          # query runners (`sql run`/`sql select`, `mongo`, `redis`), `edit`, re-exports cfg + schema
+├── cfg.nu          # connection-file management, `cfg` commands, translate-to
+├── schema.nu       # `sql schema` (views) + `sql dumpschema` (mermaid & future formats)
+├── drivers.nu      # per-driver registry (exec / parse / danger keywords / schema queries)
+├── cache.nu        # per-(connection, database) schema cache
+├── types.nu        # cached-type → native-value conversion for `sql select`
+├── completers.nu   # tab completers
+└── ejson.nu        # MongoDB Extended JSON decoding
 ```
