@@ -1,0 +1,7 @@
+# mole's manifest — read at runtime by lib/version.nu. mole core declares exactly
+# ONE version: the api version, i.e. the core<->submodule contract version
+# (native semver, no `v` prefix). Every submodule declares an api requirement
+# (a semver-range) against THIS number. Bump it here, not in code.
+{
+  api: "0.1.0"
+}
