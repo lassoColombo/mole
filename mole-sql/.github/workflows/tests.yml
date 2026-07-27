@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches-ignore: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nushell
+        uses: hustcer/setup-nu@v3
+        with:
+          version: '0.114.1'
+
+      - name: Install nutest
+        run: |
+          git clone https://github.com/vyadh/nutest.git nutest
+          git -C nutest checkout c46af12bc6e3819b95d69f54f35526ca3e5810d6
+
+      # mole-sql test suite: deterministic, no network, no external CLIs.
+      - name: Run nutest suite
+        run: |
+          nu -c "use ./nutest/nutest; nutest run-tests --path tests --fail --report { type: 'junit', path: 'report.xml' }"
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-report
+          path: report.xml

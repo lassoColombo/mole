@@ -1,0 +1,24 @@
+# mole manifest — a PLUGIN (data source) for MySQL (also MariaDB / Percona via
+# the same `mysql` client).
+#   api   — the mole-core contract it targets: a native semver-range and the ONE
+#           version constraint mole checks (bare = caret; checked at load and by
+#           `mole submodules doctor`).
+#   deps  — a UNIFIED dependency list; each entry's `kind` is "submodule" (a
+#           module dependency, e.g. the mole-sql library) or "cli" (an external
+#           executable it drives). mole checks PRESENCE, not versions.
+# `version` is this plugin's own release. Needs mysql ≥5.7 for the features used
+# (batch/TSV stdin, MYSQL_PWD, information_schema introspection) — documentation,
+# not an enforced constraint.
+{
+  kind: "plugin"
+  driver: "mysql"
+  version: "0.1.0"
+  api: "^0.1.0"
+  family: "sql"
+  suffix: ".sql"
+  deps: [
+    { kind: "submodule", name: "mole-sql" }
+    { kind: "cli", name: "mysql" }
+  ]
+  summary: "MySQL"
+}

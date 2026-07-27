@@ -1,0 +1,19 @@
+# mole manifest — a PLUGIN (data source) for Prometheus. It talks to Prometheus
+# over its HTTP API using Nushell's built-in `http`, so it drives NO external CLI
+# (no `kind: "cli"` entry in `deps`). Its one dependency is the generic
+# `mole-promql` library (the pure HTTP-API transforms / query builder it shares
+# with mole-victoriametrics), a `kind: "submodule"` entry in the unified `deps`
+# list, checked for PRESENCE by `mole submodules doctor`. The generated
+# `client.nu` is a build artifact, not a runtime dependency. `api` is its
+# mole-core requirement — a native semver-range and the one version constraint
+# mole checks, checked at load by `version require-api`.
+{
+  kind: "plugin"
+  driver: "prometheus"
+  version: "0.1.0"
+  api: "^0.1.0"
+  family: "prometheus"
+  suffix: ".promql"
+  deps: [ { kind: "submodule", name: "mole-promql" } ]
+  summary: "Prometheus (HTTP API, read-only)"
+}

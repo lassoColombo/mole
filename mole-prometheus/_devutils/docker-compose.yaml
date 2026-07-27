@@ -1,0 +1,52 @@
+# Local dev / test Prometheus for the mole-prometheus plugin.
+#
+#   docker compose -f mole-prometheus/_devutils/docker-compose.yaml up -d --wait
+#
+# Obscure host port 59090 (→ container 9090, Prometheus' default) to avoid
+# colliding with a local Prometheus. Matches the `prometheus-local-dev`
+# connection in ~/.config/mole/connections.yaml:
+#
+#   connections:
+#     - name: prometheus-local-dev
+#       driver: prometheus
+#       url: http://localhost:59090
+#
+# SEEDING — Prometheus has no ingestion API (it SCRAPES), so there is no seeder
+# sidecar (cf. mole-trino's built-in data). Instead `initdb/prometheus.yml`
+# configures TWO scrape jobs — `prometheus` (self) and `node` (the node-exporter
+# sidecar) — at a fast 2s interval, so within a few seconds the instance holds
+# real, queryable series: `up{job=prometheus|node}`, `scrape_*`, `go_*`,
+# `process_*`, `prometheus_*`, `node_*`, with target metadata for `metrics`.
+# Wait a beat after `up` for the first scrapes to land before querying.
+name: mole-prometheus-devutils
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mole-prometheus-local-dev
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    volumes:
+      - ./initdb/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - mole-prometheus-data:/prometheus
+    ports:
+      - "59090:9090"
+    depends_on:
+      - node-exporter
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/healthy"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # A second scrape target, so there are two jobs / richer label sets to exercise
+  # `labels`, `label-values job` (→ node, prometheus) and `series`.
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: mole-prometheus-node-exporter
+    # No published port; Prometheus reaches it over the compose network at
+    # node-exporter:9100.
+
+volumes:
+  mole-prometheus-data:

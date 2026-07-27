@@ -1,0 +1,18 @@
+# mole manifest — a PLUGIN (data source) for VictoriaLogs. It talks to
+# VictoriaLogs over its HTTP LogsQL API using Nushell's built-in `http`, so it has
+# no dependencies at all — neither a driven CLI nor a module dependency
+# (`deps: []`). Unlike mole-prometheus there is no generated `client.nu`:
+# VictoriaLogs ships no OpenAPI spec and its query endpoints are POST
+# form-urlencoded (not GET), so the client is hand-written (see client.nu).
+# `api` is its mole-core requirement — a native semver-range, checked at load by
+# `version require-api` and by `mole submodules doctor`.
+{
+  kind: "plugin"
+  driver: "victorialogs"
+  version: "0.1.0"
+  api: "^0.1.0"
+  family: "victorialogs"
+  suffix: ".logsql"
+  deps: []
+  summary: "VictoriaLogs (LogsQL HTTP API, read-only)"
+}

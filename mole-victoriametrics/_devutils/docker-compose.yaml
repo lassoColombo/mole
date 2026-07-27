@@ -1,0 +1,56 @@
+# Local dev / test VictoriaMetrics (single-node) for the mole-victoriametrics plugin.
+#
+#   docker compose -f mole-victoriametrics/_devutils/docker-compose.yaml up -d --wait
+#
+# Obscure host port 58428 (→ container 8428, VictoriaMetrics' default) to avoid
+# colliding with a local VictoriaMetrics. Matches the `victoriametrics-local-dev`
+# connection in ~/.config/mole/connections.yaml:
+#
+#   connections:
+#     - name: victoriametrics-local-dev
+#       driver: victoriametrics
+#       url: http://localhost:58428
+#
+# SEEDING — VictoriaMetrics SCRAPES (built-in vmagent via --promscrape.config),
+# exactly like the Prometheus dev stack, rather than a one-shot import. Two scrape
+# jobs — `victoriametrics` (self, exposing hundreds of vm_*/go_*/up series) and
+# `node` (the node-exporter sidecar) — at a fast 2s interval keep data
+# CONTINUOUSLY FRESH, so instant AND range queries always return (an imported
+# fixture would expire past VM's lookback and leave range windows empty). Wait a
+# couple of scrape intervals after `up` before querying.
+name: mole-victoriametrics-devutils
+
+services:
+  victoria-metrics:
+    image: victoriametrics/victoria-metrics:latest
+    container_name: mole-victoriametrics-local-dev
+    command:
+      - "--storageDataPath=/vmdata"
+      - "--httpListenAddr=:8428"
+      - "--retentionPeriod=100y"
+      - "--promscrape.config=/etc/vm/scrape.yml"
+      # Query the freshest data: VM otherwise shifts instant queries back 30s
+      # (search.latencyOffset), so a query issued right after `up` returns empty
+      # until 30s of history exists. 0s makes the dev stack queryable in seconds.
+      - "--search.latencyOffset=0s"
+    ports:
+      - "58428:8428"
+    volumes:
+      - ./initdb/scrape.yml:/etc/vm/scrape.yml:ro
+      - mole-victoriametrics-data:/vmdata
+    depends_on:
+      - node-exporter
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8428/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  # A second scrape target so there are two jobs / richer label sets to exercise
+  # labels / label-values job (→ node, victoriametrics) / series.
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: mole-victoriametrics-node-exporter
+
+volumes:
+  mole-victoriametrics-data:

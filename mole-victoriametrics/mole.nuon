@@ -1,0 +1,27 @@
+# mole manifest — a PLUGIN (data source) for VictoriaMetrics (single-node). It
+# talks to VictoriaMetrics over its Prometheus-compatible HTTP querying API using
+# Nushell's built-in `http`, so it drives NO external CLI (no `kind: "cli"` entry
+# in `deps`). Its one dependency is the generic `mole-promql` library (the pure
+# HTTP-API transforms / query builder it shares with mole-prometheus), a
+# `kind: "submodule"` entry in the unified `deps` list, checked for PRESENCE by
+# `mole submodules doctor`. The generated `client.nu` is a build artifact, not a
+# runtime dependency. `api` is its mole-core requirement — a native semver-range
+# and the one version constraint mole checks, checked at load by `version
+# require-api`.
+#
+# VictoriaMetrics implements the SAME `/api/v1` query surface (query/query_range/
+# series/labels/label-values/metadata) with the SAME request params and response
+# envelopes as Prometheus, so this plugin is a close port of mole-prometheus. The
+# query language is MetricsQL (a PromQL superset), passed through as an opaque
+# string — no parsing needed. Its own `driver` (`victoriametrics`) keeps it a
+# separate plugin, siblings with mole-prometheus and mole-vlogs.
+{
+  kind: "plugin"
+  driver: "victoriametrics"
+  version: "0.1.0"
+  api: "^0.1.0"
+  family: "victoriametrics"
+  suffix: ".mql"
+  deps: [ { kind: "submodule", name: "mole-promql" } ]
+  summary: "VictoriaMetrics (HTTP API, read-only)"
+}

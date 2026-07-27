@@ -1,0 +1,16 @@
+-- YugabyteDB seed wrapper for the mole-psql dev cluster.
+--
+-- YugabyteDB's YSQL API reuses the PostgreSQL query layer, and its `serial` is
+-- Postgres-faithful (a real sequence → ids 1,2,3,4), so the ONE shared seed runs
+-- UNMODIFIED — no serial tweak needed (unlike CockroachDB). It is applied
+-- OUT-OF-BAND simply because the yugabyte image has no ./initdb hook.
+--
+-- Apply from the workspace root once the container is healthy (host port 55435,
+-- user yugabyte, db yugabyte, no password):
+--
+--   psql -h 127.0.0.1 -p 55435 -U yugabyte -d yugabyte -c 'CREATE DATABASE demo;'
+--   psql -h 127.0.0.1 -p 55435 -U yugabyte -d demo \
+--        -v ON_ERROR_STOP=1 -f mole-psql/_devutils/seed-yugabyte.sql
+--
+-- The `demo` database matches the `yugabytedb-local-dev` connection.
+\i initdb/01-seed.sql

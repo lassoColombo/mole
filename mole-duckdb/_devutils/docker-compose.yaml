@@ -1,0 +1,39 @@
+# Local dev / test DuckDB for the mole-duckdb plugin.
+#
+#   docker compose -f mole-duckdb/_devutils/docker-compose.yaml up
+#
+# DEVIATION FROM THE mole-psql CONVENTION: DuckDB is EMBEDDED — there is no
+# server to run. So instead of a long-lived database container, this is a
+# ONE-SHOT service that SEEDS a `demo.duckdb` FILE and exits. The plugin then
+# opens that file directly (there is no host/port to connect to); point the
+# `duckdb-local-dev` connection at the produced file:
+#
+#   connections:
+#     - name: duckdb-local-dev
+#       driver: duckdb
+#       path: /ABSOLUTE/PATH/TO/mole-duckdb/_devutils/data/demo.duckdb
+#
+# The image's ENTRYPOINT is the `duckdb` binary, so `command:` is passed straight
+# to it: open /data/demo.duckdb and `.read` the seed script. The seed exercises
+# the type map (BOOLEAN, INTEGER, DOUBLE, DECIMAL, DATE, TIMESTAMP, TIMESTAMPTZ,
+# JSON, VARCHAR) and schema introspection (pk/fk/unique + table & column
+# comments). Re-running rebuilds against the existing file; `docker compose down`
+# + `rm -rf _devutils/data` for a clean slate.
+#
+# NO DOCKER? DuckDB is a single binary — seed the file directly with the CLI
+# (this is what CI on this host actually used):
+#
+#   mkdir -p mole-duckdb/_devutils/data
+#   duckdb mole-duckdb/_devutils/data/demo.duckdb \
+#     -c ".read mole-duckdb/_devutils/initdb/01-seed.sql"
+name: mole-duckdb-devutils
+
+services:
+  seed:
+    image: datacatering/duckdb:v1.5.5
+    container_name: mole-duckdb-seed
+    # ENTRYPOINT is /duckdb; these args open the DB file and run the seed script.
+    command: ["/data/demo.duckdb", "-c", ".read /initdb/01-seed.sql"]
+    volumes:
+      - ./initdb:/initdb:ro
+      - ./data:/data

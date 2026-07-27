@@ -1,0 +1,89 @@
+# Local dev / test MySQL-wire engines for the mole-mysql plugin.
+#
+#   docker compose -f mole-mysql/_devutils/docker-compose.yaml up -d
+#
+# mole-mysql exec is `^mysql` over the MYSQL WIRE PROTOCOL, so every
+# wire-compatible engine works through the same exec with no new code — file their
+# connections under the `mysql` section, same as any MySQL server. Each service is
+# one such wire-compatible engine, on its own OBSCURE
+# host port (→ container 3306), each seeded from ./initdb so `schema`/`select`/
+# `query` can be exercised end to end. initdb/ scripts run once, on first boot.
+#
+# Host-port map (all → container 3306):
+#   mysql     53306   (mysql:8.4)                     connection mysql-local-dev
+#   mariadb   53307   (mariadb:11)                    connection mariadb-local-dev
+#   percona   53308   (percona/percona-server:8.0)    connection percona-local-dev
+#
+# The seed (initdb/01-seed.sql) exercises the type map (tinyint(1)->bool, int,
+# decimal, date/datetime/timestamp, json) and schema introspection (pk/fk/unique
+# + table/column comments). MariaDB & Percona accept the same DDL and expose the
+# same information_schema, so all three share the one seed via the ./initdb mount
+# and the mysql-family entrypoint (MYSQL_/MARIADB_ env, *.sql on first boot).
+name: mole-mysql-devutils
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: mole-mysql-local-dev
+    environment:
+      MYSQL_ROOT_PASSWORD: mole
+      MYSQL_DATABASE: demo
+    ports:
+      - "53306:3306"
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - mole-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pmole"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # MariaDB is MySQL-wire compatible and exposes the same information_schema our
+  # introspection reads. The official image honors the MYSQL_* env for drop-in
+  # compatibility and runs ./initdb *.sql on first boot. Note: MariaDB implements
+  # JSON as an alias of LONGTEXT, so information_schema.data_type reports
+  # `longtext` (not `json`) — the json cell-converter therefore does not fire and
+  # JSON columns come back as strings (documented limitation); file it under
+  # the `mysql` section.
+  mariadb:
+    image: mariadb:11
+    container_name: mole-mariadb-local-dev
+    environment:
+      MYSQL_ROOT_PASSWORD: mole
+      MYSQL_DATABASE: demo
+    ports:
+      - "53307:3306"
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - mole-mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  # Percona Server for MySQL is a drop-in MySQL 8.0 fork: same wire protocol,
+  # same information_schema, same MYSQL_* env and ./initdb hook, same JSON type;
+  # file it under the `mysql` section.
+  percona:
+    image: percona/percona-server:8.0
+    container_name: mole-percona-local-dev
+    environment:
+      MYSQL_ROOT_PASSWORD: mole
+      MYSQL_DATABASE: demo
+    ports:
+      - "53308:3306"
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - mole-percona-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pmole"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  mole-mysql-data:
+  mole-mariadb-data:
+  mole-percona-data:

@@ -1,0 +1,23 @@
+# mole manifest — a PLUGIN (data source) for PostgreSQL.
+#   api   — the mole-core contract it targets: a native semver-range and the ONE
+#           version constraint mole checks (bare = caret; `^`/`~`/`>=`/`=`, a
+#           comma-compound and `*` honored). Checked at load by `version
+#           require-api` and by `mole submodules doctor`.
+#   deps  — a UNIFIED dependency list; each entry's `kind` is "submodule" (a
+#           module dependency, e.g. the mole-sql library) or "cli" (an external
+#           executable it drives). mole checks PRESENCE, not versions.
+# `version` is this plugin's own release. Needs psql ≥12 for the `--csv` output
+# mode it relies on (documentation, not an enforced constraint).
+{
+  kind: "plugin"
+  driver: "psql"
+  version: "0.1.0"
+  api: "^0.1.0"
+  family: "sql"
+  suffix: ".sql"
+  deps: [
+    { kind: "submodule", name: "mole-sql" }
+    { kind: "cli", name: "psql" }
+  ]
+  summary: "PostgreSQL"
+}

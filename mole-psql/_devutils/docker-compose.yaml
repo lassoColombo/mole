@@ -1,0 +1,104 @@
+# Local dev / test PostgreSQL-wire engines for the mole-psql plugin.
+#
+#   docker compose -f mole-psql/_devutils/docker-compose.yaml up -d
+#
+# mole-psql exec is `^psql` over the POSTGRES WIRE PROTOCOL. The engines below
+# integrate with NO change to the plugin's dialect code (mod.nu): the same
+# introspection SQL, type map and `select` all work unmodified — file their
+# connections under the `psql` section, same as any postgres server. Each runs on
+# its own OBSCURE host port to avoid colliding with a local server.
+#
+# Engines that would require touching mod.nu (cockroachdb needs a cockroach-only
+# introspection filter; redshift is not a faithful PG catalog) are deliberately
+# NOT here — they belong in their own submodule, per the "a dialect that needs
+# submodule-code tweaks gets its own module" rule.
+#
+# Host-port map (all → the engine's native wire port):
+#   postgres      55432 → 5432   (postgres:16)                  connection postgres-local-dev
+#   timescaledb   55433 → 5432   (timescale/timescaledb pg16)   connection timescaledb-local-dev
+#   yugabytedb    55435 → 5433   (yugabytedb/yugabyte)          connection yugabytedb-local-dev
+#
+# Seeding — the ONE shared seed (initdb/01-seed.sql) exercises the type map
+# (bool, int, numeric, date/timestamp, jsonb) and introspection (pk/fk/unique +
+# table/column comments):
+#   * postgres & timescaledb — auto-seeded via the ./initdb mount + POSTGRES_*
+#     env on first boot (their entrypoints run *.sql there).
+#   * yugabytedb — seeded OUT-OF-BAND (see seed-yugabyte.sql): it has no initdb
+#     hook, but accepts the same standard DDL (its serial is postgres-faithful),
+#     so the shared seed is applied unmodified.
+name: mole-psql-devutils
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: mole-psql-local-dev
+    environment:
+      POSTGRES_USER: mole
+      POSTGRES_PASSWORD: mole
+      POSTGRES_DB: demo
+    ports:
+      - "55432:5432"
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - mole-psql-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mole -d demo"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # TimescaleDB is stock PostgreSQL + an extension: identical wire protocol,
+  # identical catalogs, same postgres entrypoint (so ./initdb + POSTGRES_* work
+  # unchanged); file it under the `psql` section. Zero mod.nu changes.
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: mole-timescaledb-local-dev
+    environment:
+      POSTGRES_USER: mole
+      POSTGRES_PASSWORD: mole
+      POSTGRES_DB: demo
+    ports:
+      - "55433:5432"
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - mole-timescaledb-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mole -d demo"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # YugabyteDB's YSQL API reuses the PostgreSQL query layer (wire protocol +
+  # pg_catalog / information_schema), listening on 5433. `bin/yugabyted start`
+  # runs a local single-node cluster. Default user `yugabyte`, db `yugabyte`, no
+  # password. No initdb hook, so the seed is applied out-of-band by the test
+  # harness (its serial is postgres-faithful → shared seed unmodified; see
+  # _devutils/seed-yugabyte.sql); file it under the `psql` section. Zero mod.nu changes.
+  yugabytedb:
+    image: yugabytedb/yugabyte:latest
+    container_name: mole-yugabytedb-local-dev
+    # Pin a STABLE hostname + advertise it: yugabyted persists its advertise
+    # address into the data dir, and on a restart/recreate it re-resolves that
+    # stored name — with docker's default random per-container hostname it would
+    # point at the *previous* container and crash (socket.gaierror). A fixed
+    # hostname keeps recreates resolvable. --daemon=false keeps it foreground so
+    # the container stays up.
+    hostname: mole-yugabytedb
+    command: bin/yugabyted start --daemon=false --advertise_address=mole-yugabytedb
+    ports:
+      - "55435:5433"
+    volumes:
+      - mole-yugabytedb-data:/root/var
+    # yugabyted binds YSQL to the container's advertised (eth0) address, NOT
+    # loopback, so the probe connects to $(hostname -i), not 127.0.0.1. Host
+    # access is unaffected — it uses the published 55435->5433 port mapping.
+    healthcheck:
+      test: ["CMD-SHELL", "/home/yugabyte/bin/ysqlsh -h $(hostname -i) -p 5433 -U yugabyte -d yugabyte -c 'SELECT 1' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+volumes:
+  mole-psql-data:
+  mole-timescaledb-data:
+  mole-yugabytedb-data:

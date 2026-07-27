@@ -1,0 +1,21 @@
+# mole manifest — a PLUGIN (data source) for DuckDB.
+#   api / deps — see mole-psql for the shared schema. `api` is the ONE version
+#                constraint mole checks; `deps` is one unified list, each entry
+#                tagged `kind` "submodule" or "cli", checked for PRESENCE only.
+# DuckDB is EMBEDDED: a connection is a FILE PATH (or ":memory:"), not host/port/
+# user — the plugin reads `path` (or `database`) from the connection record.
+# Needs duckdb ≥1.0.0 (Jun 2024) for the forward-compatible file format and the
+# `-readonly` flag the parallel schema loader uses (documentation, not enforced).
+{
+  kind: "plugin"
+  driver: "duckdb"
+  version: "0.1.0"
+  api: "^0.1.0"
+  family: "sql"
+  suffix: ".sql"
+  deps: [
+    { kind: "submodule", name: "mole-sql" }
+    { kind: "cli", name: "duckdb" }
+  ]
+  summary: "DuckDB"
+}

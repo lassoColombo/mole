@@ -1,0 +1,17 @@
+# Dev scrape config for the mole-victoriametrics _devutils stack, loaded via
+# VictoriaMetrics' built-in --promscrape.config. Two jobs so the instance has
+# real, multi-label data continuously: `victoriametrics` scrapes itself (vm_*,
+# go_*, up, scrape_*), `node` scrapes the node-exporter sidecar. Fast interval so
+# instant and range queries always have fresh points.
+global:
+  scrape_interval: 2s
+  scrape_timeout: 2s
+
+scrape_configs:
+  - job_name: victoriametrics
+    static_configs:
+      - targets: ["localhost:8428"]
+
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]

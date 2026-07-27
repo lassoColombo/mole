@@ -1,0 +1,6 @@
+{"_msg":"service started","host":"h1","app":"api","level":"info"}
+{"_msg":"request handled ok","host":"h1","app":"api","level":"info"}
+{"_msg":"db connection timeout","host":"h1","app":"api","level":"error"}
+{"_msg":"cache miss for key user:42","host":"h2","app":"worker","level":"warn"}
+{"_msg":"job completed","host":"h2","app":"worker","level":"info"}
+{"_msg":"unhandled exception in handler","host":"h2","app":"worker","level":"error"}

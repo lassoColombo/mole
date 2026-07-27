@@ -1,0 +1,51 @@
+# Local dev / test VictoriaLogs for the mole-victorialogs plugin.
+#
+#   docker compose -f mole-victorialogs/_devutils/docker-compose.yaml up -d --wait
+#
+# Obscure host port 59428 (→ container 9428, VictoriaLogs' default) to avoid
+# colliding with a local VictoriaLogs. Matches the `victorialogs-local-dev`
+# connection in ~/.config/mole/connections.yaml:
+#
+#   connections:
+#     - name: victorialogs-local-dev
+#       driver: victorialogs
+#       url: http://localhost:59428
+#
+# SEEDING — a one-shot `seeder` sidecar pushes test log lines via the JSON-line
+# ingestion API (initdb/logs.jsonl → /insert/jsonline), forces a flush, and exits
+# 0. The fixtures span two streams (host/app = h1/api, h2/worker) and three levels
+# (info/warn/error) to exercise query/hits/stats/fields/field-values/streams/facets.
+#
+# NOTE: the `victoria-logs` image is built FROM scratch — no shell, no wget — so
+# it carries NO container healthcheck (a `wget`-based probe can't run in it). The
+# seeder therefore starts on `service_started` and POLLS /health itself before
+# ingesting; `up --wait` completes once the seeder has exited 0.
+name: mole-victorialogs-devutils
+
+services:
+  victoria-logs:
+    image: victoriametrics/victoria-logs:latest
+    container_name: mole-victorialogs-local-dev
+    command:
+      - "--storageDataPath=/vlogs"
+      - "--httpListenAddr=:9428"
+      - "--retentionPeriod=100y"
+    ports:
+      - "59428:9428"
+    volumes:
+      - mole-victorialogs-data:/vlogs
+
+  seeder:
+    image: curlimages/curl:latest
+    depends_on:
+      victoria-logs:
+        condition: service_started
+    volumes:
+      - ./initdb:/seed:ro
+    entrypoint: ["sh", "/seed/seed.sh"]
+    environment:
+      VLOGS_URL: http://victoria-logs:9428
+    restart: "no"
+
+volumes:
+  mole-victorialogs-data:

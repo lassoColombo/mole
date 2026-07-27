@@ -1,0 +1,17 @@
+# Dev scrape config for the mole-prometheus _devutils stack. Two jobs so the
+# instance has real, multi-label data the moment it is up: `prometheus` scrapes
+# itself, `node` scrapes the node-exporter sidecar. Fast interval so fixtures
+# land within a couple of seconds.
+global:
+  scrape_interval: 2s
+  scrape_timeout: 2s
+  evaluation_interval: 2s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]

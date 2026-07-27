@@ -1,0 +1,9 @@
+{
+  "matchers": [
+    { "name": "service", "value": "web", "isRegex": false, "isEqual": true }
+  ],
+  "startsAt": "2026-07-01T00:00:00Z",
+  "endsAt": "2099-01-01T00:00:00Z",
+  "createdBy": "mole-dev",
+  "comment": "Silence web-service alerts in the dev stack"
+}
