@@ -8,10 +8,12 @@ def setup [] {
   let temp = mktemp --tmpdir --directory
   mkdir ($temp | path join mole)
   {
-    connections: [
-      { name: "db1", driver: "postgres" }
-      { name: "db2", driver: "postgres" }
-    ]
+    connections: {
+      psql: [
+        { name: "db1", driver: "postgres" }
+        { name: "db2", driver: "postgres" }
+      ]
+    }
   } | to yaml | save ($temp | path join mole connections.yaml)
   mkdir ($temp | path join mole queries sub)
   "x" | save ($temp | path join mole queries a.sql)

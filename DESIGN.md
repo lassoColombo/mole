@@ -4,12 +4,18 @@ mole is the shared foundation for a family of small Nushell modules that wrap
 data-source CLIs/APIs (`mole-sql`, `mole-vlogs`, …) behind typed, completion-aware
 verbs. This document is the interface spec.
 
+> **Scope note.** Submodule *management* (`mole submodules …`) and the
+> version/compatibility contract were removed for now. mole core is currently
+> connection-config + saved-query management plus the shared `lib/` plumbing;
+> submodules still self-register at load. Installing/updating a submodule is plain
+> `git` by hand. This spec describes that reduced surface.
+
 ## 1. The one principle: submodules depend on mole, never the reverse
 
 ```
         ┌──────────────┐
-        │     mole     │   mod.nu · cfg.nu · submodules.nu  → user commands
-        │  ┌────────┐  │   lib/*.nu                         → plumbing (private)
+        │     mole     │   mod.nu · cfg.nu   → user commands
+        │  ┌────────┐  │   lib/*.nu          → plumbing (private)
         │  │  lib   │  │
         └──┴────────┴──┘
               ▲
@@ -32,28 +38,24 @@ Installing a submodule is only cloning a sibling repo — no umbrella, no
 | `use mod` (no `*`) prefixes commands with the module name; a private `use` (not `export use`) does not re-export. | Prefix = dir name (`use mole-sql` → `mole-sql select`). `mod.nu` imports `./lib/*` privately, so `use mole` never leaks plumbing. |
 | A file module is imported **with its `.nu` extension** (`use ./lib/conn.nu`); the module name is the basename (`conn`). | Concern files compose as `conn resolve`, `cache path`, … |
 | A command's `@"completer"` binding is captured on import. | Callers annotate `@"complete connection"`. |
-| `into semver` / `into semver-range` + `in` evaluate semver-ranges (a bare version means caret); `into semver` rejects non-semver and `v`-prefixed strings. | Version gating and tag validation are native one-liners — no dependency. |
 
 ## 3. Layout & command surface
 
 ```
 <workspace>/
 ├── mole/
-│   ├── mod.nu          # composition + `mole api-version`, `mole edit`
-│   ├── cfg.nu          # `mole cfg show/file/querydir/edit`
-│   ├── submodules.nu   # `mole submodules sources/doctor/install/uninstall/update/checkout`
-│   ├── mole.nuon       # mole's single tag: { api } (read at runtime)
-│   └── lib/            # plumbing concerns (private to mole; imported by submodules)
-│       ├── version.nu · config.nu · conn.nu · cache.nu · query.nu · complete.nu
-├── mole-sql/    mod.nu · plugin.nuon      (`use ../mole/lib/*.nu`)
-└── mole-vlogs/  mod.nu · plugin.nuon
+│   ├── mod.nu    # composition + `mole query edit/show/dir`
+│   ├── cfg.nu    # `mole cfg show/file/dir/edit`
+│   └── lib/      # plumbing concerns (private to mole; imported by submodules)
+│       ├── config.nu · conn.nu · cache.nu · query.nu · complete.nu
+├── mole-sql/    mod.nu · mole.nuon      (`use ../mole/lib/*.nu`)
+└── mole-vlogs/  mod.nu · mole.nuon
 ```
 
-`use mole` exposes **only management commands** (scoped where natural):
-`mole api-version`, `mole edit`, `mole cfg …`, `mole submodules …`. `mod.nu`
-composes `cfg.nu`/`submodules.nu` with `export use ./cfg.nu` / `export use
-./submodules.nu` (whole-file, no `*`), so their leaf defs become `mole cfg show`,
-`mole submodules sources`, etc.
+`use mole` exposes **only management commands**: `mole cfg …` (connection config)
+and `mole query …` (saved queries). `mod.nu` composes `cfg.nu` with `export use
+./cfg.nu` (whole-file, no `*`), so its leaf defs become `mole cfg show`, etc.; the
+`query` verbs are defined directly in `mod.nu`.
 
 ## 4. The lib (plumbing), imported per concern
 
@@ -62,9 +64,8 @@ extension. Submodules import only what they need; `use mole` never exposes any:
 
 | Import | Commands |
 |--------|----------|
-| `use ../mole/lib/version.nu` | `version api-version`, `version require-api` |
 | `use ../mole/lib/config.nu`  | `config file`, `config querydir` |
-| `use ../mole/lib/conn.nu`    | `conn list`, `conn resolve`, `conn override` |
+| `use ../mole/lib/conn.nu`    | `conn list`, `conn resolve`, `conn override`, `conn with` |
 | `use ../mole/lib/cache.nu`   | `cache path/read/write/stale/clear` |
 | `use ../mole/lib/query.nu`   | `query resolve`, `query confirm`, `query check` |
 | `use ../mole/lib/complete.nu`| `complete connection`, `complete queryfile` |
@@ -78,83 +79,61 @@ A record keyed by source, built at load by each submodule's own `export-env`:
 
 ```nushell
 # in mole-sql/mod.nu
-use ../mole/lib/version.nu
 use ../mole/lib/conn.nu
 const HERE = (path self | path dirname)
 export-env {
-  let m = (open ([$HERE plugin.nuon] | path join))   # its manifest (data)
-  version require-api $m.api                           # version gate (§6)
+  let m = (open ([$HERE mole.nuon] | path join))   # its manifest (data)
   $env.MOLE_REGISTRY = (($env.MOLE_REGISTRY? | default {}) | upsert $m.source $m)
   $env.MOLE_CURRENT  = ($env.MOLE_CURRENT? | default {})
 }
 ```
 
-`conn list` reads the registry to map a connection's `driver` → owning `source`;
-`mole submodules sources/doctor` read it to know what's loaded.
+The registry's keys are the loaded source names; `conn`'s `--source` completer
+(`source-names`) reads them. (Connections are resolved from the source-keyed
+config directly — §7 — so resolution itself needs no registry lookup.)
 
-## 6. Versioned integration
-
-- **mole core declares exactly one version: `api`**, in `mole.nuon` (currently
-  `0.1.0`), read at runtime by `version api-version`. It is the core↔submodule
-  contract version — the single number every requirement is checked against.
-- Each submodule declares THREE requirement kinds, all native semver-ranges:
-  `api` (range on core; `*` = free, for a pure library that imports nothing from
-  core), `deps` (`[{module, version}]`, range per module dependency) and
-  `requires` (`[{name, version}]`, range per external CLI it drives). `version`
-  is the submodule's own release.
-- At load, a submodule calls `version require-api $m.api`, which errors unless
-  `(api-version | into semver) in ($m.api | into semver-range)`. The declared
-  range is honored as written — a bare version means caret, and `^`/`~`/`>=`/`=`,
-  a comma-compound (`>=1.0.0, <2.0.0`) or `*` all work.
-- `mole submodules doctor` checks all three per *installed* submodule: the core
-  api range, each dep's range, and each required CLI's `--version` against its
-  range (probed by running `<cli> --version`).
-
-## 7. Submodule management (`mole submodules …`)
-
-| Command | Purpose |
-|---------|---------|
-| `sources` | Installed submodules (from `<workspace>/mole-*/plugin.nuon`) + `loaded`/`ready`. |
-| `doctor`  | api + dep + CLI-version range checks. |
-| `install <name> <url>` | `git clone` a `mole-*` submodule as a sibling. |
-| `uninstall <name>` | Remove its sibling dir (completes installed names). |
-| `update <name>` | `git pull --ff-only` (completes installed names). |
-| `checkout <name> <tag>` | `git checkout` at a release **tag**. Tags are native semver, **no `v` prefix**; `<tag>` completion lists the submodule's valid semver tags, latest first, and the value is validated with `into semver`. |
-
-Discovery/install operate on `<workspace>/mole-*/` — never on anything inside
-mole. `submodules.nu` self-locates via `const WORKSPACE = (path self | path
-dirname | path dirname)`.
-
-## 8. Submodule contract
+## 6. Submodule contract
 
 A `mole-<tool>` directory must:
-1. Ship `plugin.nuon`: `{ source, version, api, deps?, requires?, drivers?, family?, suffix?, summary }` — `api`/`deps`/`requires` are the three semver-range requirements (§6); `requires` is `[{name, version}]`, `deps` is `[{module, version}]`.
+1. Ship `mole.nuon`: `{ kind, source, version, drivers?, family?, suffix?, summary }`. (Manifests may still carry `api`/`deps` fields — currently **dormant**, kept as forward-looking data for an eventual package manager; nothing reads them today.)
 2. `use ../mole/lib/<concern>.nu` for the plumbing it needs (no `*`); annotate completers `@"complete connection"`.
 3. Define verbs with clean names (`export def "select"` → `mole-<tool> select`).
-4. In `export-env`, call `version require-api $m.api` and upsert its manifest into `$env.MOLE_REGISTRY`.
+4. In `export-env`, upsert its manifest into `$env.MOLE_REGISTRY`.
 
 `mole-sql`/`mole-vlogs` in this workspace are stubs demonstrating the contract.
 
-## 9. Configuration model
+## 7. Configuration model
 
-Flat, driver-keyed connections at `~/.config/mole/connections.yaml` (honors
-`$XDG_CONFIG_HOME`):
+Connections at `~/.config/mole/connections.yaml` (honors `$XDG_CONFIG_HOME`),
+grouped into a **map keyed by source** — one section per submodule — so each
+section is shape-homogeneous:
 
 ```yaml
 connections:
-  - name: prod-pg
-    driver: postgres        # driver → source resolved via $env.MOLE_REGISTRY
-    host: db.example.com
-    port: 5432
-    user: alice
-    password: hunter2
-    database: app
-  - name: prod-logs
-    driver: victorialogs
-    url: https://vl.example.com
+  psql:                       # section key = source (mole-psql)
+    - name: prod-pg
+      driver: postgres        # optional: which engine within the source
+      host: db.example.com
+      port: 5432
+      user: alice
+      password: hunter2
+      database: app
+  victorialogs:
+    - name: prod-logs
+      url: https://vl.example.com
 ```
 
-- Records are heterogeneous; each submodule reads the fields it needs.
-- The active connection is **per-source**: `$env.MOLE_CURRENT = { sql: "prod-pg",
+- Sections are shape-homogeneous (one source = one connection shape); the section
+  key IS the `source`, so `conn list` flattens the map and tags every record with
+  it (no registry lookup needed). An optional per-record `driver` distinguishes
+  engines within a source (postgres vs timescaledb); nothing branches on it.
+- **Completion is source-scoped.** `conn names "<source>"` returns only that
+  source's connection names. Each submodule wraps it in a tiny local completer
+  (`def complete-connection [] { conn names "psql" }`) so its verbs — including
+  `set-connection` — never suggest another source's connections. mole's own
+  cross-source `cfg show` still completes all names (`complete connection`).
+- The active connection is **per-source**: `$env.MOLE_CURRENT = { psql: "prod-pg",
   vlogs: "prod-logs" }`, set by each source's `set-connection`.
-- Legacy sectioned configs are converted once with `migrate-connections.nu`.
+- The old flat `connections:` list is rejected at read with a clear error; a
+  scratch script (`scripts/migrate-connections-to-sections.nu`) converts it,
+  resolving each `driver` → owning source from the workspace manifests.

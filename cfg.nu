@@ -24,34 +24,37 @@ def mask [
 
 # Show configured connections, with secret-looking fields masked.
 #
-# With no name, returns a table of every connection. With a name, returns that
-# single connection record (or null if it does not exist). Password/token/secret
-# fields are hidden unless `--raw` is given.
+# With no name, returns a record keyed by source (`{psql: <table>, vlogs:
+# <table>, …}`) so each section stays shape-homogeneous. With a name, returns that
+# single connection record (or null if it does not exist), searched across all
+# sources. Password/token/secret fields are hidden unless `--raw` is given.
 @category mole
-@example "list all connections (secrets masked)" { show }
-@example "show one connection" { show prod-db }
-@example "show one connection with secrets" { show prod-db --raw }
+@example "list all connections, grouped by source (secrets masked)" { mole cfg show }
+@example "show one connection" { mole cfg show prod-db }
+@example "show one connection with secrets" { mole cfg show prod-db --raw }
 export def "show" [
-  name?: string@"complete connection"   # Connection name to show; omit for a table of all
+  name?: string@"complete connection"   # Connection name to show; omit for all, grouped by source
   --raw(-r)                             # Reveal secret-looking fields (password/token/secret) instead of masking
 ] {
   if ($name | is-not-empty) {
     return (conn list | where name == $name | first | default null | mask $raw)
   }
-  conn list | each {|c| $c | mask $raw }
+  conn list
+  | group-by source
+  | items {|source, rows| {key: $source, val: ($rows | each {|c| $c | reject source | mask $raw})} }
+  | reduce --fold {} {|it, acc| $acc | upsert $it.key $it.val }
 }
 
 # Absolute path to the connections file (~/.config/mole/connections.yaml).
 @category mole
-@example "print the connections file path" { file }
+@example "print the connections file path" { mole cfg file }
 export def "file" []: nothing -> string { config file }
 
-# Absolute path to the saved-query directory (~/.config/mole/queries).
 @category mole
-@example "print the query directory path" { querydir }
-export def "querydir" []: nothing -> string { config querydir }
+@example "print the config directory path" { mole cfg dir }
+export def "dir" []: nothing -> string { config dir }
 
 # Open the connections file in $EDITOR.
 @category mole
-@example "edit the connections file" { edit }
+@example "edit the connections file" { mole cfg edit }
 export def "edit" []: nothing -> nothing { nu -c $"($env.EDITOR) (config file)" }

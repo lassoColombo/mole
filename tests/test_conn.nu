@@ -7,10 +7,10 @@ def setup [] {
   let temp = mktemp --tmpdir --directory
   mkdir ([$temp mole] | path join)
   {
-    connections: [
-      {name: "db1", driver: "postgres", host: "h", password: "p"},
-      {name: "log1", driver: "victorialogs"},
-    ]
+    connections: {
+      psql: [{name: "db1", driver: "postgres", host: "h", password: "p"}]
+      vlogs: [{name: "log1", driver: "victorialogs"}]
+    }
   } | to yaml | save ([$temp mole connections.yaml] | path join)
   { temp: $temp }
 }
@@ -25,14 +25,32 @@ def registry []: nothing -> record {
 }
 
 @test
-def "list tags sources from registry" [] {
+def "list tags sources from section keys" [] {
   let ctx = $in
   $env.XDG_CONFIG_HOME = $ctx.temp
-  $env.MOLE_REGISTRY = (registry)
 
   let out = conn list
   assert equal ($out | where name == "db1" | first | get source) "psql"
   assert equal ($out | where name == "log1" | first | get source) "vlogs"
+}
+
+@test
+def "names returns only a given sources own connection names" [] {
+  let ctx = $in
+  $env.XDG_CONFIG_HOME = $ctx.temp
+
+  assert equal (conn names "psql") ["db1"]
+  assert equal (conn names "vlogs") ["log1"]
+  assert equal (conn names "nope") []
+}
+
+@test
+def "read errors on the old flat connections list" [] {
+  let ctx = $in
+  { connections: [{name: "x", driver: "postgres"}] } | to yaml
+    | save -f ([$ctx.temp mole connections.yaml] | path join)
+  $env.XDG_CONFIG_HOME = $ctx.temp
+  assert error { conn list }
 }
 
 @test

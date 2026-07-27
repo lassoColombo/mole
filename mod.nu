@@ -7,26 +7,21 @@
 # never `use module *`.
 #
 # This file COMPOSES the user-facing `mole` module from:
-#   - ./cfg.nu         → `mole cfg show/file/querydir/edit`
-#   - ./submodules.nu  → `mole submodules sources/doctor/install`
-#   - two root commands below (`mole api-version`, `mole edit`)
+#   - ./cfg.nu   → `mole cfg show/file/dir/edit`   (connection config)
+#   - `mole query edit/show/dir` below             (saved queries)
 # and nothing more. The PLUMBING lives in ./lib/* and is imported PRIVATELY here
 # (and directly by submodules via `use ../mole/lib/<concern>`), so `use mole`
 # exposes only management commands — never the plumbing.
+#
+# NOTE: submodule management (`mole submodules …`) and the version/compatibility
+# contract were removed for now — mole is currently just config + query
+# management plus the shared lib/ plumbing. Submodules still self-register into
+# `$env.MOLE_REGISTRY` at load (powering `--source` resolution), and they import
+# lib concerns directly.
 
-use ./lib/version.nu
 use ./lib/config.nu
 use ./lib/complete.nu
-
-# The core<->submodule contract version this mole provides.
-#
-# Every submodule declares the api version it targets in its `mole.nuon`;
-# `mole submodules doctor` checks each declared target against this value using
-# native semver. The version is stored in mole.nuon and read at runtime — bump
-# it there, not in code.
-@category mole
-@example "show the contract version this mole provides" { api-version } --result "1.0.0"
-export def "api-version" []: nothing -> string { version api-version }
+use ./lib/query.nu
 
 # Open the saved-query directory (or a specific query file) in $EDITOR.
 #
@@ -34,9 +29,9 @@ export def "api-version" []: nothing -> string { version api-version }
 # file (a path relative to the query dir); tab-completion lists existing saved
 # queries. The editor is launched with the query dir as its working directory.
 @category mole
-@example "open the query directory in \$EDITOR" { edit }
-@example "open a specific saved query" { edit "reports/daily.sql" }
-export def "edit" [
+@example "open the query directory in \$EDITOR" { mole query edit }
+@example "open a specific saved query" { mole query edit "reports/daily.sql" }
+export def "query edit" [
   queryfile?: string@"complete queryfile"   # Saved query to open, relative to the query dir; omit to open the dir itself
 ]: nothing -> nothing {
   let d = config querydir
@@ -44,5 +39,21 @@ export def "edit" [
   nu -c $"cd ($d); ($env.EDITOR) ($target)"
 }
 
+# Print the text of a saved query.
+#
+# Reads the saved query (a path relative to the query dir) as raw text and
+# returns it; tab-completion lists existing saved queries.
+@category mole
+@example "show a saved query" { mole query show "reports/daily.sql" }
+export def "query show" [
+  queryfile: string@"complete queryfile"   # Saved query to print, relative to the query dir
+]: nothing -> string {
+  query resolve --file $queryfile
+}
+
+# Absolute path to the saved-query directory (~/.config/mole/queries).
+@category mole
+@example "print the query directory path" { mole query dir }
+export def "query dir" []: nothing -> string { config querydir }
+
 export use ./cfg.nu
-export use ./submodules.nu

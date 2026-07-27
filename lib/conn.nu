@@ -1,17 +1,22 @@
 # mole/lib/conn — connection reading, resolution, overrides.
 # Import individually: `use ../mole/lib/conn` → `conn list`, `conn resolve`, `conn override`.
 #
-# Connections are a flat, driver-keyed list in ~/.config/mole/connections.yaml.
-# A connection's `source` is derived from its `driver` via $env.MOLE_REGISTRY
-# (self-assembled by loaded submodules), so nothing here knows any source name.
+# Connections live in ~/.config/mole/connections.yaml under a `connections:` map
+# KEYED BY SOURCE (one section per submodule: `psql:`, `mysql:`, `vlogs:`, …), so
+# each section is shape-homogeneous. A connection's `source` is the section it is
+# filed under; `list` flattens the sections and tags each record with it. An
+# optional per-record `driver` distinguishes engines within a source (postgres vs
+# timescaledb) but nothing here branches on it.
 
 use ./config.nu
 
-# Raw connection list from the flat `connections:` form of the config file.
+# Raw connections, flattened from the source-keyed `connections:` map.
 #
-# Returns an empty list when the config file does not exist; errors when the file
-# exists but has no `connections:` key (the legacy sectioned form is not read at
-# runtime — convert it once with migrate-connections.nu).
+# Reads the config file and expands its `{ <source>: [<record>...] }` sections
+# into a flat list, tagging every record with the `source` it was filed under.
+# Returns [] when the file does not exist. Errors when the file has no
+# `connections:` key, or when it is still the OLD flat list (group by source
+# first — a scratch migration converts it).
 @category mole-lib
 @example "read the raw connection list" { read-connections }
 def read-connections []: nothing -> list {
@@ -19,46 +24,44 @@ def read-connections []: nothing -> list {
   if not ($f | path exists) { return [] }
   let raw = open $f
   if ("connections" not-in ($raw | columns)) {
-    error make {msg: $"($f) has no `connections:` list — if it's an old sectioned config, run migrate-connections.nu first"}
+    error make {msg: $"($f) has no `connections:` map — expected connections grouped by source"}
   }
-  $raw.connections
+  let conns = ($raw.connections | default {})
+  if (($conns | describe) | str starts-with "list") {
+    error make {msg: $"($f): the flat `connections:` list is no longer supported — group connections by source, e.g. `connections: {psql: [...], vlogs: [...]}`"}
+  }
+  $conns | items {|source, rows| ($rows | default []) | each {|c| $c | insert source $source } } | flatten
 }
 
-# The source that owns a driver, per the self-assembled registry.
-#
-# Looks the driver up across every loaded submodule's declared `drivers` in
-# `$env.MOLE_REGISTRY`. Returns the owning source name, or null if no loaded
-# submodule claims the driver.
-@category mole-lib
-@example "which source owns the postgres driver" { driver-source "postgres" }
-def driver-source [
-  driver: string   # The connection driver name to look up
-]: nothing -> any {
-  ($env.MOLE_REGISTRY? | default {})
-  | items {|name, m| {name: $name, drivers: ($m | get -o drivers | default [])} }
-  | where {|e| $driver in $e.drivers }
-  | get -o 0.name
-}
-
-# Completer: loaded source names, from the self-assembled registry.
+# Completer: source names, from the self-assembled registry.
 #
 # Local (not from lib/complete) on purpose: `complete` imports this module, so
 # importing it back would be a circular dependency. The names come straight from
-# the registry keys this module already reads.
+# the registry keys of loaded submodules.
 @category mole-lib
 @example "source-name suggestions" { source-names }
 def source-names []: nothing -> list<string> {
   $env.MOLE_REGISTRY? | default {} | columns
 }
 
-# All connections, each tagged with its resolved `source`.
-#
-# Reads the config file and adds a `source` column to every connection by
-# resolving its `driver` through the registry (null when unclaimed).
+# All connections, each tagged with its `source` (the section it is filed under).
 @category mole-lib
-@example "list connections with resolved sources" { list }
+@example "list connections with their sources" { list }
 export def "list" []: nothing -> table {
-  read-connections | each {|c| $c | insert source (driver-source ($c | get -o driver | default "")) }
+  read-connections
+}
+
+# Connection names owned by a source, for source-scoped completion.
+#
+# Returns just the names of connections filed under `source`. Submodules wrap this
+# in a tiny local completer (`def complete-connection [] { conn names "psql" }`)
+# so a source's verbs only ever suggest that source's own connections.
+@category mole-lib
+@example "names of the psql connections" { names "psql" }
+export def "names" [
+  source: string   # The source whose connection names to list
+]: nothing -> list<string> {
+  list | where source == $source | get -o name | default []
 }
 
 # Resolve a single connection record, secrets intact, for running a query.

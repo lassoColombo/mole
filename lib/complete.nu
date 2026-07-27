@@ -5,11 +5,14 @@
 use ./conn.nu
 use ./config.nu
 
-# Completer: all configured connection names.
+# Completer: ALL configured connection names, across every source.
 #
-# Attach to a parameter with `name: string@"complete connection"`.
+# For mole's cross-source management surface (`mole cfg show`). A source's OWN
+# verbs must NOT use this — they scope to their own connections via `conn names
+# "<source>"` (wrapped in a tiny local completer). Attach with
+# `name: string@"complete connection"`.
 @category mole-lib
-@example "connection-name suggestions" { connection }
+@example "connection-name suggestions (all sources)" { connection }
 export def "connection" []: nothing -> list<string> {
   conn list | get -o name | default []
 }

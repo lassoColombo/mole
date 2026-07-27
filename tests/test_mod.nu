@@ -3,35 +3,46 @@ use std/testing *
 
 use ../mod.nu
 
-# Absolute path to the manifest, resolved at parse time relative to this file.
-const MANIFEST = (path self ../mole.nuon)
-
-# The api version reported by `mod api-version` must equal the `api` field
-# in the manifest (mole.nuon), the single source of truth.
-@test
-def "api-version matches manifest" [] {
-  let manifest_api = (open $MANIFEST | get api)
-  assert equal (mod api-version) $manifest_api
-}
-
 # Management commands MUST be exposed by `use ../mod.nu`.
 @test
 def "management commands are present" [] {
   let names = (scope commands | get name)
-  for cmd in ["mod api-version" "mod cfg show" "mod submodules sources"] {
+  for cmd in ["mod cfg show" "mod query show" "mod query dir"] {
     assert ($cmd in $names) $"expected command not exposed: ($cmd)"
   }
 }
 
+# `query show` returns the raw text of a saved query, resolved against the
+# query dir (XDG-aware).
+@test
+def "query show returns saved query text" [] {
+  let temp = mktemp --tmpdir --directory
+  mkdir ([$temp mole queries] | path join)
+  "SELECT 1" | save ([$temp mole queries hello.sql] | path join)
+  $env.XDG_CONFIG_HOME = $temp
+  let out = (mod query show "hello.sql")
+  rm --recursive $temp
+  assert equal $out "SELECT 1"
+}
+
 # Architectural guard: `use mole` must NEVER leak plumbing. No exposed command's
-# leaf may be a plumbing concern (conn/cache/query/config/version).
+# leaf may be a plumbing concern (conn/cache/config/version). `query` is special:
+# it is ALSO the user-facing query-management namespace (`query edit`, `query
+# show`, `query dir`, …), so for that leaf we forbid only the lib/query.nu
+# plumbing verbs — an `export use ./lib/query.nu` leak would surface `query
+# resolve`/`confirm`/`check` — while allowing the hand-written management verbs.
 @test
 def "plumbing is not leaked" [] {
   let mod_cmds = (scope commands | get name | where ($it | str starts-with "mod "))
-  let plumbing = ["conn" "cache" "query" "config" "version"]
+  let plumbing = ["conn" "cache" "config"]
+  let query_plumbing = ["resolve" "confirm" "check"]
   for cmd in $mod_cmds {
-    # leaf = the segment right after "mod "
-    let leaf = ($cmd | str replace "mod " "" | split row " " | first)
+    let parts = ($cmd | str replace "mod " "" | split row " ")
+    let leaf = ($parts | first)
     assert ($leaf not-in $plumbing) $"plumbing leaked via: ($cmd)"
+    if $leaf == "query" {
+      let sub = ($parts | get -o 1 | default "")
+      assert ($sub not-in $query_plumbing) $"plumbing leaked via: ($cmd)"
+    }
   }
 }
