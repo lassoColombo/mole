@@ -1,5 +1,5 @@
 # mole/lib/config — config + query-dir paths (XDG-aware).
-# Import individually: `use ../mole/lib/config` → `config file`, `config querydir`.
+# Import individually: `use mole/lib/config` → `config file`, `config querydir`.
 
 # The mole config directory, honoring $env.XDG_CONFIG_HOME.
 #

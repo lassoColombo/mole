@@ -1,5 +1,5 @@
-# mole/lib/cache — cache storage plumbing (storage only; each source decides
-# what/when to cache). Import individually: `use ../mole/lib/cache` →
+# mole/lib/cache — cache storage plumbing (storage only; each driver decides
+# what/when to cache). Import individually: `use mole/lib/cache` →
 # `cache path`, `cache read`, `cache write`, `cache stale`, `cache clear`.
 # Convention: a cached file is a record with a `meta.refreshed_at` datetime.
 
@@ -14,18 +14,18 @@ def cache-dir []: nothing -> string {
   [$base mole] | path join
 }
 
-# Cache-file path for a (source, key) pair.
+# Cache-file path for a (namespace, key) pair.
 #
-# Returns `<cache-dir>/<source>/<key>.nuon`, with any character outside
+# Returns `<cache-dir>/<namespace>/<key>.nuon`, with any character outside
 # `[A-Za-z0-9._-]` in the key replaced by `_` so it is filesystem-safe.
 @category mole-lib
-@example "path for a source/key pair" { path "sql" "prod:users" }
+@example "path for a namespace/key pair" { path "sql" "prod:users" }
 export def "path" [
-  source: string   # The data source name (a subdirectory under the cache root)
-  key: string      # Cache key; sanitized into a safe filename
+  namespace: string   # Cache namespace, a subdirectory under the cache root (typically the driver name)
+  key: string         # Cache key; sanitized into a safe filename
 ]: nothing -> string {
   let safe = $key | str replace --all --regex '[^A-Za-z0-9._-]' '_'
-  [(cache-dir) $source $"($safe).nuon"] | path join
+  [(cache-dir) $namespace $"($safe).nuon"] | path join
 }
 
 # Read a cache file, or null if it is missing or unreadable.

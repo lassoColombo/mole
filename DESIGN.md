@@ -20,14 +20,17 @@ verbs. This document is the interface spec.
         └──┴────────┴──┘
               ▲
      ┌────────┼────────┐   each submodule imports the lib CONCERNS it needs
-┌────────┐ ┌────────┐ ┌────────┐   (e.g. `use ../mole/lib/conn.nu`)
+┌────────┐ ┌────────┐ ┌────────┐   (e.g. `use mole/lib/conn.nu`)
 │mole-sql│ │mole-…  │ │mole-vlg│   and self-registers at load
 └────────┘ └────────┘ └────────┘
 ```
 
 mole **never imports, enumerates, or generates anything about submodules.**
-Installing a submodule is only cloning a sibling repo — no umbrella, no
-`sync`/codegen. Import rule everywhere: **`use module`, never `use module *`**.
+Installing a submodule is just placing it on `$env.NU_LIB_DIRS` (clone it
+anywhere that path covers) — no umbrella, no `sync`/codegen, and **no assumed
+on-disk layout**: cross-module imports go through `NU_LIB_DIRS` discovery
+(`use mole/lib/conn.nu`), never `../` relative paths. Import rule everywhere:
+**`use module`, never `use module *`**.
 
 ## 2. Constraints that drive the design (verified on 0.114.1)
 
@@ -37,6 +40,8 @@ Installing a submodule is only cloning a sibling repo — no umbrella, no
 | **Direct** top-level `use mod` runs its `export-env`; multiple accumulate into `$env`. | Because the user `use`s each submodule directly, their `export-env` blocks run and **self-assemble** `$env.MOLE_REGISTRY`. |
 | `use mod` (no `*`) prefixes commands with the module name; a private `use` (not `export use`) does not re-export. | Prefix = dir name (`use mole-sql` → `mole-sql select`). `mod.nu` imports `./lib/*` privately, so `use mole` never leaks plumbing. |
 | A file module is imported **with its `.nu` extension** (`use ./lib/conn.nu`); the module name is the basename (`conn`). | Concern files compose as `conn resolve`, `cache path`, … |
+| A relative `use ../x` hard-codes an on-disk layout; a bare `use x/y.nu` resolves against `$env.NU_LIB_DIRS`. | Cross-module imports use **bare discovery paths** (`use mole/lib/conn.nu`, `use mole-sql/sql.nu`); submodules need not sit beside `mole/`. Intra-module imports stay `./`. |
+| `$env.NU_LIB_DIRS` is read at **`nu` startup**; `use` resolves at **parse time**. | Set `NU_LIB_DIRS` as an env var *before* launching `nu` — a `$env.NU_LIB_DIRS = …` assignment in the same file runs too late for that file's own `use`. |
 | A command's `@"completer"` binding is captured on import. | Callers annotate `@"complete connection"`. |
 
 ## 3. Layout & command surface
@@ -48,7 +53,7 @@ Installing a submodule is only cloning a sibling repo — no umbrella, no
 │   ├── cfg.nu    # `mole cfg show/file/dir/edit`
 │   └── lib/      # plumbing concerns (private to mole; imported by submodules)
 │       ├── config.nu · conn.nu · cache.nu · query.nu · complete.nu
-├── mole-sql/    mod.nu · mole.nuon      (`use ../mole/lib/*.nu`)
+├── mole-sql/    mod.nu · mole.nuon      (`use mole/lib/*.nu`)
 └── mole-vlogs/  mod.nu · mole.nuon
 ```
 
@@ -64,39 +69,39 @@ extension. Submodules import only what they need; `use mole` never exposes any:
 
 | Import | Commands |
 |--------|----------|
-| `use ../mole/lib/config.nu`  | `config file`, `config querydir` |
-| `use ../mole/lib/conn.nu`    | `conn list`, `conn resolve`, `conn override`, `conn with` |
-| `use ../mole/lib/cache.nu`   | `cache path/read/write/stale/clear` |
-| `use ../mole/lib/query.nu`   | `query resolve`, `query confirm`, `query check` |
-| `use ../mole/lib/complete.nu`| `complete connection`, `complete queryfile` |
+| `use mole/lib/config.nu`  | `config file`, `config querydir` |
+| `use mole/lib/conn.nu`    | `conn list`, `conn resolve`, `conn override`, `conn with` |
+| `use mole/lib/cache.nu`   | `cache path/read/write/stale/clear` |
+| `use mole/lib/query.nu`   | `query resolve`, `query confirm`, `query check` |
+| `use mole/lib/complete.nu`| `complete connection`, `complete queryfile` |
 
 Core ships *mechanism*; each submodule owns *policy* (what's dangerous, how to
 type results, how to exec).
 
 ## 5. The self-assembling registry — `$env.MOLE_REGISTRY`
 
-A record keyed by source, built at load by each submodule's own `export-env`:
+A record keyed by driver, built at load by each submodule's own `export-env`:
 
 ```nushell
 # in mole-sql/mod.nu
-use ../mole/lib/conn.nu
+use mole/lib/conn.nu
 const HERE = (path self | path dirname)
 export-env {
   let m = (open ([$HERE mole.nuon] | path join))   # its manifest (data)
-  $env.MOLE_REGISTRY = (($env.MOLE_REGISTRY? | default {}) | upsert $m.source $m)
+  $env.MOLE_REGISTRY = (($env.MOLE_REGISTRY? | default {}) | upsert $m.driver $m)
   $env.MOLE_CURRENT  = ($env.MOLE_CURRENT? | default {})
 }
 ```
 
-The registry's keys are the loaded source names; `conn`'s `--source` completer
-(`source-names`) reads them. (Connections are resolved from the source-keyed
+The registry's keys are the loaded driver names; `conn`'s `--driver` completer
+(`driver-names`) reads them. (Connections are resolved from the driver-keyed
 config directly — §7 — so resolution itself needs no registry lookup.)
 
 ## 6. Submodule contract
 
 A `mole-<tool>` directory must:
-1. Ship `mole.nuon`: `{ kind, source, version, drivers?, family?, suffix?, summary }`. (Manifests may still carry `api`/`deps` fields — currently **dormant**, kept as forward-looking data for an eventual package manager; nothing reads them today.)
-2. `use ../mole/lib/<concern>.nu` for the plumbing it needs (no `*`); annotate completers `@"complete connection"`.
+1. Ship `mole.nuon`: `{ kind, driver, version, family?, suffix?, summary }`. (Manifests may still carry `api`/`deps` fields — currently **dormant**, kept as forward-looking data for an eventual package manager; nothing reads them today.)
+2. `use mole/lib/<concern>.nu` for the plumbing it needs (no `*`); annotate completers `@"complete connection"`.
 3. Define verbs with clean names (`export def "select"` → `mole-<tool> select`).
 4. In `export-env`, upsert its manifest into `$env.MOLE_REGISTRY`.
 
@@ -105,14 +110,13 @@ A `mole-<tool>` directory must:
 ## 7. Configuration model
 
 Connections at `~/.config/mole/connections.yaml` (honors `$XDG_CONFIG_HOME`),
-grouped into a **map keyed by source** — one section per submodule — so each
+grouped into a **map keyed by driver** — one section per submodule — so each
 section is shape-homogeneous:
 
 ```yaml
 connections:
-  psql:                       # section key = source (mole-psql)
+  psql:                       # section key = driver (mole-psql)
     - name: prod-pg
-      driver: postgres        # optional: which engine within the source
       host: db.example.com
       port: 5432
       user: alice
@@ -123,17 +127,15 @@ connections:
       url: https://vl.example.com
 ```
 
-- Sections are shape-homogeneous (one source = one connection shape); the section
-  key IS the `source`, so `conn list` flattens the map and tags every record with
-  it (no registry lookup needed). An optional per-record `driver` distinguishes
-  engines within a source (postgres vs timescaledb); nothing branches on it.
-- **Completion is source-scoped.** `conn names "<source>"` returns only that
-  source's connection names. Each submodule wraps it in a tiny local completer
+- Sections are shape-homogeneous (one driver = one connection shape); the section
+  key IS the `driver`, so `conn list` flattens the map and tags every record with
+  it (no registry lookup needed, no redundant per-record `driver` field).
+- **Completion is driver-scoped.** `conn names "<driver>"` returns only that
+  driver's connection names. Each submodule wraps it in a tiny local completer
   (`def complete-connection [] { conn names "psql" }`) so its verbs — including
-  `set-connection` — never suggest another source's connections. mole's own
-  cross-source `cfg show` still completes all names (`complete connection`).
-- The active connection is **per-source**: `$env.MOLE_CURRENT = { psql: "prod-pg",
-  vlogs: "prod-logs" }`, set by each source's `set-connection`.
-- The old flat `connections:` list is rejected at read with a clear error; a
-  scratch script (`scripts/migrate-connections-to-sections.nu`) converts it,
-  resolving each `driver` → owning source from the workspace manifests.
+  `set-connection` — never suggest another driver's connections. mole's own
+  cross-driver `cfg show` still completes all names (`complete connection`).
+- The active connection is **per-driver**: `$env.MOLE_CURRENT = { psql: "prod-pg",
+  vlogs: "prod-logs" }`, set by each driver's `set-connection`.
+- The old flat `connections:` list is rejected at read with a clear error — group
+  connections into driver-keyed sections.

@@ -1,21 +1,20 @@
 # mole/lib/conn — connection reading, resolution, overrides.
-# Import individually: `use ../mole/lib/conn` → `conn list`, `conn resolve`, `conn override`.
+# Import individually: `use mole/lib/conn` → `conn list`, `conn resolve`, `conn override`.
 #
 # Connections live in ~/.config/mole/connections.yaml under a `connections:` map
-# KEYED BY SOURCE (one section per submodule: `psql:`, `mysql:`, `vlogs:`, …), so
-# each section is shape-homogeneous. A connection's `source` is the section it is
-# filed under; `list` flattens the sections and tags each record with it. An
-# optional per-record `driver` distinguishes engines within a source (postgres vs
-# timescaledb) but nothing here branches on it.
+# KEYED BY DRIVER (one section per submodule: `psql:`, `mysql:`, `vlogs:`, …), so
+# each section is shape-homogeneous. A connection's `driver` is the section it is
+# filed under; `list` flattens the sections and tags each record with it.
 
 use ./config.nu
 
-# Raw connections, flattened from the source-keyed `connections:` map.
+# Raw connections, flattened from the driver-keyed `connections:` map.
 #
-# Reads the config file and expands its `{ <source>: [<record>...] }` sections
-# into a flat list, tagging every record with the `source` it was filed under.
+# Reads the config file and expands its `{ <driver>: [<record>...] }` sections
+# into a flat list, tagging every record with the `driver` it was filed under (the
+# section key is authoritative, so a stray per-record `driver` is overwritten).
 # Returns [] when the file does not exist. Errors when the file has no
-# `connections:` key, or when it is still the OLD flat list (group by source
+# `connections:` key, or when it is still the OLD flat list (group by driver
 # first — a scratch migration converts it).
 @category mole-lib
 @example "read the raw connection list" { read-connections }
@@ -24,76 +23,76 @@ def read-connections []: nothing -> list {
   if not ($f | path exists) { return [] }
   let raw = open $f
   if ("connections" not-in ($raw | columns)) {
-    error make {msg: $"($f) has no `connections:` map — expected connections grouped by source"}
+    error make {msg: $"($f) has no `connections:` map — expected connections grouped by driver"}
   }
   let conns = ($raw.connections | default {})
   if (($conns | describe) | str starts-with "list") {
-    error make {msg: $"($f): the flat `connections:` list is no longer supported — group connections by source, e.g. `connections: {psql: [...], vlogs: [...]}`"}
+    error make {msg: $"($f): the flat `connections:` list is no longer supported — group connections by driver, e.g. `connections: {psql: [...], vlogs: [...]}`"}
   }
-  $conns | items {|source, rows| ($rows | default []) | each {|c| $c | insert source $source } } | flatten
+  $conns | items {|driver, rows| ($rows | default []) | each {|c| $c | upsert driver $driver } } | flatten
 }
 
-# Completer: source names, from the self-assembled registry.
+# Completer: driver names, from the self-assembled registry.
 #
 # Local (not from lib/complete) on purpose: `complete` imports this module, so
 # importing it back would be a circular dependency. The names come straight from
 # the registry keys of loaded submodules.
 @category mole-lib
-@example "source-name suggestions" { source-names }
-def source-names []: nothing -> list<string> {
+@example "driver-name suggestions" { driver-names }
+def driver-names []: nothing -> list<string> {
   $env.MOLE_REGISTRY? | default {} | columns
 }
 
-# All connections, each tagged with its `source` (the section it is filed under).
+# All connections, each tagged with its `driver` (the section it is filed under).
 @category mole-lib
-@example "list connections with their sources" { list }
+@example "list connections with their drivers" { list }
 export def "list" []: nothing -> table {
   read-connections
 }
 
-# Connection names owned by a source, for source-scoped completion.
+# Connection names owned by a driver, for driver-scoped completion.
 #
-# Returns just the names of connections filed under `source`. Submodules wrap this
+# Returns just the names of connections filed under `driver`. Submodules wrap this
 # in a tiny local completer (`def complete-connection [] { conn names "psql" }`)
-# so a source's verbs only ever suggest that source's own connections.
+# so a driver's verbs only ever suggest that driver's own connections.
 @category mole-lib
 @example "names of the psql connections" { names "psql" }
 export def "names" [
-  source: string   # The source whose connection names to list
+  driver: string   # The driver whose connection names to list
 ]: nothing -> list<string> {
-  list | where source == $source | get -o name | default []
+  list | where driver == $driver | get -o name | default []
 }
 
 # Resolve a single connection record, secrets intact, for running a query.
 #
 # With a `name`, resolves that connection (errors if unknown). Otherwise, with
-# `--source`, resolves the current connection for that source (from
-# `$env.MOLE_CURRENT`). When `--source` is given it also asserts the resolved
-# connection actually belongs to that source. Errors if neither a name nor a
-# source is given.
+# `--driver`, resolves the current connection for that driver (from
+# `$env.MOLE_CURRENT`). When `--driver` is given it also asserts the resolved
+# connection actually belongs to that driver. Errors if neither a name nor a
+# driver is given.
 @category mole-lib
 @example "resolve a connection by name" { resolve prod-db }
-@example "resolve the current connection for a source" { resolve --source sql }
+@example "resolve the current connection for a driver" { resolve --driver sql }
 export def "resolve" [
-  name?: string      # Connection name to resolve; omit to use the current-for-`--source`
-  --source: string@source-names   # Source to resolve the current connection for, and to assert membership against
+  name?: string      # Connection name to resolve; omit to use the current-for-`--driver`
+  --driver: string@driver-names   # Driver to resolve the current connection for, and to assert membership against
 ]: nothing -> record {
   let all = list
   let conf = if ($name | is-not-empty) {
     let hit = $all | where name == $name
     if ($hit | is-empty) { error make {msg: $"unknown connection: ($name)"} }
     $hit | first
-  } else if ($source | is-not-empty) {
-    let cur = ($env.MOLE_CURRENT? | default {}) | get -o $source
+  } else if ($driver | is-not-empty) {
+    let cur = ($env.MOLE_CURRENT? | default {}) | get -o $driver
     if ($cur | is-empty) {
-      error make {msg: $"no current ($source) connection — pass a name or set one via `($source) set-connection`"}
+      error make {msg: $"no current ($driver) connection — pass a name or set one via `($driver) set-connection`"}
     }
     $all | where name == $cur | first
   } else {
-    error make {msg: "specify a connection name or a --source"}
+    error make {msg: "specify a connection name or a --driver"}
   }
-  if ($source | is-not-empty) and ($conf.source != $source) {
-    error make {msg: $"connection '($conf.name)' is a '($conf.source | default '?')' connection, not '($source)'"}
+  if ($driver | is-not-empty) and ($conf.driver != $driver) {
+    error make {msg: $"connection '($conf.name)' is a '($conf.driver | default '?')' connection, not '($driver)'"}
   }
   $conf
 }
@@ -121,16 +120,33 @@ export def "override" [
 #
 # The blessed override path every driver shares: a verb collects its
 # `--host`/`--port`/… flags (plus a generic `--set`) into a record and passes it
-# here. `name` picks the connection (else the current-for-`source`); null-valued
+# here. `name` picks the connection (else the current-for-`driver`); null-valued
 # overrides are dropped, so unset flags are no-ops.
 @category mole-lib
 @example "a named sql connection with an overridden port" {
   with sql "prod-db" {port: 6543}
 }
 export def "with" [
-  source: string@source-names   # Source to resolve the current connection for when no name is given
-  name?: string         # Connection name; omit to use the current-for-`source`
+  driver: string@driver-names   # Driver to resolve the current connection for when no name is given
+  name?: string         # Connection name; omit to use the current-for-`driver`
   overrides: record = {}  # Fields to override; null-valued fields are skipped
 ]: nothing -> record {
-  resolve $name --source $source | override $overrides
+  resolve $name --driver $driver | override $overrides
+}
+
+# Drop secret-looking fields from a connection record, for safe display.
+#
+# Driver-agnostic field-name heuristic: any column whose name matches
+# `pass`/`token`/`secret` (case-insensitive) is removed; everything else is kept.
+# Empty input passes through. Used by dry-run output and `mole cfg show` so a
+# resolved connection can be shown without leaking its credentials.
+@category mole-lib
+@example "redact secrets from a connection record" {
+  {host: "db", password: "hunter2", token: "x"} | redact
+} --result {host: "db"}
+export def "redact" []: any -> any {
+  let c = $in
+  if ($c | is-empty) { return $c }
+  let secret = ($c | columns | where {|k| $k =~ '(?i)pass|token|secret' })
+  if ($secret | is-empty) { $c } else { $c | reject ...$secret }
 }

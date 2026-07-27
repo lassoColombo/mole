@@ -11,8 +11,8 @@ def setup [] {
   {
     connections: {
       psql: [
-        {name: "db1", driver: "postgres", host: "h", password: "s3cr3t"}
-        {name: "db2", driver: "postgres", host: "h2"}
+        {name: "db1", host: "h", password: "s3cr3t"}
+        {name: "db2", host: "h2"}
       ]
     }
   } | to yaml | save ([$mole_dir connections.yaml] | path join)
@@ -54,11 +54,11 @@ def "show name raw keeps password" [] {
 }
 
 @test
-def "show all masked groups by source without password" [] {
+def "show all masked groups by driver without password" [] {
   let ctx = $in
   $env.XDG_CONFIG_HOME = $ctx.temp
   let t = cfg show
-  # grouped by source: a record with a `psql` section holding both rows
+  # grouped by driver: a record with a `psql` section holding both rows
   assert equal ($t | describe | str starts-with "record") true
   assert equal ($t.psql | length) 2
   let has_password = $t.psql | any {|row| "password" in ($row | columns) }

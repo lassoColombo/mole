@@ -1,18 +1,18 @@
 # mole/lib/complete — shared tab-completers. Import individually:
-# `use ../mole/lib/complete` → `complete connection`, `complete queryfile`.
+# `use mole/lib/complete` → `complete connection`, `complete queryfile`.
 # Callers annotate flags with `@"complete connection"` / `@"complete queryfile"`.
 
 use ./conn.nu
 use ./config.nu
 
-# Completer: ALL configured connection names, across every source.
+# Completer: ALL configured connection names, across every driver.
 #
-# For mole's cross-source management surface (`mole cfg show`). A source's OWN
+# For mole's cross-driver management surface (`mole cfg show`). A driver's OWN
 # verbs must NOT use this — they scope to their own connections via `conn names
-# "<source>"` (wrapped in a tiny local completer). Attach with
+# "<driver>"` (wrapped in a tiny local completer). Attach with
 # `name: string@"complete connection"`.
 @category mole-lib
-@example "connection-name suggestions (all sources)" { connection }
+@example "connection-name suggestions (all drivers)" { connection }
 export def "connection" []: nothing -> list<string> {
   conn list | get -o name | default []
 }

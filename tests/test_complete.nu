@@ -10,8 +10,8 @@ def setup [] {
   {
     connections: {
       psql: [
-        { name: "db1", driver: "postgres" }
-        { name: "db2", driver: "postgres" }
+        { name: "db1" }
+        { name: "db2" }
       ]
     }
   } | to yaml | save ($temp | path join mole connections.yaml)

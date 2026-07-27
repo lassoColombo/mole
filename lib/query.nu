@@ -1,26 +1,37 @@
 # mole/lib/query — the query-running toolkit: resolve query text, confirm before
-# running, check the external result. Import individually: `use ../mole/lib/query`
+# running, check the external result. Import individually: `use mole/lib/query`
 # → `query resolve`, `query confirm`, `query check`.
 # (`query confirm` was the old `confirm`; `query check` was the old `sh check`.)
 
 use ./config.nu
 use ./complete.nu
 
-# Resolve query text, from a saved file or an interactive editor session.
+# Resolve query text from the first available source, in precedence order:
+# inline `text`, a saved `--file`, piped stdin, then an interactive `$EDITOR`
+# session. Submodule verbs call it as `$in | query resolve $sql --file $file
+# --suffix ".sql"`, so the query can arrive as the verb's positional, a saved
+# file, or a pipeline — e.g. `mole query show reports/daily.sql | mole-psql query`.
 #
-# With `--file`, reads that saved query (a path relative to the query dir) as raw
-# text. Otherwise opens $EDITOR on a fresh temp file (named with `--suffix`) and
-# returns whatever was written.
+# `text` (an explicit argument) wins; then `--file` reads that saved query (a
+# path relative to the query dir) as raw text; then non-empty piped input is used
+# verbatim (coerced to a string); with none of those, opens $EDITOR on a fresh
+# temp file (named with `--suffix`) and returns whatever was written.
 @category mole-lib
+@example "inline text wins over the pipeline" { "SELECT 1" | resolve "SELECT 2" } --result "SELECT 2"
+@example "fall back to piped stdin" { "SELECT 1" | resolve } --result "SELECT 1"
 @example "load a saved query" { resolve --file "reports/daily.sql" }
 @example "compose a query in \$EDITOR with a .sql temp file" { resolve --suffix ".sql" }
 export def "resolve" [
-  --file(-f): string@"complete queryfile"   # Saved query to read, relative to the query dir; omit to open an editor
+  text?: string                             # Inline query text; wins over --file, stdin, and $EDITOR
+  --file(-f): string@"complete queryfile"   # Saved query to read, relative to the query dir
   --suffix: string = ".txt"    # Temp-file suffix for the editor session (sets the editor's syntax mode)
-]: nothing -> string {
+]: any -> string {
+  let piped = $in
+  if ($text | is-not-empty) { return $text }
   if ($file | is-not-empty) {
     return (open -r ([(config querydir) $file] | path join))
   }
+  if ($piped | is-not-empty) { return ($piped | into string) }
   let tmp = mktemp --suffix $suffix
   nu -c $"($env.EDITOR) ($tmp)"
   open -r $tmp

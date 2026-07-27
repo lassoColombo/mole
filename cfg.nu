@@ -8,7 +8,7 @@ use ./lib/complete.nu
 
 # Drop secret-looking fields from a piped connection record/table.
 #
-# Source-agnostic field-name heuristic: any column whose name matches
+# Driver-agnostic field-name heuristic: any column whose name matches
 # `pass`/`token`/`secret` (case-insensitive) is rejected. A truthy `raw` (or
 # empty input) passes the value through untouched.
 @example "mask a connection record" { {host: "db", password: "hunter2"} | mask false } --result {host: "db"}
@@ -18,30 +18,29 @@ def mask [
 ]: any -> any {
   let c = $in
   if ($c | is-empty) or $raw { return $c }
-  let secret = $c | columns | where {|k| $k =~ '(?i)pass|token|secret' }
-  if ($secret | is-empty) { $c } else { $c | reject ...$secret }
+  $c | conn redact
 }
 
 # Show configured connections, with secret-looking fields masked.
 #
-# With no name, returns a record keyed by source (`{psql: <table>, vlogs:
+# With no name, returns a record keyed by driver (`{psql: <table>, vlogs:
 # <table>, …}`) so each section stays shape-homogeneous. With a name, returns that
 # single connection record (or null if it does not exist), searched across all
-# sources. Password/token/secret fields are hidden unless `--raw` is given.
+# drivers. Password/token/secret fields are hidden unless `--raw` is given.
 @category mole
-@example "list all connections, grouped by source (secrets masked)" { mole cfg show }
+@example "list all connections, grouped by driver (secrets masked)" { mole cfg show }
 @example "show one connection" { mole cfg show prod-db }
 @example "show one connection with secrets" { mole cfg show prod-db --raw }
 export def "show" [
-  name?: string@"complete connection"   # Connection name to show; omit for all, grouped by source
+  name?: string@"complete connection"   # Connection name to show; omit for all, grouped by driver
   --raw(-r)                             # Reveal secret-looking fields (password/token/secret) instead of masking
 ] {
   if ($name | is-not-empty) {
     return (conn list | where name == $name | first | default null | mask $raw)
   }
   conn list
-  | group-by source
-  | items {|source, rows| {key: $source, val: ($rows | each {|c| $c | reject source | mask $raw})} }
+  | group-by driver
+  | items {|driver, rows| {key: $driver, val: ($rows | each {|c| $c | reject driver | mask $raw})} }
   | reduce --fold {} {|it, acc| $acc | upsert $it.key $it.val }
 }
 

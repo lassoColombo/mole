@@ -1,6 +1,6 @@
 # mole — the standalone core module for the mole ecosystem.
 #
-# ARCHITECTURE (see DESIGN.md). mole is a foundation that source submodules
+# ARCHITECTURE (see DESIGN.md). mole is a foundation that submodules
 # depend on, never the other way around. mole never imports, enumerates, or
 # generates anything about submodules — installing one is only cloning a sibling
 # repo. No umbrella, no `sync`/codegen step. Import rule everywhere: `use module`,
@@ -10,13 +10,13 @@
 #   - ./cfg.nu   → `mole cfg show/file/dir/edit`   (connection config)
 #   - `mole query edit/show/dir` below             (saved queries)
 # and nothing more. The PLUMBING lives in ./lib/* and is imported PRIVATELY here
-# (and directly by submodules via `use ../mole/lib/<concern>`), so `use mole`
+# (and directly by submodules via `use mole/lib/<concern>`), so `use mole`
 # exposes only management commands — never the plumbing.
 #
 # NOTE: submodule management (`mole submodules …`) and the version/compatibility
 # contract were removed for now — mole is currently just config + query
 # management plus the shared lib/ plumbing. Submodules still self-register into
-# `$env.MOLE_REGISTRY` at load (powering `--source` resolution), and they import
+# `$env.MOLE_REGISTRY` at load (powering `--driver` resolution), and they import
 # lib concerns directly.
 
 use ./lib/config.nu
