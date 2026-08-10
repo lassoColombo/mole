@@ -1,7 +1,7 @@
 # mole-trino — Trino driver plugin.
 #
 # A PLUGIN (data source): supports the trino technology, registers itself as a
-# driver, and exposes the user verbs `query` / `select` / `schema`. It DEPENDS on:
+# driver, and exposes the user verbs `raw-query` / `select` / `schema`. It DEPENDS on:
 #   - mole core plumbing        (`use mole/lib/*.nu`)
 #   - the generic mole-sql pure LIBRARY (`use mole-sql/sql.nu`)
 # The library dependency is also declared in mole.nuon (`deps`) so `mole
@@ -261,16 +261,16 @@ def trino-order [sort_by: any]: nothing -> any {
 # current trino one unless `--connection` names another; per-field flags,
 # `--catalog`/`--schema`, and `--set` override individual fields.
 #
-# Named `query`, not `run`, because `run` is a Nushell parser keyword. Reference
-# invocations (leaf verb — call it as your loader exposes it, e.g. `mole-trino query`):
+# Named `raw-query`, not `run`, because `run` is a Nushell parser keyword. Reference
+# invocations (leaf verb — call it as your loader exposes it, e.g. `mole-trino raw-query`):
 #
-#   mole-trino query "SELECT 1 AS n"                                    # the current connection
-#   mole-trino query "SELECT custkey, name FROM customer LIMIT 5" -c trino-local-dev
-#   mole-trino query --file reports/top-customers -c trino-local-dev    # <querydir>/reports/top-customers.sql
-#   mole query show reports/top-customers.sql | mole-trino query -c trino-local-dev  # query text piped via stdin
-#   mole-trino query "SELECT * FROM lineitem" -c trino-local-dev --catalog tpch --schema sf1
+#   mole-trino raw-query "SELECT 1 AS n"                                    # the current connection
+#   mole-trino raw-query "SELECT custkey, name FROM customer LIMIT 5" -c trino-local-dev
+#   mole-trino raw-query --file reports/top-customers -c trino-local-dev    # <querydir>/reports/top-customers.sql
+#   mole query show reports/top-customers.sql | mole-trino raw-query -c trino-local-dev  # query text piped via stdin
+#   mole-trino raw-query "SELECT * FROM lineitem" -c trino-local-dev --catalog tpch --schema sf1
 @category mole-trino
-export def "query" [
+export def "raw-query" [
   sql?: string                                     # SQL statement (else --file, else stdin, else $EDITOR)
   --file(-f): string@"complete queryfile"          # saved query file (relative to the query dir)
   --connection(-c): string@complete-connection   # named connection (default: current)
@@ -374,7 +374,7 @@ export def "select" [
 # columns; constraints are always empty); `--find` searches table and column
 # names and comments case-insensitively; `--full` returns the raw cache record,
 # including its `meta`. `--refresh` rebuilds the cache from the live server
-# before reading. Connection is overridable exactly as in `query`.
+# before reading. Connection is overridable exactly as in `raw-query`.
 @category mole-trino
 @example "summary — one row per table" {
   mole-trino schema -c trino-local-dev
@@ -418,7 +418,7 @@ export def "schema" [
 
 # Make a trino connection the current one for this driver.
 #
-# Records the choice in `$env.MOLE_CURRENT.trino`, so later `query` / `select` /
+# Records the choice in `$env.MOLE_CURRENT.trino`, so later `raw-query` / `select` /
 # `schema` calls can omit `--connection`. Validates that `name` exists and is
 # actually a trino connection (errors otherwise). Being `--env`, the change
 # persists in the caller's environment.

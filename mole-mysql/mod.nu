@@ -1,7 +1,7 @@
 # mole-mysql — MySQL driver plugin.
 #
 # A PLUGIN (data source): supports the mysql technology, registers itself as a
-# driver, and exposes the user verbs `query` / `select` / `schema`. It DEPENDS on:
+# driver, and exposes the user verbs `raw-query` / `select` / `schema`. It DEPENDS on:
 #   - mole core plumbing        (`use mole/lib/*.nu`)
 #   - the generic mole-sql pure LIBRARY (`use mole-sql/sql.nu`)
 #
@@ -245,16 +245,16 @@ def my-lock [lock: any, lock_of: list<string>, skip_locked: bool, nowait: bool]:
 # current mysql one unless `--connection` names another; per-field flags and
 # `--set` override individual fields.
 #
-# Named `query`, not `run`, because `run` is a Nushell parser keyword. Reference
-# invocations (leaf verb — call it as your loader exposes it, e.g. `mole-mysql query`):
+# Named `raw-query`, not `run`, because `run` is a Nushell parser keyword. Reference
+# invocations (leaf verb — call it as your loader exposes it, e.g. `mole-mysql raw-query`):
 #
-#   mole-mysql query "SELECT now()"                                    # the current connection
-#   mole-mysql query "SELECT id, email FROM users ORDER BY id" -c mysql-local-dev
-#   mole-mysql query --file reports/active-users -c mysql-local-dev    # <querydir>/reports/active-users.sql
-#   mole query show reports/active-users.sql | mole-mysql query -c mysql-local-dev  # query text piped via stdin
-#   mole-mysql query "CREATE TEMPORARY TABLE t (id int)" -c mysql-local-dev --yes   # skip the danger prompt
+#   mole-mysql raw-query "SELECT now()"                                    # the current connection
+#   mole-mysql raw-query "SELECT id, email FROM users ORDER BY id" -c mysql-local-dev
+#   mole-mysql raw-query --file reports/active-users -c mysql-local-dev    # <querydir>/reports/active-users.sql
+#   mole query show reports/active-users.sql | mole-mysql raw-query -c mysql-local-dev  # query text piped via stdin
+#   mole-mysql raw-query "CREATE TEMPORARY TABLE t (id int)" -c mysql-local-dev --yes   # skip the danger prompt
 @category mole-mysql
-export def "query" [
+export def "raw-query" [
   sql?: string                                     # SQL statement (else --file, else stdin, else $EDITOR)
   --file(-f): string@"complete queryfile"          # saved query file (relative to the query dir)
   --connection(-c): string@complete-connection   # named connection (default: current)
@@ -294,7 +294,7 @@ export def "query" [
 # normalization). `--dry-run` returns a `{connection, query}` record — the resolved
 # connection (secrets dropped) and the assembled SQL — without running it. A `--lock` clause locks the matched rows, so it
 # prompts unless you pass `--yes`. Connection is overridable via `--connection` +
-# per-field flags / `--set`, as in `query`.
+# per-field flags / `--set`, as in `raw-query`.
 @category mole-mysql
 @example "every column of a table" {
   mole-mysql select --from users --dry-run | get query

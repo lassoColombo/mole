@@ -1,7 +1,7 @@
 # mole-victorialogs — VictoriaLogs driver plugin (READ-ONLY LogsQL HTTP API).
 #
 # A PLUGIN (data source): supports the `victorialogs` driver, registers itself as
-# a driver, and exposes read-only verbs — `query` / `hits` / `stats` / `fields` /
+# a driver, and exposes read-only verbs — `raw-query` / `hits` / `raw-stats` / `fields` /
 # `field-values` / `streams` / `facets` / `set-connection`. It talks to
 # VictoriaLogs over its HTTP API using Nushell's built-in `http` (no external
 # CLI), so `requires: []` in mole.nuon.
@@ -10,13 +10,13 @@
 #   - client.nu  — HAND-WRITTEN, mechanical HTTP layer for the read-only
 #                  `/select/logsql/` POST endpoints: base URL, multi-tenancy +
 #                  auth headers, form-urlencoding, timeouts, non-2xx raising. It
-#                  returns lightly-parsed data (raw JSONL text for `query`, a
+#                  returns lightly-parsed data (raw JSONL text for `raw-query`, a
 #                  `from json` record otherwise). Hand-written, not generated,
 #                  because VictoriaLogs ships no OpenAPI spec and its endpoints
 #                  are POST form-urlencoded (see client.nu header).
-#   - logsql.nu  — PURE response→typed-rows transforms (JSONL→table with `_time`
-#                  a datetime, hits pivot, Prometheus-shaped stats shaping,
-#                  value/facets parsing) plus the time/duration formatting
+#   - logsql.nu  — PURE response→typed-rows transforms (JSONL→table with
+#                  per-column type inference, hits pivot, Prometheus-shaped stats
+#                  shaping, value/facets parsing) plus the time/duration formatting
 #                  VictoriaLogs wants. No I/O, no clock — unit-tested directly.
 #   - mod.nu     — THIS wrapper. It owns policy: connection resolution,
 #                  time-range ergonomics, turning each payload into typed rows,
@@ -110,24 +110,106 @@ def vl-catalog-ctx [context: string]: nothing -> record {
 
 def "vl-field" [context: string]: nothing -> list<string> { vl-catalog-ctx $context | get -o fields | default [] }
 
+# The token under the cursor: the last whitespace-delimited chunk of a completion
+# context. Both list-style completers below reason about it.
+def vl-token [context: string]: nothing -> string { $context | split row " " | last }
+
+# Split a comma-separated flag value into a clean list (trims, drops blanks).
+def vl-csv [v: any]: nothing -> list<string> {
+  $v | default "" | split row "," | str trim | where {|x| $x | is-not-empty }
+}
+
+# Completer for the `--output` verbosity flag (see `logsql shape`).
+def "vl-output" []: nothing -> list<string> { ["compact" "wide" "full"] }
+
+# Rest-positional completer for `select` filter tokens. TWO STAGES on the token:
+#   - no `:` → field-name stage: `field:` for every cached field (cache-only, instant).
+#   - `field:…` → value stage: a LIVE `field_values` call (short timeout,
+#                 best-effort) so `level:er⇥` → `level:error`. The one completer
+#                 that hits the network — by design (values are not cached).
+# Nushell keeps `:` inside the word, so a `field:value` candidate replaces the
+# whole token and is prefix-filtered for us.
+def "vl-filter" [context: string]: nothing -> list<string> {
+  let tok = (vl-token $context)
+  if not ($tok | str contains ":") {
+    vl-field $context | each {|f| $"($f):" }
+  } else {
+    try {
+      let field = ($tok | split row ":" | first)
+      let conf = (vl-conf (vl-flag $context ["--connection" "-c"]) null null {})
+      client field-values $conf "*" $field --limit 50 --timeout 3sec
+      | logsql values $in | get -o value | default []
+      | each {|v| $"($field):(logsql lit ($v | into string))" }
+    } catch { [] }
+  }
+}
+
+# Completer for the comma-separated `--select` flag. Nushell won't complete inside
+# a `list<string>` `[...]` literal, so it takes a comma-joined string; this
+# re-prepends the already-typed values so accepting a candidate extends the list
+# (`_time,ho⇥` → `_time,host`). The prefix is the token with its partial last
+# segment stripped.
+def "vl-fields-csv" [context: string]: nothing -> list<string> {
+  let prefix = (vl-token $context | str replace --regex '[^,]*$' '')
+  vl-field $context | each {|f| $"($prefix)($f)" }
+}
+
+# ---- execution ----------------------------------------------------------------
+
+# Compose a LogsQL *filter* from AND-joined filter tokens. LogsQL ANDs
+# space-separated filters, so the tokens are space-joined; an empty result becomes
+# `*` (match everything). A top-level `|` pipe is rejected — a filter token may not
+# smuggle its own pipeline stage; `raw-query` is the escape hatch for that. The check
+# is quote-aware (`logsql has-pipe`), so a `|` inside a quoted regex/phrase (e.g.
+# `app:~"api|web"`) is allowed. Shared by `select` and the enumeration verbs
+# (`fields`/`field-values`/`streams`/`facets`), which all take completing filter
+# tokens instead of a raw query string. Raw filter syntax (regex, `OR`, ranges) is
+# just a quoted token — there is no separate `--where`.
+def vl-compose-filter [filters: list<string>]: nothing -> string {
+  let filter = ($filters | where {|p| $p | is-not-empty } | str join " ")
+  if (logsql has-pipe $filter) {
+    error make {msg: "a '|' pipe isn't allowed in a filter token — use `raw-query` for a full LogsQL pipeline"}
+  }
+  if ($filter | is-empty) { "*" } else { $filter }
+}
+
+# Fetch a resolved LogsQL query, warm the catalog, and return typed rows projected
+# to the `output` verbosity. Shared by `raw-query` and `select` — they differ only in
+# how `$q` is produced. `raw` skips the `_time` datetime coercion; `output` is one
+# of compact/wide/full (see `logsql shape`). (`limit`/`offset` are `any` so a null
+# passes straight through to the client's int flags.)
+def vl-run [conf: record, q: string, range: record, limit: any, offset: any, raw: bool, output: string]: nothing -> any {
+  let body = (client query $conf $q
+    --start (logsql vl-time $range.start) --end (logsql vl-time $range.end) --limit $limit --offset $offset)
+  vl-warm $conf
+  let rows = if $raw { logsql jsonl $body } else { logsql query $body }
+  logsql shape $rows $output
+}
+
 # ---- user verbs ---------------------------------------------------------------
 
 # Run a LogsQL query, returning one typed row per matching log entry.
 #
 # The expression is the positional <expr>, a saved `--file` (resolved under the
 # query dir with a `.logsql` suffix), or `$EDITOR` when neither is given. Each row
-# is a log entry — every field a column, with `_time` coerced to a datetime and
-# all other fields kept as the strings VictoriaLogs returned. The window is
-# `--last` (now minus a duration) or explicit `--start`/`--end`; `--limit` caps
-# the number of latest entries and `--offset` paginates. `--raw` skips the `_time`
-# coercion. Connection is the current victorialogs one unless `--connection` names
-# another; `--url`/`--token`/`--set` override fields.
+# is a log entry — every field a column. VictoriaLogs returns every value as a
+# string, so each column's type is inferred from its values (`_time` a datetime,
+# all-numeric columns int/float, `true`/`false` bool, JSON arrays/objects parsed,
+# the `_stream` selector a record of its labels); `--raw` returns the untouched
+# strings. `--output` sets the column verbosity: `compact` (the default — the
+# triage essentials `_time`/`level`/`_stream`/`_msg` that the data has), `wide`
+# (drops only the internal `_stream_id`) or `full`
+# (every column). The window is `--last` (now minus a
+# duration) or explicit `--start`/`--end`; `--limit` caps the number of latest
+# entries and `--offset` paginates. Connection is the current victorialogs one
+# unless `--connection` names another; `--url`/`--token`/`--set` override fields.
 @category mole-victorialogs
-@example "the last hour of errors" { mole-victorialogs query 'level:error' --last 1hr --limit 100 }
-@example "an explicit window" { mole-victorialogs query '*' --start 2026-07-26T00:00:00Z --end 2026-07-26T06:00:00Z }
-@example "a saved query against a named connection" { mole-victorialogs query --file dashboards/errors.logsql -c prod }
-@example "query text piped via stdin" { mole query show dashboards/errors.logsql | mole-victorialogs query -c prod }
-export def "query" [
+@example "the last hour of errors" { mole-victorialogs raw-query 'level:error' --last 1hr --limit 100 }
+@example "an explicit window" { mole-victorialogs raw-query '*' --start 2026-07-26T00:00:00Z --end 2026-07-26T06:00:00Z }
+@example "the full row, every column" { mole-victorialogs raw-query 'level:error' --last 1hr --output full }
+@example "a saved query against a named connection" { mole-victorialogs raw-query --file dashboards/errors.logsql -c prod }
+@example "query text piped via stdin" { mole query show dashboards/errors.logsql | mole-victorialogs raw-query -c prod }
+export def "raw-query" [
   expr?: string                                    # LogsQL expression (else --file, else stdin, else $EDITOR)
   --file(-f): string@"complete queryfile"          # saved query file (relative to the query dir)
   --last(-L): duration                             # window ending now (shorthand for --start (now - dur))
@@ -135,19 +217,87 @@ export def "query" [
   --end(-b): datetime                              # window end (default: now when --last is given)
   --limit(-l): int                                 # return up to N latest entries
   --offset(-o): int                                # skip N entries (pagination)
+  --output(-O): string@"vl-output" = "compact"     # column verbosity: compact | wide | full
   --connection(-c): string@complete-connection   # named connection (default: current)
   --url: string                                    # override the connection URL
   --token: string                                  # override the bearer token
   --set: record = {}                               # override any other connection field(s)
-  --raw(-R)                                         # skip the _time datetime coercion
+  --raw(-R)                                         # raw strings: skip all type inference
 ] {
   let conf = (vl-conf $connection $url $token $set)
   let q = ($in | query resolve $expr --file $file --suffix ".logsql")
-  let range = (vl-range $last $start $end)
-  let body = (client query $conf $q
-    --start (logsql vl-time $range.start) --end (logsql vl-time $range.end) --limit $limit --offset $offset)
-  vl-warm $conf
-  if $raw { logsql jsonl $body } else { logsql query $body }
+  vl-run $conf $q (vl-range $last $start $end) $limit $offset $raw $output
+}
+
+# Compose and run a LogsQL log query from the command line, with completion.
+#
+# The autocompleting mirror of `raw-query`: instead of writing the LogsQL by hand you
+# assemble it from flags, and every part tab-completes. The `...filters` are LogsQL
+# filter tokens (`error`, `level:error`, `status:>=500`), space-joined with AND and
+# passed through verbatim; each completes the field name first, then (via a live
+# lookup) that field's values. A token that won't complete is still fine — any raw
+# LogsQL filter (a regex, `OR`, a range) works as a quoted token, e.g.
+# `'app:~"api-.*"'`. `--select` projects columns (`| fields …`, completing) and
+# `--drop` removes them (`| delete …`, completing) — the inverse; `--sort-by` is a
+# completing comma-list of fields (`| sort by (…)`), ascending unless `--desc`;
+# `--limit` caps; `--before`/`--after` pull N surrounding log lines around each
+# match (`| stream_context`). Rows come back typed like `raw-query` (`--raw` keeps the
+# raw strings), and `--output` sets the column verbosity (compact | wide | full).
+# The window and connection flags are exactly `raw-query`'s. Single-stage on purpose —
+# a `|` in a filter token is rejected; reach for `raw-query` for an arbitrary pipeline
+# (or a mixed-direction sort). `--dry-run` returns `{connection, query}` — the
+# resolved connection (secrets dropped) and the composed LogsQL — without running it.
+@category mole-victorialogs
+@example "compose a filtered, projected, ordered query" {
+  mole-victorialogs select level:error status:>=500 --select _time,host,_msg --sort-by _time --desc --limit 100 --last 1hr --dry-run | get query
+} --result "level:error status:>=500 | fields _time, host, _msg | sort by (_time) desc | limit 100"
+@example "a raw filter is just another token, AND-joined" {
+  mole-victorialogs select timeout 'app:~"api-.*"' --dry-run | get query
+} --result "timeout app:~\"api-.*\""
+@example "drop noisy columns, keep the rest" {
+  mole-victorialogs select level:error --drop _stream_id,bytes --dry-run | get query
+} --result "level:error | delete _stream_id, bytes"
+@example "2 lines of context around each match" {
+  mole-victorialogs select 'db timeout' --after 2 --dry-run | get query
+} --result "db timeout | stream_context after 2"
+@example "no filters matches everything" {
+  mole-victorialogs select --limit 10 --dry-run | get query
+} --result "* | limit 10"
+@example "newest first against a named connection" {
+  mole-victorialogs select level:error --sort-by _time --desc --last 1hr -c prod
+}
+export def "select" [
+  ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
+  --select(-S): string@"vl-fields-csv"             # projected fields, comma-separated → `| fields ...`
+  --drop(-D): string@"vl-fields-csv"               # fields to remove, comma-separated → `| delete ...` (inverse of --select)
+  --sort-by(-s): string@"vl-fields-csv"            # sort fields, comma-separated → `| sort by (...)`
+  --desc(-d)                                       # sort descending (default: ascending)
+  --limit(-l): int                                 # `| limit N`
+  --before: int                                    # stream_context: N log lines before each match
+  --after: int                                     # stream_context: N log lines after each match
+  --last(-L): duration                             # window ending now (shorthand for --start (now - dur))
+  --start(-a): datetime                            # window start (overrides --last)
+  --end(-b): datetime                              # window end (default: now when --last is given)
+  --offset(-o): int                                # skip N entries (pagination)
+  --output(-O): string@"vl-output" = "compact"     # column verbosity: compact | wide | full
+  --connection(-c): string@complete-connection   # named connection (default: current)
+  --url: string                                    # override the connection URL
+  --token: string                                  # override the bearer token
+  --set: record = {}                               # override any other connection field(s)
+  --raw(-R)                                         # raw strings: skip all type inference
+  --dry-run(-n)                                     # return {connection, query} instead of running
+] {
+  let conf = (vl-conf $connection $url $token $set)
+  # Single-stage by design: a filter token may not smuggle its own pipe (enforced
+  # by vl-compose-filter). `raw-query` is the escape hatch for a full LogsQL pipeline.
+  let filter = (vl-compose-filter $filters)
+  let q = (logsql build-pipeline $filter
+    --fields (vl-csv $select) --drop (vl-csv $drop)
+    --sort-by (vl-csv $sort_by) --desc=$desc --limit $limit
+    --context-before $before --context-after $after)
+  if $dry_run { return {connection: ($conf | conn redact), query: $q} }
+  # Limit rides the `| limit` pipe in $q (so it applies after the sort), not the client param.
+  vl-run $conf $q (vl-range $last $start $end) null $offset $raw $output
 }
 
 # Per-bucket hit counts over time. Returns tidy `{time, <group>, hits}` rows.
@@ -185,9 +335,9 @@ export def "hits" [
 # instead — one row per (series, point), `{..labels, metric, time, value}` over the
 # `--last` / `--start`/`--end` window at `--step` resolution (default 1hr).
 @category mole-victorialogs
-@example "instant counts by level" { mole-victorialogs stats 'error | stats count() by (level)' }
-@example "a daily time series" { mole-victorialogs stats '* | stats count() by (level)' --range --last 1day --step 1hr }
-export def "stats" [
+@example "instant counts by level" { mole-victorialogs raw-stats 'error | stats count() by (level)' }
+@example "a daily time series" { mole-victorialogs raw-stats '* | stats count() by (level)' --range --last 1day --step 1hr }
+export def "raw-stats" [
   expr: string                                     # LogsQL ending in `| stats ...`
   --time(-t): datetime                             # instant to evaluate at (default: server now)
   --range(-r)                                       # time series instead of a single instant
@@ -211,15 +361,17 @@ export def "stats" [
   }
 }
 
-# List the field names present in the results of a query, with hit counts.
+# List the field names present in a query's results, with hit counts.
 #
-# Returns a `{value, hits}` table. The <expr> is the LogsQL filter (default `*`);
-# the window scopes the lookup.
+# Returns a `{value, hits}` table. Like `select`, the log set is composed from
+# `...filters` — LogsQL filter tokens (`level:error`, `status:>=500`) AND-joined
+# and tab-completing field → value (a raw regex/`OR` filter is just a quoted
+# token); no filters means every field. The window scopes the lookup.
 @category mole-victorialogs
 @example "all field names" { mole-victorialogs fields }
-@example "field names among errors in the last hour" { mole-victorialogs fields 'level:error' --last 1hr }
+@example "field names among errors in the last hour" { mole-victorialogs fields level:error --last 1hr }
 export def "fields" [
-  expr?: string                                    # LogsQL filter (default: *)
+  ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
   --last(-L): duration
   --start(-a): datetime
   --end(-b): datetime
@@ -230,22 +382,23 @@ export def "fields" [
 ] {
   let conf = (vl-conf $connection $url $token $set)
   let range = (vl-range $last $start $end)
-  (client field-names $conf ($expr | default "*")
+  (client field-names $conf (vl-compose-filter $filters)
     --start (logsql vl-time $range.start) --end (logsql vl-time $range.end))
   | logsql values $in
 }
 
 # List the distinct values of a field, with hit counts.
 #
-# Returns a `{value, hits}` table for <field>. The <expr> is the LogsQL filter
-# (default `*`); `--limit` caps the number of values, and the window scopes the
-# lookup. (Named `field-values`, not `values` — `values` is a Nushell builtin.)
+# Returns a `{value, hits}` table for <field>. Like `select`, the log set is
+# composed from `...filters` (AND-joined, tab-completing filter tokens); `--limit`
+# caps the number of values and the window scopes the lookup. (Named
+# `field-values`, not `values` — `values` is a Nushell builtin.)
 @category mole-victorialogs
 @example "every level value" { mole-victorialogs field-values level }
-@example "top hosts among errors" { mole-victorialogs field-values host 'level:error' --limit 20 }
+@example "top hosts among errors" { mole-victorialogs field-values host level:error --limit 20 }
 export def "field-values" [
   field: string@"vl-field"                         # the field name to enumerate
-  expr?: string                                    # LogsQL filter (default: *)
+  ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
   --last(-L): duration
   --start(-a): datetime
   --end(-b): datetime
@@ -257,7 +410,7 @@ export def "field-values" [
 ] {
   let conf = (vl-conf $connection $url $token $set)
   let range = (vl-range $last $start $end)
-  (client field-values $conf ($expr | default "*") $field
+  (client field-values $conf (vl-compose-filter $filters) $field
     --start (logsql vl-time $range.start) --end (logsql vl-time $range.end) --limit $limit)
   | logsql values $in
 }
@@ -265,13 +418,14 @@ export def "field-values" [
 # List the log streams matching a query, with hit counts.
 #
 # Returns a `{value, hits}` table where each `value` is a stream selector string
-# like `{host="h1",app="foo"}`. The <expr> is the LogsQL filter (default `*`);
-# `--limit` caps the number of streams, and the window scopes the lookup.
+# like `{host="h1",app="foo"}`. Like `select`, the log set is composed from
+# `...filters` (AND-joined, tab-completing filter tokens); `--limit` caps the
+# number of streams and the window scopes the lookup.
 @category mole-victorialogs
 @example "all active streams" { mole-victorialogs streams }
-@example "streams carrying errors, last day" { mole-victorialogs streams 'level:error' --last 1day --limit 50 }
+@example "streams carrying errors, last day" { mole-victorialogs streams level:error --last 1day --limit 50 }
 export def "streams" [
-  expr?: string                                    # LogsQL filter (default: *)
+  ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
   --last(-L): duration
   --start(-a): datetime
   --end(-b): datetime
@@ -283,7 +437,7 @@ export def "streams" [
 ] {
   let conf = (vl-conf $connection $url $token $set)
   let range = (vl-range $last $start $end)
-  (client streams $conf ($expr | default "*")
+  (client streams $conf (vl-compose-filter $filters)
     --start (logsql vl-time $range.start) --end (logsql vl-time $range.end) --limit $limit)
   | logsql values $in
 }
@@ -291,13 +445,14 @@ export def "streams" [
 # The most frequent values of every field, grouped by field.
 #
 # Returns `{field, values}` rows, where `values` is a `{value, hits}` table of the
-# top values for that field. The <expr> is the LogsQL filter (default `*`);
-# `--limit` caps the values kept per field, and the window scopes the lookup.
+# top values for that field. Like `select`, the log set is composed from
+# `...filters` (AND-joined, tab-completing filter tokens); `--limit` caps the
+# values kept per field and the window scopes the lookup.
 @category mole-victorialogs
 @example "the facet breakdown of the last hour" { mole-victorialogs facets --last 1hr }
-@example "facets among errors, 10 values per field" { mole-victorialogs facets 'level:error' --limit 10 }
+@example "facets among errors, 10 values per field" { mole-victorialogs facets level:error --limit 10 }
 export def "facets" [
-  expr?: string                                    # LogsQL filter (default: *)
+  ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
   --last(-L): duration
   --start(-a): datetime
   --end(-b): datetime
@@ -309,7 +464,7 @@ export def "facets" [
 ] {
   let conf = (vl-conf $connection $url $token $set)
   let range = (vl-range $last $start $end)
-  (client facets $conf ($expr | default "*")
+  (client facets $conf (vl-compose-filter $filters)
     --start (logsql vl-time $range.start) --end (logsql vl-time $range.end) --limit $limit)
   | logsql facets $in
 }

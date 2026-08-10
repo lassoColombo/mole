@@ -1,6 +1,6 @@
-{"_msg":"service started","host":"h1","app":"api","level":"info"}
-{"_msg":"request handled ok","host":"h1","app":"api","level":"info"}
-{"_msg":"db connection timeout","host":"h1","app":"api","level":"error"}
-{"_msg":"cache miss for key user:42","host":"h2","app":"worker","level":"warn"}
-{"_msg":"job completed","host":"h2","app":"worker","level":"info"}
-{"_msg":"unhandled exception in handler","host":"h2","app":"worker","level":"error"}
+{"_msg":"service started","host":"h1","app":"api","level":"info","status":200,"latency_ms":3.2,"bytes":128,"cached":false}
+{"_msg":"request handled ok","host":"h1","app":"api","level":"info","status":200,"latency_ms":12.7,"bytes":842,"cached":true}
+{"_msg":"db connection timeout","host":"h1","app":"api","level":"error","status":500,"latency_ms":5031.5,"bytes":0,"cached":false}
+{"_msg":"cache miss for key user:42","host":"h2","app":"worker","level":"warn","status":200,"latency_ms":88.1,"bytes":256,"cached":false,"items":[1,2,3]}
+{"_msg":"job completed","host":"h2","app":"worker","level":"info","status":200,"latency_ms":940.0,"bytes":4096,"cached":false,"items":[4,5]}
+{"_msg":"unhandled exception in handler","host":"h2","app":"worker","level":"error","status":500,"latency_ms":12.0,"bytes":0,"cached":false}

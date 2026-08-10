@@ -10,7 +10,7 @@ use ./complete.nu
 # inline `text`, a saved `--file`, piped stdin, then an interactive `$EDITOR`
 # session. Submodule verbs call it as `$in | query resolve $sql --file $file
 # --suffix ".sql"`, so the query can arrive as the verb's positional, a saved
-# file, or a pipeline — e.g. `mole query show reports/daily.sql | mole-psql query`.
+# file, or a pipeline — e.g. `mole query show reports/daily.sql | mole-psql raw-query`.
 #
 # `text` (an explicit argument) wins; then `--file` reads that saved query (a
 # path relative to the query dir) as raw text; then non-empty piped input is used

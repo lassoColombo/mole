@@ -1,7 +1,7 @@
 # mole-duckdb — DuckDB driver plugin.
 #
 # A PLUGIN (data source): supports the duckdb technology, registers itself as a
-# driver, and exposes the user verbs `query` / `select` / `schema`. It DEPENDS on:
+# driver, and exposes the user verbs `raw-query` / `select` / `schema`. It DEPENDS on:
 #   - mole core plumbing        (`use mole/lib/*.nu`)
 #   - the generic mole-sql pure LIBRARY (`use mole-sql/sql.nu`)
 # The library dependency is also declared in mole.nuon (`deps`) so `mole
@@ -282,16 +282,16 @@ def duck-order [sort_by: any]: nothing -> any {
 # names another; the target is a FILE PATH (--path / --database / --set, default
 # :memory:).
 #
-# Named `query`, not `run`, because `run` is a Nushell parser keyword. Reference
-# invocations (leaf verb — call it as your loader exposes it, e.g. `mole-duckdb query`):
+# Named `raw-query`, not `run`, because `run` is a Nushell parser keyword. Reference
+# invocations (leaf verb — call it as your loader exposes it, e.g. `mole-duckdb raw-query`):
 #
-#   mole-duckdb query "SELECT 42 AS n"                                   # the current connection
-#   mole-duckdb query "SELECT id, email FROM users ORDER BY id" -c duckdb-local-dev
-#   mole-duckdb query --file reports/active-users -c duckdb-local-dev    # <querydir>/reports/active-users.sql
-#   mole query show reports/active-users.sql | mole-duckdb query -c duckdb-local-dev  # query text piped via stdin
-#   mole-duckdb query "CREATE TABLE t (id int)" -c duckdb-local-dev --yes   # skip the danger prompt
+#   mole-duckdb raw-query "SELECT 42 AS n"                                   # the current connection
+#   mole-duckdb raw-query "SELECT id, email FROM users ORDER BY id" -c duckdb-local-dev
+#   mole-duckdb raw-query --file reports/active-users -c duckdb-local-dev    # <querydir>/reports/active-users.sql
+#   mole query show reports/active-users.sql | mole-duckdb raw-query -c duckdb-local-dev  # query text piped via stdin
+#   mole-duckdb raw-query "CREATE TABLE t (id int)" -c duckdb-local-dev --yes   # skip the danger prompt
 @category mole-duckdb
-export def "query" [
+export def "raw-query" [
   sql?: string                                     # SQL statement (else --file, else stdin, else $EDITOR)
   --file(-f): string@"complete queryfile"          # saved query file (relative to the query dir)
   --connection(-c): string@complete-connection   # named connection (default: current)
@@ -395,7 +395,7 @@ export def "select" [
 # detail for one table (its columns and constraints); `--find` searches table and
 # column names and comments case-insensitively; `--full` returns the raw cache
 # record, including its `meta`. `--refresh` rebuilds the cache from the live
-# database before reading. Connection/target overridable as in `query`.
+# database before reading. Connection/target overridable as in `raw-query`.
 @category mole-duckdb
 @example "summary — one row per table" {
   mole-duckdb schema -c duckdb-local-dev
@@ -436,7 +436,7 @@ export def "schema" [
 
 # Make a duckdb connection the current one for this driver.
 #
-# Records the choice in `$env.MOLE_CURRENT.duckdb`, so later `query` / `select` /
+# Records the choice in `$env.MOLE_CURRENT.duckdb`, so later `raw-query` / `select` /
 # `schema` calls can omit `--connection`. Validates that `name` exists and is
 # actually a duckdb connection (errors otherwise). Being `--env`, the change
 # persists in the caller's environment.

@@ -1,7 +1,7 @@
 # mole-prometheus — Prometheus driver plugin (READ-ONLY HTTP API).
 #
 # A PLUGIN (data source): supports the `prometheus` driver, registers itself as a
-# driver, and exposes read-only verbs — `query` / `query-range` / `series` /
+# driver, and exposes read-only verbs — `raw-query` / `raw-query-range` / `series` /
 # `labels` / `label-values` / `metrics`. It talks to Prometheus over its HTTP API
 # using Nushell's built-in `http` (no external CLI), so `requires: []` in
 # mole.nuon.
@@ -183,11 +183,11 @@ def "pq-eq" [context: string]: nothing -> list<string> {
 # `{status, data, warnings, …}` envelope. Connection is the current prometheus one
 # unless `--connection` names another; `--url`/`--token`/`--set` override fields.
 @category mole-prometheus
-@example "instant value of a metric" { mole-prometheus query "up" }
-@example "an aggregation, at a specific instant" { mole-prometheus query "sum by (job) (up)" --time 2026-07-26T00:00:00Z }
-@example "a saved query against a named connection" { mole-prometheus query --file dashboards/errors.promql -c prod }
-@example "query text piped via stdin" { mole query show dashboards/errors.promql | mole-prometheus query -c prod }
-export def "query" [
+@example "instant value of a metric" { mole-prometheus raw-query "up" }
+@example "an aggregation, at a specific instant" { mole-prometheus raw-query "sum by (job) (up)" --time 2026-07-26T00:00:00Z }
+@example "a saved query against a named connection" { mole-prometheus raw-query --file dashboards/errors.promql -c prod }
+@example "query text piped via stdin" { mole query show dashboards/errors.promql | mole-prometheus raw-query -c prod }
+export def "raw-query" [
   expr?: string@"pq-expr"                          # PromQL expression (else --file, else stdin, else $EDITOR)
   --file(-f): string@"complete queryfile"          # saved query file (relative to the query dir)
   --time(-t): datetime                             # evaluation instant (default: server now)
@@ -212,15 +212,15 @@ export def "query" [
 
 # Run a range PromQL query over a time window, returning a tidy time series.
 #
-# Same expression sources as `query`. The window is `--last` (now minus a
+# Same expression sources as `raw-query`. The window is `--last` (now minus a
 # duration), or explicit `--start`/`--end`; `--step` is the resolution (default
 # 15s). A `matrix` result comes back tidy: one row per (series, point), every
 # label a column (`__name__` as `metric`), plus `timestamp` (datetime) and `value`
-# (float). `--raw`/`--full` and the connection flags behave as in `query`.
+# (float). `--raw`/`--full` and the connection flags behave as in `raw-query`.
 @category mole-prometheus
-@example "last hour of a rate, at 1-minute resolution" { mole-prometheus query-range "rate(http_requests_total[5m])" --last 1hr --step 1min }
-@example "an explicit window" { mole-prometheus query-range "up" --start 2026-07-26T00:00:00Z --end 2026-07-26T06:00:00Z --step 5min }
-export def "query-range" [
+@example "last hour of a rate, at 1-minute resolution" { mole-prometheus raw-query-range "rate(http_requests_total[5m])" --last 1hr --step 1min }
+@example "an explicit window" { mole-prometheus raw-query-range "up" --start 2026-07-26T00:00:00Z --end 2026-07-26T06:00:00Z --step 5min }
+export def "raw-query-range" [
   expr?: string@"pq-expr"                          # PromQL expression (else --file, else stdin, else $EDITOR)
   --file(-f): string@"complete queryfile"          # saved query file (relative to the query dir)
   --last(-L): duration                             # window ending now (shorthand for --start (now - dur))
@@ -239,7 +239,7 @@ export def "query-range" [
   let conf = (pq-conf $connection $url $token $set)
   let q = ($in | query resolve $expr --file $file --suffix ".promql")
   let range = (promql resolve-range $last $start $end (date now))
-  if ($range.start | is-empty) { error make {msg: "query-range needs a window: pass --last, or --start/--end"} }
+  if ($range.start | is-empty) { error make {msg: "raw-query-range needs a window: pass --last, or --start/--end"} }
   let resp = (client query-range list --query $q
     --start (promql ts $range.start) --end (promql ts $range.end) --step (promql step $step)
     --limit $limit --timeout $timeout
@@ -251,7 +251,7 @@ export def "query-range" [
 }
 
 # Compose and run a PromQL query from completion-aware flags — the ergonomic
-# alternative to writing raw PromQL in `query`.
+# alternative to writing raw PromQL in `raw-query`.
 #
 # Assembles `[agg [by/without (labels)]] ( [func] ( metric{matchers}[range] ) )`
 # from the flags, then runs it: INSTANT by default, or as a RANGE query when any
@@ -262,7 +262,7 @@ export def "query-range" [
 # `--func`/`--agg` complete from the PromQL function/aggregation sets; `--by`/
 # `--without` complete the metric's labels. Matcher tokens are `label=value` (the
 # value is quoted for you); use `--re`/`--nre` for regex values. Results are typed
-# exactly as `query`/`query-range`.
+# exactly as `raw-query`/`raw-query-range`.
 @category mole-prometheus
 @example "filter a metric by labels (instant)" {
   mole-prometheus select http_requests_total --eq [job=api method=GET] --dry-run | get query
@@ -313,9 +313,9 @@ export def "select" [
     --without ($without | default []))
   if $dry_run { return {connection: (pq-conf $connection $url $token $set | conn redact), query: $expr} }
   if (($last | is-not-empty) or ($start | is-not-empty) or ($end | is-not-empty)) {
-    query-range $expr --last $last --start $start --end $end --step $step --limit $limit --connection $connection --url $url --token $token --set $set --raw=$raw --full=$full
+    raw-query-range $expr --last $last --start $start --end $end --step $step --limit $limit --connection $connection --url $url --token $token --set $set --raw=$raw --full=$full
   } else {
-    query $expr --time $time --limit $limit --connection $connection --url $url --token $token --set $set --raw=$raw --full=$full
+    raw-query $expr --time $time --limit $limit --connection $connection --url $url --token $token --set $set --raw=$raw --full=$full
   }
 }
 
@@ -345,7 +345,7 @@ export def "series" [
   (client series get --qp-match $match --start (promql ts $range.start) --end (promql ts $range.end) --limit $limit
     --base-url (pq-base $conf) --token (pq-token $conf) --insecure=(pq-insecure $conf))
   | get -o data | default []
-  | each {|r| promql relabel $r }   # surface __name__ as `metric`, as query/query-range do
+  | each {|r| promql relabel $r }   # surface __name__ as `metric`, as raw-query/raw-query-range do
 }
 
 # List label names present in the data (optionally scoped by selectors/window).

@@ -1,7 +1,7 @@
 # mole-psql — PostgreSQL driver plugin.
 #
 # A PLUGIN (data source): supports the postgres technology, registers itself as a
-# driver, and exposes the user verbs `query` / `select` / `schema`. It DEPENDS on:
+# driver, and exposes the user verbs `raw-query` / `select` / `schema`. It DEPENDS on:
 #   - mole core plumbing        (`use mole/lib/*.nu`)
 #   - the generic mole-sql pure LIBRARY (`use mole-sql/sql.nu`)
 # The library dependency is also declared in mole.nuon (`deps`) so `mole
@@ -278,16 +278,16 @@ def pg-lock [lock: any, lock_of: list<string>, skip_locked: bool, nowait: bool]:
 # skips. The connection is the current psql one unless `--connection` names
 # another; per-field flags and `--set` override individual fields.
 #
-# Named `query`, not `run`, because `run` is a Nushell parser keyword. Reference
-# invocations (leaf verb — call it as your loader exposes it, e.g. `mole-psql query`):
+# Named `raw-query`, not `run`, because `run` is a Nushell parser keyword. Reference
+# invocations (leaf verb — call it as your loader exposes it, e.g. `mole-psql raw-query`):
 #
-#   mole-psql query "SELECT now()"                                     # the current connection
-#   mole-psql query "SELECT id, email FROM users ORDER BY id" -c postgres-local-dev
-#   mole-psql query --file reports/active-users -c postgres-local-dev  # <querydir>/reports/active-users.sql
-#   mole query show reports/active-users.sql | mole-psql query -c postgres-local-dev  # query text piped via stdin
-#   mole-psql query "CREATE TEMP TABLE t (id int)" -c postgres-local-dev --yes   # skip the danger prompt
+#   mole-psql raw-query "SELECT now()"                                     # the current connection
+#   mole-psql raw-query "SELECT id, email FROM users ORDER BY id" -c postgres-local-dev
+#   mole-psql raw-query --file reports/active-users -c postgres-local-dev  # <querydir>/reports/active-users.sql
+#   mole query show reports/active-users.sql | mole-psql raw-query -c postgres-local-dev  # query text piped via stdin
+#   mole-psql raw-query "CREATE TEMP TABLE t (id int)" -c postgres-local-dev --yes   # skip the danger prompt
 @category mole-psql
-export def "query" [
+export def "raw-query" [
   sql?: string                                     # SQL statement (else --file, else stdin, else $EDITOR)
   --file(-f): string@"complete queryfile"          # saved query file (relative to the query dir)
   --connection(-c): string@complete-connection   # named connection (default: current)
@@ -324,7 +324,7 @@ export def "query" [
 # fully lossless rows (no typing, no null-normalization). `--dry-run` returns a `{connection, query}` record — the resolved
 # connection (secrets dropped) and the assembled SQL — without running it. A `--lock`
 # clause locks the matched rows, so it prompts unless you pass `--yes`. Connection
-# is overridable via `--connection` + per-field flags / `--set`, as in `query`.
+# is overridable via `--connection` + per-field flags / `--set`, as in `raw-query`.
 @category mole-psql
 @example "every column of a table" {
   mole-psql select --from users --dry-run | get query
