@@ -271,7 +271,6 @@ export def "status" [
 export def --env "set-connection" [
   name: string@complete-connection               # an alertmanager connection name (from the connections file)
 ]: nothing -> nothing {
-  let conf = (conn resolve $name --driver alertmanager)
-  $env.MOLE_CURRENT = (($env.MOLE_CURRENT? | default {}) | upsert alertmanager $name)
+  let conf = (conn set-current alertmanager $name)
   try { am-catalog-load $conf --refresh | ignore } catch { }
 }

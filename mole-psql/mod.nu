@@ -205,7 +205,9 @@ def "psql-table" [context: string]: nothing -> list<string> {
 def "psql-column" [context: string]: nothing -> list<string> {
   try {
     let conf = (conn with psql (sql parse-flag $context ["--connection" "-c"]) {})
-    let tbl = (sql parse-flag $context ["--from" "-F"])
+    # `select` names its table with --from; `update`/`delete` take it as the leading
+    # positional — fall back to that so column completion works for the write verbs too.
+    let tbl = (sql parse-flag $context ["--from" "-F"] | default (sql lead-arg $context [update delete]))
     sql complete-columns (pg-schema-load $conf | default {}) $tbl
   } catch { [] }
 }
@@ -296,7 +298,7 @@ export def "raw-query" [
 ] {
   let conf = (pg-conf $connection $host $port $user $password $database $set)
   let text = ($in | query resolve $sql --file $file --suffix ".sql")
-  if (sql is-dangerous $text (pg-dangerous)) and (not (query confirm "This query may modify data. Run it?" --yes=$yes)) {
+  if (query is-dangerous $text (pg-dangerous)) and (not (query confirm "This query may modify data. Run it?" --yes=$yes)) {
     return
   }
   pg-rows $conf $text
@@ -414,13 +416,15 @@ export def "select" [
 
 # Compose and run a single-table PostgreSQL UPDATE.
 #
-# The SET assignments are the positional args — each a verbatim `"col = expr"`, so
-# expressions (`hits = hits + 1`, `updated_at = now()`) all work; you quote
-# identifiers and string literals yourself. Their column names complete against
-# the `--from` table. `--where` is the same verbatim predicate as `select`;
-# `--returning` names columns to hand back for the changed rows (Postgres
-# RETURNING), typed exactly like a `select` result. There is NO join support — the
-# target is the single `--from` table; reach for `raw-query` for `UPDATE ... FROM`.
+# Reads like the statement: `update <table> <assignment>...`. The table is the
+# leading positional (completing table names); the SET assignments follow as
+# positionals — each a verbatim `"col = expr"`, so expressions (`hits = hits + 1`,
+# `updated_at = now()`) all work; you quote identifiers and string literals
+# yourself, and their column names complete against the table. `--where` is the
+# same verbatim predicate as `select`; `--returning` names columns to hand back for
+# the changed rows (Postgres RETURNING), typed exactly like a `select` result.
+# There is NO join support — the target is the single table; reach for `raw-query`
+# for `UPDATE ... FROM`.
 #
 # UPDATE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to touch every row unless you pass `--all` (a missing `--where` would
@@ -429,23 +433,23 @@ export def "select" [
 # flags / `--set`, as in `raw-query`.
 @category mole-psql
 @example "set a column on the matched rows" {
-  mole-psql update "status = 'inactive'" --from users --where "last_login < now() - interval '1 year'" --dry-run | get query
+  mole-psql update users "status = 'inactive'" --where "last_login < now() - interval '1 year'" --dry-run | get query
 } --result "UPDATE users SET status = 'inactive' WHERE last_login < now() - interval '1 year'"
 @example "expression assignment, returning the new value" {
-  mole-psql update "login_count = login_count + 1" --from users --where "id = 42" --returning [id login_count] --dry-run | get query
+  mole-psql update users "login_count = login_count + 1" --where "id = 42" --returning [id login_count] --dry-run | get query
 } --result "UPDATE users SET login_count = login_count + 1 WHERE id = 42 RETURNING id, login_count"
 @example "several assignments at once" {
-  mole-psql update "status = 'active'" "verified = true" --from users --where "email = 'a@b.c'" --dry-run | get query
+  mole-psql update users "status = 'active'" "verified = true" --where "email = 'a@b.c'" --dry-run | get query
 } --result "UPDATE users SET status = 'active', verified = true WHERE email = 'a@b.c'"
 @example "guard: an unfiltered UPDATE needs --all" {
-  mole-psql update "archived = true" --from users --all --dry-run | get query
+  mole-psql update users "archived = true" --all --dry-run | get query
 } --result "UPDATE users SET archived = true"
 @example "run for real — RETURNING rows come back DB-typed (prompts unless --yes)" {
-  mole-psql update "balance = balance - 10" --from accounts --where "id = 1" --returning [id balance] -c postgres-local-dev --yes
+  mole-psql update accounts "balance = balance - 10" --where "id = 1" --returning [id balance] -c postgres-local-dev --yes
 }
 export def "update" [
+  table: string@"psql-table"                       # target table (UPDATE <table>); single table, an alias is allowed: "users u"
   ...assignments: string@"psql-column"             # SET assignments, verbatim "col = expr" (at least one required)
-  --from(-F): string@"psql-table"                  # target table, single table only (an alias is allowed: "users u")
   --where(-w): string                              # WHERE predicate (without the keyword)
   --returning: list<string>@"psql-column"          # RETURNING columns (typed like a select result)
   --all                                            # allow an unfiltered UPDATE (every row) when --where is omitted
@@ -460,17 +464,11 @@ export def "update" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($from | is-empty) { error make {msg: "update: --from <table> is required"} }
-  if ($assignments | is-empty) { error make {msg: "update: at least one SET assignment is required, e.g. \"status = 'active'\""} }
+  if ($assignments | is-empty) { error make {msg: "update: at least one SET assignment is required, e.g. update users \"status = 'active'\""} }
   if ($where | is-empty) and (not $all) {
     error make {msg: "update: refusing to update every row without --where (pass --all to override)"}
   }
-  let text = (sql assemble [
-    $"UPDATE ($from)"
-    (sql join-list $assignments --prefix "SET ")
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
-    (sql join-list ($returning | default []) --prefix "RETURNING ")
-  ])
+  let text = (sql build-update --table $table --set $assignments --where ($where | default "") --returning ($returning | default []))
   let conf = (pg-conf $connection $host $port $user $password $database $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This UPDATE will modify rows. Run it?" --yes=$yes)) { return }
@@ -478,15 +476,16 @@ export def "update" [
   if $raw or ($rows | is-empty) { return $rows }
   $rows
   | sql normalize-nulls $PG_NULLS
-  | sql apply-types (sql columns-for (pg-schema-load $conf) (sql base-table $from)) {|c| pg-type $c }
+  | sql apply-types (sql columns-for (pg-schema-load $conf) (sql base-table $table)) {|c| pg-type $c }
 }
 
 # Compose and run a single-table PostgreSQL DELETE.
 #
-# `--where` is the same verbatim predicate as `select`; `--returning` names
-# columns to hand back for the deleted rows (Postgres RETURNING), typed exactly
-# like a `select` result. There is NO join support — deletes from the single
-# `--from` table; reach for `raw-query` for `DELETE ... USING`.
+# Reads like the statement: `delete <table>`. The table is the leading positional
+# (completing table names). `--where` is the same verbatim predicate as `select`;
+# `--returning` names columns to hand back for the deleted rows (Postgres
+# RETURNING), typed exactly like a `select` result. There is NO join support —
+# deletes from the single table; reach for `raw-query` for `DELETE ... USING`.
 #
 # DELETE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to delete every row unless you pass `--all`. `--dry-run` returns a
@@ -494,19 +493,19 @@ export def "update" [
 # `raw-query`.
 @category mole-psql
 @example "delete the matched rows" {
-  mole-psql delete --from sessions --where "expires_at < now()" --dry-run | get query
+  mole-psql delete sessions --where "expires_at < now()" --dry-run | get query
 } --result "DELETE FROM sessions WHERE expires_at < now()"
 @example "delete, returning everything that was removed" {
-  mole-psql delete --from sessions --where "user_id = 7" --returning ["*"] --dry-run | get query
+  mole-psql delete sessions --where "user_id = 7" --returning ["*"] --dry-run | get query
 } --result "DELETE FROM sessions WHERE user_id = 7 RETURNING *"
 @example "guard: an unfiltered DELETE needs --all" {
-  mole-psql delete --from staging_rows --all --dry-run | get query
+  mole-psql delete staging_rows --all --dry-run | get query
 } --result "DELETE FROM staging_rows"
 @example "run for real — returns the deleted ids (prompts unless --yes)" {
-  mole-psql delete --from sessions --where "user_id = 7" --returning [id] -c postgres-local-dev --yes
+  mole-psql delete sessions --where "user_id = 7" --returning [id] -c postgres-local-dev --yes
 }
 export def "delete" [
-  --from(-F): string@"psql-table"                  # target table, single table only (an alias is allowed: "users u")
+  table: string@"psql-table"                       # target table (DELETE FROM <table>); single table, an alias is allowed: "users u"
   --where(-w): string                              # WHERE predicate (without the keyword)
   --returning: list<string>@"psql-column"          # RETURNING columns (typed like a select result)
   --all                                            # allow an unfiltered DELETE (every row) when --where is omitted
@@ -521,15 +520,10 @@ export def "delete" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($from | is-empty) { error make {msg: "delete: --from <table> is required"} }
   if ($where | is-empty) and (not $all) {
     error make {msg: "delete: refusing to delete every row without --where (pass --all to override)"}
   }
-  let text = (sql assemble [
-    $"DELETE FROM ($from)"
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
-    (sql join-list ($returning | default []) --prefix "RETURNING ")
-  ])
+  let text = (sql build-delete --table $table --where ($where | default "") --returning ($returning | default []))
   let conf = (pg-conf $connection $host $port $user $password $database $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This DELETE will remove rows. Run it?" --yes=$yes)) { return }
@@ -537,7 +531,7 @@ export def "delete" [
   if $raw or ($rows | is-empty) { return $rows }
   $rows
   | sql normalize-nulls $PG_NULLS
-  | sql apply-types (sql columns-for (pg-schema-load $conf) (sql base-table $from)) {|c| pg-type $c }
+  | sql apply-types (sql columns-for (pg-schema-load $conf) (sql base-table $table)) {|c| pg-type $c }
 }
 
 # Inspect a connection's cached schema (introspection is cached for a day).
@@ -602,6 +596,5 @@ export def "schema" [
 export def --env "set-connection" [
   name: string@complete-connection   # a psql connection name (from the connections file)
 ]: nothing -> nothing {
-  conn resolve $name --driver psql | ignore
-  $env.MOLE_CURRENT = (($env.MOLE_CURRENT? | default {}) | upsert psql $name)
+  conn set-current psql $name | ignore
 }

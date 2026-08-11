@@ -48,3 +48,24 @@ def "resolve --file returns raw file contents" [] {
   let r = query resolve --file "hello.sql"
   assert equal $r "SELECT 1"
 }
+
+@test
+def "is-dangerous flags a dangerous statement" [] {
+  assert equal (query is-dangerous "DROP TABLE x" '(?i)\b(drop|delete)\b') true
+  assert equal (query is-dangerous "select 1" '(?i)\b(drop|delete)\b') false
+}
+
+@test
+def "is-dangerous ignores keywords inside quoted spans of both escape styles" [] {
+  let pat = '(?i)\b(create|drop|delete|update|insert)\b'
+  # single-quoted literal / LIKE pattern, incl. the SQL '' doubling escape
+  assert equal (query is-dangerous "SELECT sku FROM products WHERE name LIKE '%create%'" $pat) false
+  assert equal (query is-dangerous "SELECT 'it''s a drop' AS x" $pat) false
+  # double-quoted identifier / JS-or-mongosh string value (backslash-escape style)
+  assert equal (query is-dangerous 'SELECT "update" FROM t' $pat) false
+  assert equal (query is-dangerous 'db.users.find({action: "drop"})' $pat) false
+  # backtick identifier
+  assert equal (query is-dangerous 'SELECT `delete` FROM t' $pat) false
+  # a real write is still caught
+  assert equal (query is-dangerous "UPDATE t SET x = 1" $pat) true
+}

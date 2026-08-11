@@ -202,7 +202,9 @@ def "trino-table" [context: string]: nothing -> list<string> {
 def "trino-column" [context: string]: nothing -> list<string> {
   try {
     let conf = (conn with trino (sql parse-flag $context ["--connection" "-c"]) {})
-    let tbl = (sql parse-flag $context ["--from" "-F"])
+    # `select` names its table with --from; `update`/`delete` take it as the leading
+    # positional — fall back to that so column completion works for the write verbs too.
+    let tbl = (sql parse-flag $context ["--from" "-F"] | default (sql lead-arg $context [update delete]))
     sql complete-columns (trino-schema-load $conf | default {}) $tbl
   } catch { [] }
 }
@@ -279,7 +281,7 @@ export def "raw-query" [
 ] {
   let conf = (trino-conf $connection $host $port $user $catalog $schema $set)
   let text = ($in | query resolve $sql --file $file --suffix ".sql")
-  if (sql is-dangerous $text (trino-dangerous)) and (not (query confirm "This query may modify data. Run it?" --yes=$yes)) {
+  if (query is-dangerous $text (trino-dangerous)) and (not (query confirm "This query may modify data. Run it?" --yes=$yes)) {
     return
   }
   trino-rows $conf $text
@@ -351,7 +353,7 @@ export def "select" [
   ])
   let conf = (trino-conf $connection $host $port $user $catalog $schema $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
-  if (sql is-dangerous $text (trino-dangerous)) and (not (query confirm "This query may modify data. Run it?" --yes=$yes)) {
+  if (query is-dangerous $text (trino-dangerous)) and (not (query confirm "This query may modify data. Run it?" --yes=$yes)) {
     return
   }
   let rows = (trino-rows $conf $text)
@@ -363,11 +365,13 @@ export def "select" [
 
 # Compose and run a single-table Trino UPDATE.
 #
-# The SET assignments are the positional args — each a verbatim `"col = expr"`, so
-# expressions work; you quote identifiers and string literals yourself. Their
-# column names complete against the `--from` table. `--where` is the same verbatim
-# predicate as `select`. Trino UPDATE is connector-dependent and has no RETURNING,
-# no ORDER BY/LIMIT and no join support — reach for `raw-query` for anything more.
+# Reads like the statement: `update <table> <assignment>...`. The table is the
+# leading positional (completing table names); the SET assignments follow as
+# positionals — each a verbatim `"col = expr"`, so expressions work; you quote
+# identifiers and string literals yourself, and their column names complete against
+# the table. `--where` is the same verbatim predicate as `select`. Trino UPDATE is
+# connector-dependent and has no RETURNING, no ORDER BY/LIMIT and no join support —
+# reach for `raw-query` for anything more.
 #
 # UPDATE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to touch every row unless you pass `--all`. `--dry-run` returns a
@@ -375,17 +379,17 @@ export def "select" [
 # `--connection` + per-field flags / `--catalog` / `--schema` / `--set`.
 @category mole-trino
 @example "set a column on the matched rows" {
-  mole-trino update "status = 'inactive'" --from users --where "id = 5" --dry-run | get query
+  mole-trino update users "status = 'inactive'" --where "id = 5" --dry-run | get query
 } --result "UPDATE users SET status = 'inactive' WHERE id = 5"
 @example "several assignments at once" {
-  mole-trino update "a = 1" "b = 2" --from t --where "id = 5" --dry-run | get query
+  mole-trino update t "a = 1" "b = 2" --where "id = 5" --dry-run | get query
 } --result "UPDATE t SET a = 1, b = 2 WHERE id = 5"
 @example "guard: an unfiltered UPDATE needs --all" {
-  mole-trino update "archived = true" --from users --all --dry-run | get query
+  mole-trino update users "archived = true" --all --dry-run | get query
 } --result "UPDATE users SET archived = true"
 export def "update" [
+  table: string@"trino-table"                      # target table (UPDATE <table>); single table, an alias is allowed: "customer c"
   ...assignments: string@"trino-column"            # SET assignments, verbatim "col = expr" (at least one required)
-  --from(-F): string@"trino-table"                 # target table, single table only (an alias is allowed: "customer c")
   --where(-w): string                              # WHERE predicate (without the keyword)
   --all                                            # allow an unfiltered UPDATE (every row) when --where is omitted
   --connection(-c): string@complete-connection   # named connection (default: current)
@@ -398,16 +402,11 @@ export def "update" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($from | is-empty) { error make {msg: "update: --from <table> is required"} }
-  if ($assignments | is-empty) { error make {msg: "update: at least one SET assignment is required, e.g. \"status = 'active'\""} }
+  if ($assignments | is-empty) { error make {msg: "update: at least one SET assignment is required, e.g. update customer \"status = 'active'\""} }
   if ($where | is-empty) and (not $all) {
     error make {msg: "update: refusing to update every row without --where (pass --all to override)"}
   }
-  let text = (sql assemble [
-    $"UPDATE ($from)"
-    (sql join-list $assignments --prefix "SET ")
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
-  ])
+  let text = (sql build-update --table $table --set $assignments --where ($where | default ""))
   let conf = (trino-conf $connection $host $port $user $catalog $schema $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This UPDATE will modify rows. Run it?" --yes=$yes)) { return }
@@ -416,9 +415,10 @@ export def "update" [
 
 # Compose and run a single-table Trino DELETE.
 #
-# `--where` is the same verbatim predicate as `select`. Trino DELETE is
-# connector-dependent and has no RETURNING, no ORDER BY/LIMIT and no join support
-# — reach for `raw-query` for anything more.
+# Reads like the statement: `delete <table>`. The table is the leading positional
+# (completing table names). `--where` is the same verbatim predicate as `select`.
+# Trino DELETE is connector-dependent and has no RETURNING, no ORDER BY/LIMIT and
+# no join support — reach for `raw-query` for anything more.
 #
 # DELETE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to delete every row unless you pass `--all`. `--dry-run` returns a
@@ -426,13 +426,13 @@ export def "update" [
 # `update`.
 @category mole-trino
 @example "delete the matched rows" {
-  mole-trino delete --from sessions --where "expires_at < now()" --dry-run | get query
+  mole-trino delete sessions --where "expires_at < now()" --dry-run | get query
 } --result "DELETE FROM sessions WHERE expires_at < now()"
 @example "guard: an unfiltered DELETE needs --all" {
-  mole-trino delete --from staging_rows --all --dry-run | get query
+  mole-trino delete staging_rows --all --dry-run | get query
 } --result "DELETE FROM staging_rows"
 export def "delete" [
-  --from(-F): string@"trino-table"                 # target table, single table only (an alias is allowed: "customer c")
+  table: string@"trino-table"                      # target table (DELETE FROM <table>); single table, an alias is allowed: "customer c"
   --where(-w): string                              # WHERE predicate (without the keyword)
   --all                                            # allow an unfiltered DELETE (every row) when --where is omitted
   --connection(-c): string@complete-connection   # named connection (default: current)
@@ -445,14 +445,10 @@ export def "delete" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($from | is-empty) { error make {msg: "delete: --from <table> is required"} }
   if ($where | is-empty) and (not $all) {
     error make {msg: "delete: refusing to delete every row without --where (pass --all to override)"}
   }
-  let text = (sql assemble [
-    $"DELETE FROM ($from)"
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
-  ])
+  let text = (sql build-delete --table $table --where ($where | default ""))
   let conf = (trino-conf $connection $host $port $user $catalog $schema $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This DELETE will remove rows. Run it?" --yes=$yes)) { return }
@@ -522,6 +518,5 @@ export def "schema" [
 export def --env "set-connection" [
   name: string@complete-connection   # a trino connection name (from the connections file)
 ]: nothing -> nothing {
-  conn resolve $name --driver trino | ignore
-  $env.MOLE_CURRENT = (($env.MOLE_CURRENT? | default {}) | upsert trino $name)
+  conn set-current trino $name | ignore
 }

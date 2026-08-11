@@ -114,6 +114,28 @@ export def "resolve" [
   $conf
 }
 
+# Make `name` the current connection for `driver`, in `$env.MOLE_CURRENT`.
+#
+# Validates that `name` exists and is actually a `driver` connection — it resolves
+# through `resolve $name --driver $driver`, which errors on an unknown name or a
+# cross-driver mismatch — then upserts `$env.MOLE_CURRENT.<driver> = name`, so later
+# verbs can `resolve --driver <driver>` and the user can omit `--connection`. Being
+# `--env`, the change persists in the caller's environment: a submodule's own
+# `set-connection` verb is a thin `--env` wrapper over this. RETURNS the resolved
+# connection record, so a driver that warms a cache on switch can chain off it
+# (`let conf = (conn set-current "vlogs" $name)`); a driver that doesn't need it
+# pipes the record to `ignore` (env changes still propagate through the pipe).
+@category mole-lib
+@example "make a psql connection the current one" { set-current "psql" "prod-db" }
+export def --env "set-current" [
+  driver: string   # The driver the connection belongs to (membership asserted via `resolve`)
+  name: string     # The connection name to make current
+]: nothing -> record {
+  let conf = (resolve $name --driver $driver)
+  $env.MOLE_CURRENT = (($env.MOLE_CURRENT? | default {}) | upsert $driver $name)
+  $conf
+}
+
 # Apply non-null overrides to a piped connection record.
 #
 # Fields in `overrides` whose value is null are ignored; the rest are upserted

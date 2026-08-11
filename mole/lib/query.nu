@@ -75,3 +75,37 @@ export def "check" []: record -> string {
   }
   $r.stdout
 }
+
+# Test a statement against a caller-supplied dangerous-statement regex.
+#
+# The caller owns `pattern` (its dialect's write / DDL / session-mutating keywords)
+# and calls this before running to decide whether to prompt. String literals and
+# quoted identifiers are stripped FIRST — single- and double-quoted spans (honoring
+# BOTH the SQL `''`/`""` doubling and the JS/mongosh `\'`/`\"` backslash escape
+# conventions) plus `` `...` `` spans — so a keyword that appears only inside a
+# `'...'` value, a `LIKE` pattern, a `"..."` / `` `...` `` identifier, or a mongosh
+# string field can't trip the check; only keywords in real statement positions
+# count. (Without this a read-only `... WHERE name LIKE '%create%'` would falsely
+# prompt.) Dialect-agnostic: shared by the SQL drivers (`pattern` = their danger
+# regex) and mongodb (`pattern` = `mongo mongo-danger`). Case-sensitivity is
+# whatever the pattern encodes — the dialect patterns lead with `(?i)`.
+@category mole-lib
+@example "a DROP is flagged" {
+  is-dangerous "DROP TABLE x" '(?i)\b(drop|delete)\b'
+} --result true
+@example "a plain SELECT is not" {
+  is-dangerous "select 1" '(?i)\b(drop|delete)\b'
+} --result false
+@example "a keyword inside a string literal does not count" {
+  is-dangerous "SELECT id FROM t WHERE name LIKE '%drop%'" '(?i)\b(drop|delete)\b'
+} --result false
+export def "is-dangerous" [
+  text: string      # the statement to test
+  pattern: string   # the caller's dangerous-statement regex (dialect-specific)
+]: nothing -> bool {
+  let bare = ($text
+    | str replace --all --regex "'(?:[^'\\\\]|''|\\\\.)*'" " "   # single-quoted spans ('' or \-escapes)
+    | str replace --all --regex '"(?:[^"\\]|""|\\.)*"' " "       # double-quoted spans / identifiers
+    | str replace --all --regex '`[^`]*`' " ")                   # backtick identifiers / template literals
+  $bare =~ $pattern
+}

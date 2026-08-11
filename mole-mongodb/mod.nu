@@ -419,7 +419,7 @@ export def "raw-query" [
 ] {
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
   let js = ($in | query resolve $expr --file $file --suffix ".mongodb")
-  if (mongo is-dangerous $js (mongo mongo-danger)) and (not (query confirm "This may modify data. Run it?" --yes=$yes)) { return }
+  if (query is-dangerous $js (mongo mongo-danger)) and (not (query confirm "This may modify data. Run it?" --yes=$yes)) { return }
   let rows = (mongo-run $conf $js $raw)
   mongo-warm $conf
   $rows
@@ -572,7 +572,7 @@ export def "raw-aggregate" [
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
   let pipe = ($in | query resolve $pipeline --file $file --suffix ".mongodb")
   let js = "db.getCollection(" + (mongo lit $collection) + ").aggregate(" + $pipe + ").toArray()"
-  if (mongo is-dangerous $js (mongo mongo-danger)) and (not (query confirm "This pipeline may modify data. Run it?" --yes=$yes)) { return }
+  if (query is-dangerous $js (mongo mongo-danger)) and (not (query confirm "This pipeline may modify data. Run it?" --yes=$yes)) { return }
   let rows = (mongo-run $conf $js $raw)
   mongo-warm $conf
   $rows
@@ -763,7 +763,6 @@ export def "indexes" [
 export def --env "set-connection" [
   name: string@"complete-connection"
 ]: nothing -> nothing {
-  let conf = (conn resolve $name --driver mongodb)
-  $env.MOLE_CURRENT = (($env.MOLE_CURRENT? | default {}) | upsert mongodb $name)
+  let conf = (conn set-current mongodb $name)
   try { mongo-skeleton-load $conf --refresh --fast | ignore } catch { }
 }

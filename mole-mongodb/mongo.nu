@@ -220,28 +220,10 @@ export def "parse-flag" [ctx: string, names: list<string>]: nothing -> any {
 # ---- safety --------------------------------------------------------------------
 
 # The dangerous-operation regex: write/DDL mongosh methods and the pipeline write
-# stages `$out`/`$merge`. Case-insensitive. `mod.nu` passes it to `is-dangerous`.
+# stages `$out`/`$merge`. Case-insensitive. `mod.nu` passes it to `query is-dangerous`.
 @category mole-mongodb
 export def "mongo-danger" []: nothing -> string {
   '(?i)\.(insertone|insertmany|updateone|updatemany|replaceone|deleteone|deletemany|remove|save|bulkwrite|findandmodify|findoneandupdate|findoneandreplace|findoneanddelete|drop|dropdatabase|createindex|createindexes|dropindex|dropindexes|createcollection|renamecollection)\b|\$out\b|\$merge\b'
-}
-
-# Does a mongosh JS statement match the dangerous-operation regex? JS string and
-# template/regex-literal spans are blanked FIRST, so a keyword appearing only
-# inside a string value (e.g. a field equal to "drop") can't trip the check — only
-# real code positions count. Mirrors mole-sql's `is-dangerous`.
-@category mole-mongodb
-@example "a write is flagged" { mongo is-dangerous "db.users.deleteMany({})" (mongo mongo-danger) } --result true
-@example "a plain read is not" { mongo is-dangerous "db.users.find({})" (mongo mongo-danger) } --result false
-@example "a keyword inside a string value does not count" {
-  mongo is-dangerous "db.users.find({action: \"drop\"})" (mongo mongo-danger)
-} --result false
-export def "is-dangerous" [js: string, pattern: string]: nothing -> bool {
-  let bare = ($js
-    | str replace --all --regex '"(?:[^"\\]|\\.)*"' ' '
-    | str replace --all --regex "'(?:[^'\\\\]|\\\\.)*'" ' '
-    | str replace --all --regex '`[^`]*`' ' ')
-  $bare =~ $pattern
 }
 
 # ---- aggregate building --------------------------------------------------------

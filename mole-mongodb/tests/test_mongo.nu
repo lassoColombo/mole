@@ -108,15 +108,16 @@ def "parse-flag reads flags from a context line" [] {
 # ---- safety --------------------------------------------------------------------
 
 @test
-def "is-dangerous flags writes, ignores string contents" [] {
+def "mongo-danger flags write ops, not reads" [] {
     let re = (mongo mongo-danger)
-    assert equal (mongo is-dangerous "db.users.deleteMany({})" $re) true
-    assert equal (mongo is-dangerous "db.users.insertOne({a:1})" $re) true
-    assert equal (mongo is-dangerous "db.users.drop()" $re) true
-    assert equal (mongo is-dangerous "db.orders.aggregate([{$out: 'copy'}])" $re) true
-    assert equal (mongo is-dangerous "db.users.find({})" $re) false
-    assert equal (mongo is-dangerous "db.users.countDocuments({})" $re) false
-    assert equal (mongo is-dangerous 'db.users.find({action: "drop"})' $re) false   # keyword in a string value
+    # the pattern classifies mongosh methods + pipeline write stages; the generic
+    # string-blanking guard (`query is-dangerous`) is covered in mole/tests/test_query
+    assert equal ("db.users.deleteMany({})" =~ $re) true
+    assert equal ("db.users.insertOne({a:1})" =~ $re) true
+    assert equal ("db.users.drop()" =~ $re) true
+    assert equal ("db.orders.aggregate([{$out: 'copy'}])" =~ $re) true
+    assert equal ("db.users.find({})" =~ $re) false
+    assert equal ("db.users.countDocuments({})" =~ $re) false
 }
 
 # ---- aggregate building --------------------------------------------------------

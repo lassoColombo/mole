@@ -689,7 +689,6 @@ export def "facets" [
 export def --env "set-connection" [
   name: string@complete-connection               # a victorialogs connection name (from the connections file)
 ]: nothing -> nothing {
-  let conf = (conn resolve $name --driver victorialogs)
-  $env.MOLE_CURRENT = (($env.MOLE_CURRENT? | default {}) | upsert victorialogs $name)
+  let conf = (conn set-current victorialogs $name)
   try { vl-catalog-load $conf --refresh | ignore } catch { }
 }

@@ -234,6 +234,16 @@ def "parse-flag extracts flag values and returns null when absent" [] {
 }
 
 @test
+def "lead-arg reads the table positional after a write verb" [] {
+    assert equal (sql lead-arg 'mole-psql update users "a = 1" st' [update delete]) "users"
+    assert equal (sql lead-arg "mole-psql delete sessions --where " [update delete]) "sessions"
+    assert equal (sql lead-arg "mole-psql update public.users col" [update delete]) "public.users"
+    # a flag in the slot, or no such verb (e.g. a select context) → null, so the caller falls back
+    assert equal (sql lead-arg "mole-psql update -c prod " [update delete]) null
+    assert equal (sql lead-arg "mole-psql select id --from users" [update delete]) null
+}
+
+@test
 def "complete-tables and complete-columns read a cache record" [] {
     assert equal (sql complete-tables (sample-data)) ["public.users"]
     assert equal (sql complete-columns (sample-data) "users") [id name]
@@ -245,28 +255,4 @@ def "complete-columns returns bare, unqualified names even without a table" [] {
     # no table (columns typed before --from) -> deduped bare names, never table.col
     assert equal (sql complete-columns (sample-data)) [id name]
     assert equal (sql complete-columns (sample-data) | any {|c| $c =~ '\.'}) false
-}
-
-# ---- safety -------------------------------------------------------------------
-
-@test
-def "is-dangerous matches the dialect regex" [] {
-    assert equal (sql is-dangerous "DROP TABLE x" '(?i)\b(drop|delete)\b') true
-    assert equal (sql is-dangerous "select 1" '(?i)\b(drop|delete)\b') false
-}
-
-@test
-def "is-dangerous ignores keywords inside literals and quoted identifiers" [] {
-    let pat = '(?i)\b(create|drop|delete|update|insert)\b'
-    # keyword only inside a string literal / LIKE pattern → not dangerous
-    assert equal (sql is-dangerous "SELECT sku FROM products WHERE name LIKE '%create%'" $pat) false
-    assert equal (sql is-dangerous "SELECT * FROM t WHERE label = 'drop me'" $pat) false
-    # keyword only inside a quoted identifier → not dangerous
-    assert equal (sql is-dangerous 'SELECT "update" FROM t' $pat) false
-    assert equal (sql is-dangerous 'SELECT `delete` FROM t' $pat) false
-    # a doubled-quote escape inside a literal is still fully stripped
-    assert equal (sql is-dangerous "SELECT 'it''s a drop' AS x" $pat) false
-    # a real write is still caught
-    assert equal (sql is-dangerous "UPDATE t SET x = 1" $pat) true
-    assert equal (sql is-dangerous "SELECT 1" $pat) false
 }

@@ -583,6 +583,33 @@ export def "parse-flag" [
   if ($m | is-empty) { null } else { $m | last | get v }
 }
 
+# The leading positional (target table) of a write verb's completion context.
+#
+# `update`/`delete` take their table as the FIRST positional (`update <table> …`,
+# `delete <table> …`), not a `--from` flag, so their column completer recovers it
+# from here — the token immediately after the verb name. `verbs` lists the leaf
+# names to anchor on (so one completer can serve both). Returns null when that slot
+# is missing or is itself a flag, letting the caller fall back (to `--from`, then to
+# every table's columns) — which is exactly what a `select` context wants, since it
+# carries no `update`/`delete` token.
+@category mole-sql
+@example "the table right after the verb" {
+  sql lead-arg 'mole-psql update users "a = 1"' [update delete]
+} --result "users"
+@example "null when a flag takes the slot (caller falls back)" {
+  sql lead-arg "mole-psql update -c prod " [update delete]
+} --result null
+export def "lead-arg" [
+  ctx: string          # completion context (the partial command line up to the cursor)
+  verbs: list<string>  # verb leaf names to anchor after, e.g. [update delete]
+]: nothing -> any {
+  let toks = ($ctx | split row --regex '\s+' | where {|t| $t | is-not-empty })
+  let hits = ($toks | enumerate | where item in $verbs | get index)
+  if ($hits | is-empty) { return null }
+  let nxt = ($toks | get -o (($hits | first) + 1))
+  if ($nxt | is-empty) or ($nxt | str starts-with "-") { null } else { $nxt }
+}
+
 # Fully-qualified `schema.name` table names from a cache record, for completion.
 #
 # Returns `[]` for an empty/absent cache, so a completer can call it blindly.
@@ -622,37 +649,4 @@ export def "complete-columns" [
   } else {
     (columns-for $data $table) | get name
   }
-}
-
-# ---- safety -------------------------------------------------------------------
-
-# Test a statement against the dialect's dangerous-statement regex.
-#
-# The plugin owns `pattern` (its list of write / DDL / session-mutating keywords)
-# and calls this before running to decide whether to prompt. String literals and
-# quoted identifiers are stripped FIRST, so a keyword that appears only inside a
-# `'...'` value, a `LIKE` pattern, or a `"..."` / `` `...` `` identifier can't
-# trip the check — only keywords in real statement positions count. (Without this
-# a read-only `... WHERE name LIKE '%create%'` would falsely prompt.)
-# Case-sensitivity is whatever the pattern encodes — the dialect patterns lead
-# with `(?i)`.
-@category mole-sql
-@example "a DROP is flagged" {
-  sql is-dangerous "DROP TABLE x" '(?i)\b(drop|delete)\b'
-} --result true
-@example "a plain SELECT is not" {
-  sql is-dangerous "select 1" '(?i)\b(drop|delete)\b'
-} --result false
-@example "a keyword inside a string literal does not count" {
-  sql is-dangerous "SELECT id FROM t WHERE name LIKE '%drop%'" '(?i)\b(drop|delete)\b'
-} --result false
-export def "is-dangerous" [
-  sql: string       # the statement to test
-  pattern: string   # the dialect's dangerous-statement regex
-]: nothing -> bool {
-  let bare = ($sql
-    | str replace --all --regex "'(?:[^']|'')*'" " "     # single-quoted string literals
-    | str replace --all --regex '"(?:[^"]|"")*"' " "     # double-quoted identifiers
-    | str replace --all --regex '`[^`]*`' " ")           # backtick identifiers
-  $bare =~ $pattern
 }

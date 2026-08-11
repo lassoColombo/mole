@@ -507,8 +507,7 @@ export def "export-samples" [
 export def --env "set-connection" [
   name: string@complete-connection               # a victoriametrics connection name (from the connections file)
 ]: nothing -> nothing {
-  let conf = (conn resolve $name --driver victoriametrics)
-  $env.MOLE_CURRENT = (($env.MOLE_CURRENT? | default {}) | upsert victoriametrics $name)
+  let conf = (conn set-current victoriametrics $name)
   {name: $name} | cache write (vm-current-file)   # so completion finds it without $env
   try { vm-catalog-load $conf --refresh | ignore } catch { }
 }

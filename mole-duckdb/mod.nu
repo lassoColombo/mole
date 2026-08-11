@@ -216,7 +216,9 @@ def "duckdb-table" [context: string]: nothing -> list<string> {
 def "duckdb-column" [context: string]: nothing -> list<string> {
   try {
     let conf = (conn with duckdb (sql parse-flag $context ["--connection" "-c"]) {})
-    let tbl = (sql parse-flag $context ["--from" "-F"])
+    # `select` names its table with --from; `update`/`delete` take it as the leading
+    # positional — fall back to that so column completion works for the write verbs too.
+    let tbl = (sql parse-flag $context ["--from" "-F"] | default (sql lead-arg $context [update delete]))
     sql complete-columns (duck-schema-load $conf | default {}) $tbl
   } catch { [] }
 }
@@ -297,7 +299,7 @@ export def "raw-query" [
 ] {
   let conf = (duck-conf $connection $path $database $set)
   let text = ($in | query resolve $sql --file $file --suffix ".sql")
-  if (sql is-dangerous $text (duck-dangerous)) and (not (query confirm "This query may modify data. Run it?" --yes=$yes)) {
+  if (query is-dangerous $text (duck-dangerous)) and (not (query confirm "This query may modify data. Run it?" --yes=$yes)) {
     return
   }
   duck-rows $conf $text
@@ -373,7 +375,7 @@ export def "select" [
   ])
   let conf = (duck-conf $connection $path $database $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
-  if (sql is-dangerous $text (duck-dangerous)) and (not (query confirm "This query may modify data. Run it?" --yes=$yes)) {
+  if (query is-dangerous $text (duck-dangerous)) and (not (query confirm "This query may modify data. Run it?" --yes=$yes)) {
     return
   }
   let rows = (duck-rows $conf $text)
@@ -385,13 +387,14 @@ export def "select" [
 
 # Compose and run a single-table DuckDB UPDATE.
 #
-# The SET assignments are the positional args — each a verbatim `"col = expr"`, so
-# expressions (`hits = hits + 1`) all work; you quote identifiers and string
-# literals yourself. Their column names complete against the `--from` table.
-# `--where` is the same verbatim predicate as `select`; `--returning` names
-# columns to hand back for the changed rows (DuckDB RETURNING), typed exactly like
-# a `select` result. There is NO join support — the target is the single `--from`
-# table; reach for `raw-query` for `UPDATE ... FROM`.
+# Reads like the statement: `update <table> <assignment>...`. The table is the
+# leading positional (completing table names); the SET assignments follow as
+# positionals — each a verbatim `"col = expr"`, so expressions (`hits = hits + 1`)
+# all work; you quote identifiers and string literals yourself, and their column
+# names complete against the table. `--where` is the same verbatim predicate as
+# `select`; `--returning` names columns to hand back for the changed rows (DuckDB
+# RETURNING), typed exactly like a `select` result. There is NO join support — the
+# target is the single table; reach for `raw-query` for `UPDATE ... FROM`.
 #
 # UPDATE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to touch every row unless you pass `--all`. `--dry-run` returns a
@@ -399,17 +402,17 @@ export def "select" [
 # `--connection` + `--path` / `--database` / `--set`.
 @category mole-duckdb
 @example "set a column on the matched rows" {
-  mole-duckdb update "status = 'inactive'" --from users --where "id = 5" --dry-run | get query
+  mole-duckdb update users "status = 'inactive'" --where "id = 5" --dry-run | get query
 } --result "UPDATE users SET status = 'inactive' WHERE id = 5"
 @example "expression assignment, returning the new value" {
-  mole-duckdb update "login_count = login_count + 1" --from users --where "id = 42" --returning [id login_count] --dry-run | get query
+  mole-duckdb update users "login_count = login_count + 1" --where "id = 42" --returning [id login_count] --dry-run | get query
 } --result "UPDATE users SET login_count = login_count + 1 WHERE id = 42 RETURNING id, login_count"
 @example "guard: an unfiltered UPDATE needs --all" {
-  mole-duckdb update "archived = true" --from users --all --dry-run | get query
+  mole-duckdb update users "archived = true" --all --dry-run | get query
 } --result "UPDATE users SET archived = true"
 export def "update" [
+  table: string@"duckdb-table"                     # target table (UPDATE <table>); single table, an alias is allowed: "users u"
   ...assignments: string@"duckdb-column"           # SET assignments, verbatim "col = expr" (at least one required)
-  --from(-F): string@"duckdb-table"                # target table, single table only (an alias is allowed: "users u")
   --where(-w): string                              # WHERE predicate (without the keyword)
   --returning: list<string>@"duckdb-column"        # RETURNING columns (typed like a select result)
   --all                                            # allow an unfiltered UPDATE (every row) when --where is omitted
@@ -421,17 +424,11 @@ export def "update" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($from | is-empty) { error make {msg: "update: --from <table> is required"} }
-  if ($assignments | is-empty) { error make {msg: "update: at least one SET assignment is required, e.g. \"status = 'active'\""} }
+  if ($assignments | is-empty) { error make {msg: "update: at least one SET assignment is required, e.g. update users \"status = 'active'\""} }
   if ($where | is-empty) and (not $all) {
     error make {msg: "update: refusing to update every row without --where (pass --all to override)"}
   }
-  let text = (sql assemble [
-    $"UPDATE ($from)"
-    (sql join-list $assignments --prefix "SET ")
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
-    (sql join-list ($returning | default []) --prefix "RETURNING ")
-  ])
+  let text = (sql build-update --table $table --set $assignments --where ($where | default "") --returning ($returning | default []))
   let conf = (duck-conf $connection $path $database $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This UPDATE will modify rows. Run it?" --yes=$yes)) { return }
@@ -439,15 +436,16 @@ export def "update" [
   if $raw or ($rows | is-empty) { return $rows }
   $rows
   | sql normalize-nulls $DUCK_NULLS
-  | sql apply-types (sql columns-for (duck-schema-load $conf) (sql base-table $from)) {|c| duck-type $c }
+  | sql apply-types (sql columns-for (duck-schema-load $conf) (sql base-table $table)) {|c| duck-type $c }
 }
 
 # Compose and run a single-table DuckDB DELETE.
 #
-# `--where` is the same verbatim predicate as `select`; `--returning` names
-# columns to hand back for the deleted rows (DuckDB RETURNING), typed exactly like
-# a `select` result. There is NO join support — deletes from the single `--from`
-# table; reach for `raw-query` for `DELETE ... USING`.
+# Reads like the statement: `delete <table>`. The table is the leading positional
+# (completing table names). `--where` is the same verbatim predicate as `select`;
+# `--returning` names columns to hand back for the deleted rows (DuckDB RETURNING),
+# typed exactly like a `select` result. There is NO join support — deletes from the
+# single table; reach for `raw-query` for `DELETE ... USING`.
 #
 # DELETE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to delete every row unless you pass `--all`. `--dry-run` returns a
@@ -455,16 +453,16 @@ export def "update" [
 # in `update`.
 @category mole-duckdb
 @example "delete the matched rows" {
-  mole-duckdb delete --from sessions --where "expires_at < now()" --dry-run | get query
+  mole-duckdb delete sessions --where "expires_at < now()" --dry-run | get query
 } --result "DELETE FROM sessions WHERE expires_at < now()"
 @example "delete, returning everything that was removed" {
-  mole-duckdb delete --from sessions --where "user_id = 7" --returning ["*"] --dry-run | get query
+  mole-duckdb delete sessions --where "user_id = 7" --returning ["*"] --dry-run | get query
 } --result "DELETE FROM sessions WHERE user_id = 7 RETURNING *"
 @example "guard: an unfiltered DELETE needs --all" {
-  mole-duckdb delete --from staging_rows --all --dry-run | get query
+  mole-duckdb delete staging_rows --all --dry-run | get query
 } --result "DELETE FROM staging_rows"
 export def "delete" [
-  --from(-F): string@"duckdb-table"                # target table, single table only (an alias is allowed: "users u")
+  table: string@"duckdb-table"                     # target table (DELETE FROM <table>); single table, an alias is allowed: "users u"
   --where(-w): string                              # WHERE predicate (without the keyword)
   --returning: list<string>@"duckdb-column"        # RETURNING columns (typed like a select result)
   --all                                            # allow an unfiltered DELETE (every row) when --where is omitted
@@ -476,15 +474,10 @@ export def "delete" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($from | is-empty) { error make {msg: "delete: --from <table> is required"} }
   if ($where | is-empty) and (not $all) {
     error make {msg: "delete: refusing to delete every row without --where (pass --all to override)"}
   }
-  let text = (sql assemble [
-    $"DELETE FROM ($from)"
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
-    (sql join-list ($returning | default []) --prefix "RETURNING ")
-  ])
+  let text = (sql build-delete --table $table --where ($where | default "") --returning ($returning | default []))
   let conf = (duck-conf $connection $path $database $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This DELETE will remove rows. Run it?" --yes=$yes)) { return }
@@ -492,7 +485,7 @@ export def "delete" [
   if $raw or ($rows | is-empty) { return $rows }
   $rows
   | sql normalize-nulls $DUCK_NULLS
-  | sql apply-types (sql columns-for (duck-schema-load $conf) (sql base-table $from)) {|c| duck-type $c }
+  | sql apply-types (sql columns-for (duck-schema-load $conf) (sql base-table $table)) {|c| duck-type $c }
 }
 
 # Inspect a connection's cached schema (introspection is cached for a day).
@@ -554,6 +547,5 @@ export def "schema" [
 export def --env "set-connection" [
   name: string@complete-connection   # a duckdb connection name (from the connections file)
 ]: nothing -> nothing {
-  conn resolve $name --driver duckdb | ignore
-  $env.MOLE_CURRENT = (($env.MOLE_CURRENT? | default {}) | upsert duckdb $name)
+  conn set-current duckdb $name | ignore
 }

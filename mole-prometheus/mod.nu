@@ -420,8 +420,7 @@ export def "metrics" [
 export def --env "set-connection" [
   name: string@complete-connection               # a prometheus connection name (from the connections file)
 ]: nothing -> nothing {
-  let conf = (conn resolve $name --driver prometheus)
-  $env.MOLE_CURRENT = (($env.MOLE_CURRENT? | default {}) | upsert prometheus $name)
+  let conf = (conn set-current prometheus $name)
   {name: $name} | cache write (pq-current-file)   # so completion finds it without $env
   try { pq-catalog-load $conf --refresh | ignore } catch { }
 }

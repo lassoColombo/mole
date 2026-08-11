@@ -110,7 +110,9 @@ def "mariadb-table" [context: string]: nothing -> list<string> {
 def "mariadb-column" [context: string]: nothing -> list<string> {
   try {
     let conf = (conn with mariadb (sql parse-flag $context ["--connection" "-c"]) {})
-    let tbl = (sql parse-flag $context ["--from" "-F"])
+    # `select` names its table with --from; `update`/`delete` take it as the leading
+    # positional — fall back to that so column completion works for the write verbs too.
+    let tbl = (sql parse-flag $context ["--from" "-F"] | default (sql lead-arg $context [update delete]))
     sql complete-columns (ma-schema-load $conf | default {}) $tbl
   } catch { [] }
 }
@@ -153,7 +155,7 @@ export def "raw-query" [
 ] {
   let conf = (ma-conf $connection $host $port $user $password $database $set)
   let text = ($in | query resolve $sql --file $file --suffix ".sql")
-  if (sql is-dangerous $text (myql dangerous)) and (not (query confirm "This query may modify data. Run it?" --yes=$yes)) {
+  if (query is-dangerous $text (myql dangerous)) and (not (query confirm "This query may modify data. Run it?" --yes=$yes)) {
     return
   }
   ma-rows $conf $text
@@ -287,13 +289,15 @@ export def "select" [
 
 # Compose and run a single-table MariaDB UPDATE.
 #
-# The SET assignments are the positional args — each a verbatim `"col = expr"`, so
-# expressions (`hits = hits + 1`, `updated_at = now()`) all work; you quote
-# identifiers and string literals yourself. Their column names complete against
-# the `--from` table. `--where` is the same verbatim predicate as `select`.
-# MariaDB scopes a single-table UPDATE with an optional `ORDER BY ... LIMIT`
-# (`--sort-by` / `--limit`) — the bounded-rewrite idiom; there is NO RETURNING and
-# NO join support (reach for `raw-query` for multi-table updates).
+# Reads like the statement: `update <table> <assignment>...`. The table is the
+# leading positional (completing table names); the SET assignments follow as
+# positionals — each a verbatim `"col = expr"`, so expressions (`hits = hits + 1`,
+# `updated_at = now()`) all work; you quote identifiers and string literals
+# yourself, and their column names complete against the table. `--where` is the
+# same verbatim predicate as `select`. MariaDB scopes a single-table UPDATE with an
+# optional `ORDER BY ... LIMIT` (`--sort-by` / `--limit`) — the bounded-rewrite
+# idiom; there is NO RETURNING and NO join support (reach for `raw-query` for
+# multi-table updates).
 #
 # UPDATE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to touch every row unless you pass `--all` (a missing `--where` would
@@ -302,20 +306,20 @@ export def "select" [
 # flags / `--set`, as in `raw-query`.
 @category mole-mariadb
 @example "set a column on the matched rows" {
-  mole-mariadb update "status = 'inactive'" --from users --where "id = 5" --dry-run | get query
+  mole-mariadb update users "status = 'inactive'" --where "id = 5" --dry-run | get query
 } --result "UPDATE users SET status = 'inactive' WHERE id = 5"
 @example "several assignments at once" {
-  mole-mariadb update "status = 'active'" "verified = 1" --from users --where "email = 'a@b.c'" --dry-run | get query
+  mole-mariadb update users "status = 'active'" "verified = 1" --where "email = 'a@b.c'" --dry-run | get query
 } --result "UPDATE users SET status = 'active', verified = 1 WHERE email = 'a@b.c'"
 @example "bounded rewrite: ORDER BY ... LIMIT" {
-  mole-mariadb update "priority = priority + 1" --from jobs --where "queued = 1" --sort-by "created_at asc" --limit 100 --dry-run | get query
+  mole-mariadb update jobs "priority = priority + 1" --where "queued = 1" --sort-by "created_at asc" --limit 100 --dry-run | get query
 } --result "UPDATE jobs SET priority = priority + 1 WHERE queued = 1 ORDER BY created_at ASC LIMIT 100"
 @example "guard: an unfiltered UPDATE needs --all" {
-  mole-mariadb update "archived = 1" --from users --all --dry-run | get query
+  mole-mariadb update users "archived = 1" --all --dry-run | get query
 } --result "UPDATE users SET archived = 1"
 export def "update" [
+  table: string@"mariadb-table"                    # target table (UPDATE <table>); single table, an alias is allowed: "users u"
   ...assignments: string@"mariadb-column"          # SET assignments, verbatim "col = expr" (at least one required)
-  --from(-F): string@"mariadb-table"               # target table, single table only (an alias is allowed: "users u")
   --where(-w): string                              # WHERE predicate (without the keyword)
   --sort-by(-s): string                            # ORDER BY terms, comma-separated: "col [asc|desc]" (with --limit)
   --limit(-l): int                                 # LIMIT N — cap the rows changed
@@ -330,15 +334,12 @@ export def "update" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($from | is-empty) { error make {msg: "update: --from <table> is required"} }
-  if ($assignments | is-empty) { error make {msg: "update: at least one SET assignment is required, e.g. \"status = 'active'\""} }
+  if ($assignments | is-empty) { error make {msg: "update: at least one SET assignment is required, e.g. update users \"status = 'active'\""} }
   if ($where | is-empty) and (not $all) {
     error make {msg: "update: refusing to update every row without --where (pass --all to override)"}
   }
   let text = (sql assemble [
-    $"UPDATE ($from)"
-    (sql join-list $assignments --prefix "SET ")
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
+    (sql build-update --table $table --set $assignments --where ($where | default ""))
     (myql order $sort_by)
     (if $limit != null { $"LIMIT ($limit)" })
   ])
@@ -350,10 +351,12 @@ export def "update" [
 
 # Compose and run a single-table MariaDB DELETE.
 #
-# `--where` is the same verbatim predicate as `select`. Like UPDATE, MariaDB
-# scopes a single-table DELETE with an optional `ORDER BY ... LIMIT` (`--sort-by`
-# / `--limit`) — delete the "oldest N" and so on. There is NO RETURNING and NO
-# join support (reach for `raw-query` for `DELETE ... USING`/multi-table).
+# Reads like the statement: `delete <table>`. The table is the leading positional
+# (completing table names). `--where` is the same verbatim predicate as `select`.
+# Like UPDATE, MariaDB scopes a single-table DELETE with an optional
+# `ORDER BY ... LIMIT` (`--sort-by` / `--limit`) — delete the "oldest N" and so on.
+# There is NO RETURNING and NO join support (reach for `raw-query` for
+# `DELETE ... USING`/multi-table).
 #
 # DELETE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to delete every row unless you pass `--all`. `--dry-run` returns a
@@ -361,16 +364,16 @@ export def "update" [
 # `raw-query`.
 @category mole-mariadb
 @example "delete the matched rows" {
-  mole-mariadb delete --from sessions --where "expires_at < now()" --dry-run | get query
+  mole-mariadb delete sessions --where "expires_at < now()" --dry-run | get query
 } --result "DELETE FROM sessions WHERE expires_at < now()"
 @example "delete the oldest N (ORDER BY ... LIMIT)" {
-  mole-mariadb delete --from logs --where "level = 'debug'" --sort-by "ts asc" --limit 1000 --dry-run | get query
+  mole-mariadb delete logs --where "level = 'debug'" --sort-by "ts asc" --limit 1000 --dry-run | get query
 } --result "DELETE FROM logs WHERE level = 'debug' ORDER BY ts ASC LIMIT 1000"
 @example "guard: an unfiltered DELETE needs --all" {
-  mole-mariadb delete --from staging_rows --all --dry-run | get query
+  mole-mariadb delete staging_rows --all --dry-run | get query
 } --result "DELETE FROM staging_rows"
 export def "delete" [
-  --from(-F): string@"mariadb-table"               # target table, single table only (an alias is allowed: "users u")
+  table: string@"mariadb-table"                    # target table (DELETE FROM <table>); single table, an alias is allowed: "users u"
   --where(-w): string                              # WHERE predicate (without the keyword)
   --sort-by(-s): string                            # ORDER BY terms, comma-separated: "col [asc|desc]" (with --limit)
   --limit(-l): int                                 # LIMIT N — cap the rows removed
@@ -385,13 +388,11 @@ export def "delete" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($from | is-empty) { error make {msg: "delete: --from <table> is required"} }
   if ($where | is-empty) and (not $all) {
     error make {msg: "delete: refusing to delete every row without --where (pass --all to override)"}
   }
   let text = (sql assemble [
-    $"DELETE FROM ($from)"
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
+    (sql build-delete --table $table --where ($where | default ""))
     (myql order $sort_by)
     (if $limit != null { $"LIMIT ($limit)" })
   ])
@@ -463,6 +464,5 @@ export def "schema" [
 export def --env "set-connection" [
   name: string@complete-connection   # a mariadb connection name (from the connections file)
 ]: nothing -> nothing {
-  conn resolve $name --driver mariadb | ignore
-  $env.MOLE_CURRENT = (($env.MOLE_CURRENT? | default {}) | upsert mariadb $name)
+  conn set-current mariadb $name | ignore
 }
