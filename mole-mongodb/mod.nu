@@ -12,8 +12,9 @@
 #   - mongo.nu — PURE builders/decoder/inference/danger (imported privately). Owns
 #     the JS query strings, the EJSON→typed-value decode, and schema inference.
 #   - mod.nu   — THIS wrapper. Owns policy: connection→mongosh invocation, the
-#     completion catalog (sampled schema, cached a day), turning payloads into typed
-#     rows, and the completion catalog. Read-oriented is structural; only the two
+#     lazy three-tier completion catalog (cheap skeleton + per-collection sampled
+#     schema + a metadata sweep, each cached a day — see the catalog section), and
+#     turning payloads into typed rows. Read-oriented is structural; only the two
 #     raw verbs can carry writes, so only they are danger-gated.
 #
 # All completers scope to the `--collection`/`--connection` already on the command
@@ -84,69 +85,134 @@ def mongo-run [conf: record, js: string, raw: bool]: nothing -> any {
   if $raw { $parsed } else { mongo ejson-decode $parsed }
 }
 
-# ---- completion catalog --------------------------------------------------------
+# ---- completion catalog (lazy, three tiers) ------------------------------------
+#
+# The old design eagerly sampled EVERY collection of the current database whenever
+# the catalog was (re)built — fine for a demo DB, fatal for a production `logs`
+# database with huge/many collections: `set-connection` would sample the whole
+# thing and hang. The catalog is now split so we only ever pay for what we touch:
+#   1. SKELETON  (mongo-skeleton-js)  — db names + collection names/types. Two
+#      metadata round-trips, no per-collection work; instant at any DB size. Feeds
+#      the collection/database completers. Built by set-connection and warm-on-miss.
+#   2. PER-COLLECTION (mongo-collschema-js) — one collection's count + indexes +
+#      $sample→inferred fields. Built lazily the first time that collection's fields
+#      are completed or `schema -C`/`indexes -C` inspects it. Samples ONE collection.
+#   3. COLLMETA  (mongo-collmeta-js)  — per-collection count + index count across all
+#      collections, WITHOUT sampling and WITHOUT any full-scan count fallback. Built
+#      only by the explicit `collections`/`schema` summary verbs, then cached.
 
-# The single mongosh program that gathers the catalog in one round-trip: database
-# names, non-system collections (name/type/count/indexes) and a $sample of docs per
-# collection (a plain find for views, which can't $sample). `__SAMPLE__` is filled
-# by mongo-catalog-load.
-def mongo-catalog-js [sample: int]: nothing -> string {
-  let tmpl = r#'(function(){
-  const dbs = db.getMongo().getDBNames();
-  const infos = db.getCollectionInfos().filter(c => !c.name.startsWith("system."));
-  const colls = infos.map(function(c){
-    const coll = db.getCollection(c.name);
-    let count = 0;
-    try { count = coll.estimatedDocumentCount(); } catch(e) { try { count = coll.countDocuments({}); } catch(e2) {} }
-    let indexes = [];
-    try { indexes = coll.getIndexes(); } catch(e) {}
-    let sample = [];
-    try {
-      sample = (c.type === "view")
-        ? coll.find().limit(__SAMPLE__).toArray()
-        : coll.aggregate([{$sample: {size: __SAMPLE__}}]).toArray();
-    } catch(e) {}
-    return {name: c.name, type: c.type, count: count, indexes: indexes, sample: sample};
-  });
+# Tier 1. Database names + non-system collection names/types, in one round-trip.
+# getDBNames is wrapped so a missing listDatabases privilege still yields the
+# collection list (the part completion needs most).
+def mongo-skeleton-js []: nothing -> string {
+  r#'(function(){
+  let dbs = []; try { dbs = db.getMongo().getDBNames(); } catch(e) {}
+  const colls = db.getCollectionInfos().filter(c => !c.name.startsWith("system."))
+    .map(c => ({name: c.name, type: c.type}));
   return {databases: dbs, collections: colls};
 })()'#
-  $tmpl | str replace --all "__SAMPLE__" ($sample | into string)
 }
 
-# Cache-file path for a connection's catalog (namespaced by connection + database).
-def mongo-cache-file [conf: record]: nothing -> string {
+# Tier 2. One collection's schema material: an ESTIMATED count (never a
+# countDocuments full scan — a huge collection must not block a keystroke), its
+# indexes, and a $sample of docs (views can't $sample → fall back to a limited
+# find). Field inference runs in nu via `mongo infer-schema`.
+def mongo-collschema-js [coll: string, sample: int]: nothing -> string {
+  let tmpl = r#'(function(){
+  const coll = db.getCollection(__COLL__);
+  let count = null; try { count = coll.estimatedDocumentCount(); } catch(e) {}
+  let indexes = []; try { indexes = coll.getIndexes(); } catch(e) {}
+  let sample = [];
+  try { sample = coll.aggregate([{$sample: {size: __SAMPLE__}}]).toArray(); }
+  catch(e) { try { sample = coll.find().limit(__SAMPLE__).toArray(); } catch(e2) {} }
+  return {count: count, indexes: indexes, sample: sample};
+})()'#
+  $tmpl | str replace --all "__COLL__" (mongo lit $coll) | str replace --all "__SAMPLE__" ($sample | into string)
+}
+
+# Tier 3. Per-collection metadata across the whole database — name, type, estimated
+# count (never a full scan), index count — WITHOUT sampling. O(#collections) metadata
+# reads; run only by the explicit `collections`/`schema` verbs and then cached.
+def mongo-collmeta-js []: nothing -> string {
+  r#'(function(){
+  return db.getCollectionInfos().filter(c => !c.name.startsWith("system.")).map(function(c){
+    const coll = db.getCollection(c.name);
+    let count = null; try { count = coll.estimatedDocumentCount(); } catch(e) {}
+    let indexes = 0; try { indexes = coll.getIndexes().length; } catch(e) {}
+    return {name: c.name, type: c.type, count: count, indexes: indexes};
+  });
+})()'#
+}
+
+# Cache-file paths, all namespaced by connection + database. The three tiers live
+# in separate directories so a collection named e.g. `meta` can't collide with the
+# collmeta file (sanitized keys can't be told apart otherwise).
+def mongo-cache-file [conf: record]: nothing -> string {   # tier 1 (skeleton)
   let db = ($conf | get -o database | default "_")
   cache path "mongodb" $"(($conf | get -o name) | default '_')__($db)"
 }
+def mongo-collcache-file [conf: record, coll: string]: nothing -> string {   # tier 2
+  let db = ($conf | get -o database | default "_")
+  cache path "mongodb/fields" $"(($conf | get -o name) | default '_')__($db)__($coll)"
+}
+def mongo-collmeta-file [conf: record]: nothing -> string {   # tier 3
+  let db = ($conf | get -o database | default "_")
+  cache path "mongodb/meta" $"(($conf | get -o name) | default '_')__($db)"
+}
 
-# Load the completion/schema catalog for a connection, rebuilding when --refresh or
-# stale (1 day). Samples `--sample` docs per collection and infers each collection's
-# field paths + type sets. System databases (admin/config/local) are dropped.
-def mongo-catalog-load [conf: record, --refresh, --sample: int = 100]: nothing -> record {
+# Tier 1 loader — the skeleton (db names + collection names/types), rebuilt on
+# --refresh or when stale (1 day). System databases are dropped. `--fast` bounds
+# server selection so a dead server fails a keystroke quickly instead of hanging.
+def mongo-skeleton-load [conf: record, --refresh, --fast]: nothing -> record {
   let file = (mongo-cache-file $conf)
   if (not $refresh) and (not (cache stale $file 1day)) { return (cache read $file) }
-  let decoded = (mongo ejson-decode (mongo-exec $conf (mongo-catalog-js $sample)))
-  let dbs = ($decoded | get -o databases | default [] | where {|d| $d not-in ["admin" "config" "local"] })
-  let colls = ($decoded | get -o collections | default [])
-  let fields = ($colls | each {|c|
-    (mongo infer-schema ($c | get -o sample | default [])) | each {|f| {collection: $c.name} | merge $f }
-  } | flatten)
-  let collmeta = ($colls | each {|c| {name: $c.name, type: $c.type, count: ($c | get -o count | default 0), indexes: ($c | get -o indexes | default [])} })
+  let decoded = (mongo ejson-decode (mongo-exec $conf (mongo-skeleton-js) --fast=$fast))
   let data = {
     meta: {connection: ($conf | get -o name), database: ($conf | get -o database | default "_"), driver: "mongodb", refreshed_at: (date now)}
-    databases: $dbs
-    collections: $collmeta
-    fields: $fields
+    databases: ($decoded | get -o databases | default [] | where {|d| $d not-in ["admin" "config" "local"] })
+    collections: ($decoded | get -o collections | default [])
   }
   $data | cache write $file
   $data
 }
 
-# Warm the catalog after a successful query, but only when cold (missing).
+# Tier 2 loader — one collection's `{count, indexes, fields}`, sampled + inferred.
+# Rebuilt on --refresh or when stale. This is the ONLY sampling path, and it touches
+# a single collection, so it stays cheap however large the database is.
+def mongo-collschema-load [conf: record, coll: string, --refresh, --sample: int = 100, --fast]: nothing -> record {
+  let file = (mongo-collcache-file $conf $coll)
+  if (not $refresh) and (not (cache stale $file 1day)) { return (cache read $file) }
+  let decoded = (mongo ejson-decode (mongo-exec $conf (mongo-collschema-js $coll $sample) --fast=$fast))
+  let data = {
+    meta: {connection: ($conf | get -o name), database: ($conf | get -o database | default "_"), collection: $coll, driver: "mongodb", refreshed_at: (date now)}
+    collection: $coll
+    count: ($decoded | get -o count)
+    indexes: ($decoded | get -o indexes | default [])
+    fields: (mongo infer-schema ($decoded | get -o sample | default []))
+  }
+  $data | cache write $file
+  $data
+}
+
+# Tier 3 loader — per-collection metadata across the whole DB (name/type/count/
+# #indexes), no sampling. Returns the collection list; cached under its own key.
+def mongo-collmeta-load [conf: record, --refresh, --fast]: nothing -> list {
+  let file = (mongo-collmeta-file $conf)
+  if (not $refresh) and (not (cache stale $file 1day)) { return (cache read $file | get -o collections | default []) }
+  let colls = (mongo ejson-decode (mongo-exec $conf (mongo-collmeta-js) --fast=$fast) | default [])
+  {
+    meta: {connection: ($conf | get -o name), database: ($conf | get -o database | default "_"), driver: "mongodb", refreshed_at: (date now)}
+    collections: $colls
+  } | cache write $file
+  $colls
+}
+
+# Warm the SKELETON after a successful query, but only when cold (missing).
 # Best-effort — the connection is known reachable here, so it never breaks the call.
+# Per-collection field schemas are NOT warmed here; they load lazily on first use.
 def mongo-warm [conf: record]: nothing -> nothing {
   if (cache read (mongo-cache-file $conf) | is-not-empty) { return }
-  try { mongo-catalog-load $conf | ignore } catch { }
+  try { mongo-skeleton-load $conf | ignore } catch { }
 }
 
 # ---- completion helpers --------------------------------------------------------
@@ -159,23 +225,56 @@ def csv [v: any]: nothing -> list<string> {
   $v | default "" | split row "," | str trim | where {|x| $x | is-not-empty }
 }
 
-# The cached catalog for whatever connection/database the command line names (or
-# the current). Cache-only — never hits the network, so completers stay instant.
+# The resolved connection a completion line names (via `-c`/`--connection` and an
+# optional `--database` override), or the current one. Null when nothing resolves.
+def mongo-ctx-conf [ctx: string]: nothing -> any {
+  try { conn with mongodb (mongo parse-flag $ctx ["--connection" "-c"]) {database: (mongo parse-flag $ctx ["--database" "-d"])} } catch { null }
+}
+
+# The SKELETON (db + collection names) for whatever connection/database the line
+# names. A warm cache is served as-is — instant, even if a day stale (no rebuild on a
+# keystroke). COLD (e.g. a `--database` override never queried) → the skeleton is
+# built live ONCE (best-effort, fast server-selection timeout) and cached, so
+# collection/database completion works for that database too. Nothing resolves → {}.
 def mongo-cache-ctx [ctx: string]: nothing -> record {
+  let conf = (mongo-ctx-conf $ctx)
+  if ($conf | is-empty) { return {} }
   try {
-    let conf = (conn with mongodb (mongo parse-flag $ctx ["--connection" "-c"]) {})
-    let db = ((mongo parse-flag $ctx ["--database" "-d"]) | default ($conf | get -o database) | default "_")
-    (cache read (cache path "mongodb" $"(($conf | get -o name) | default '_')__($db)")) | default {}
+    let cached = (cache read (mongo-cache-file $conf))
+    if ($cached | is-not-empty) { return $cached }
+    mongo-skeleton-load $conf --fast
   } catch { {} }
 }
 
-# Cached field names for the `--collection` named on the line (all collections'
-# fields when none is named). Deduped and sorted.
+# Field records for a collection (tier 2). A NAMED collection warms on miss — sampled
+# live ONCE (fast timeout) and cached — so field completion works even for a
+# collection never queried, without ever sampling the rest of the database. With NO
+# collection there is no cheap "all fields", so we return the UNION of collections
+# already sampled for this (connection, database) — read-only, never triggers a
+# sample. Filtered by the stored meta, so it's robust to key sanitization.
+def mongo-collfields [conf: any, coll: string]: nothing -> list {
+  if ($conf | is-empty) { return [] }
+  if ($coll | is-not-empty) {
+    let cached = (cache read (mongo-collcache-file $conf $coll))
+    let data = if ($cached | is-not-empty) { $cached } else { (try { mongo-collschema-load $conf $coll --fast } catch { {} }) }
+    return ($data | get -o fields | default [] | each {|f| {collection: $coll} | merge $f })
+  }
+  let dir = (mongo-collcache-file $conf "_" | path dirname)
+  if not ($dir | path exists) { return [] }
+  let cn = ($conf | get -o name)
+  let dbn = ($conf | get -o database | default "_")
+  try {
+    ls ($dir | path join "*.nuon") | get name | each {|p| cache read $p }
+    | where {|d| ($d | get -o meta.connection) == $cn and (($d | get -o meta.database | default "_") == $dbn) }
+    | each {|d| ($d | get -o fields | default []) | each {|f| {collection: ($d | get -o meta.collection)} | merge $f } }
+    | flatten
+  } catch { [] }
+}
+
+# Sorted, deduped field names for the `--collection` on the line (see mongo-collfields).
 def mongo-fields-for [ctx: string]: nothing -> list<string> {
   let coll = (mongo parse-flag $ctx ["--collection" "-C"])
-  (mongo-cache-ctx $ctx | get -o fields | default [])
-  | where {|f| ($coll | is-empty) or ($f.collection == $coll) }
-  | get -o name | default [] | uniq | sort
+  mongo-collfields (mongo-ctx-conf $ctx) $coll | get -o name | default [] | uniq | sort
 }
 
 # The result columns an `aggregate` produces, derived from the `--by`/`--date-bucket`
@@ -271,8 +370,8 @@ def "mongo-datebucket" [ctx: string]: nothing -> list<string> {
   let tok = (mongo-token $ctx)
   if not ($tok | str contains ":") {
     let coll = (mongo parse-flag $ctx ["--collection" "-C"])
-    (mongo-cache-ctx $ctx | get -o fields | default [])
-    | where {|f| (($coll | is-empty) or ($f.collection == $coll)) and ("datetime" in ($f | get -o types | default [])) }
+    mongo-collfields (mongo-ctx-conf $ctx) $coll
+    | where {|f| "datetime" in ($f | get -o types | default []) }
     | get -o name | default [] | each {|f| $"($f):" }
   } else {
     let field = ($tok | split row ":" | first)
@@ -467,21 +566,20 @@ export def "raw-aggregate" [
   --uri: string
   --set: record = {}
   --raw(-R)
-  --dry-run(-n)
   --yes(-y)
 ] {
   if ($collection | is-empty) { error make {msg: "raw-aggregate: --collection <name> is required"} }
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
   let pipe = ($in | query resolve $pipeline --file $file --suffix ".mongodb")
   let js = "db.getCollection(" + (mongo lit $collection) + ").aggregate(" + $pipe + ").toArray()"
-  if $dry_run { return {connection: ($conf | conn redact), query: $js} }
   if (mongo is-dangerous $js (mongo mongo-danger)) and (not (query confirm "This pipeline may modify data. Run it?" --yes=$yes)) { return }
   let rows = (mongo-run $conf $js $raw)
   mongo-warm $conf
   $rows
 }
 
-# Count documents matching `find`-style filter tokens.
+# Count documents matching `find`-style filter tokens. `--dry-run` returns
+# `{connection, query}` — the composed `countDocuments(...)` — without running.
 @category mole-mongodb
 @example "how many active admins" { mole-mongodb count active role:admin -C users -c mongodb-local-dev }
 export def "count" [
@@ -496,10 +594,12 @@ export def "count" [
   --auth-source: string
   --uri: string
   --set: record = {}
-]: nothing -> int {
+  --dry-run(-n)
+] {
   if ($collection | is-empty) { error make {msg: "count: --collection <name> is required"} }
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
   let js = "db.getCollection(" + (mongo lit $collection) + ").countDocuments(" + (mongo build-filter $filters) + ")"
+  if $dry_run { return {connection: ($conf | conn redact), query: $js} }
   let n = (mongo-run $conf $js false)
   mongo-warm $conf
   $n
@@ -508,7 +608,8 @@ export def "count" [
 # Distinct values of a field with their document counts, most frequent first.
 #
 # Composed from `find`-style `...filters`; `--limit` caps the number of values.
-# Returns a `{value, count}` table (like VictoriaLogs' `field-values`).
+# Returns a `{value, count}` table (like VictoriaLogs' `field-values`). `--dry-run`
+# returns `{connection, query}` without running.
 @category mole-mongodb
 @example "which roles exist, and how common" { mole-mongodb distinct role -C users -c mongodb-local-dev }
 @example "top regions among paid orders" { mole-mongodb distinct region status:paid -C orders --limit 10 -c mongodb-local-dev }
@@ -526,6 +627,7 @@ export def "distinct" [
   --auth-source: string
   --uri: string
   --set: record = {}
+  --dry-run(-n)
 ] {
   if ($collection | is-empty) { error make {msg: "distinct: --collection <name> is required"} }
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
@@ -540,12 +642,17 @@ export def "distinct" [
   if ($limit != null) { $stages = ($stages | append ("{$limit: " + ($limit | into string) + "}")) }
   $stages = ($stages | append "{$project: {_id: 0, value: \"$_id\", count: 1}}")
   let js = "db.getCollection(" + (mongo lit $collection) + ").aggregate([" + ($stages | str join ", ") + "]).toArray()"
+  if $dry_run { return {connection: ($conf | conn redact), query: $js} }
   let rows = (mongo-run $conf $js false)
   mongo-warm $conf
   $rows
 }
 
 # List a database's collections and views: `{name, type, count, indexes}`.
+#
+# `count` is an ESTIMATE (metadata, never a full scan) and `indexes` is the index
+# count. Gathered in one metadata sweep and cached a day (`--refresh` rebuilds) — no
+# document sampling, so it's safe on a large database.
 @category mole-mongodb
 @example "what's in the database" { mole-mongodb collections -c mongodb-local-dev }
 export def "collections" [
@@ -561,22 +668,24 @@ export def "collections" [
   --refresh(-r)
 ] {
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
-  (mongo-catalog-load $conf --refresh=$refresh | get -o collections | default [])
-  | each {|c| {name: $c.name, type: $c.type, count: $c.count, indexes: ($c.indexes | length)} }
+  mongo-collmeta-load $conf --refresh=$refresh
+  | each {|c| {name: $c.name, type: $c.type, count: ($c | get -o count), indexes: ($c | get -o indexes | default 0)} }
 }
 
-# Inspect a connection's inferred schema (sampled; cached a day).
+# Inspect a connection's inferred schema (sampled per collection, cached a day).
 #
-# No `--collection`: one summary row per collection ({collection, type, fields,
-# count}). With `--collection`: the field detail — {name, types, nullable,
-# occurrence} for each discovered field path — plus that collection's indexes.
-# `--find` filters field paths by substring; `--sample` sets the docs sampled per
-# collection (only takes effect with `--refresh`); `--full` returns the raw cache;
-# `--refresh` rebuilds from the live database first.
+# With `--collection`: samples THAT collection and returns its field detail —
+# {name, types, nullable, occurrence} per discovered path — plus its count and
+# indexes. Without `--collection`: a lightweight summary row per collection
+# ({collection, type, count, fields, indexes}) built from the metadata sweep — `fields`
+# is the field count for collections already sampled (via `schema -C`), else null (no
+# whole-database sampling). `--find <substr>` filters field paths, but only across
+# collections already sampled. `--sample` sets the docs sampled (with `-C`, on
+# --refresh/stale); `--full` returns the raw cache; `--refresh` rebuilds live first.
 @category mole-mongodb
 @example "per-collection summary" { mole-mongodb schema -c mongodb-local-dev }
 @example "one collection's fields and indexes" { mole-mongodb schema -C users -c mongodb-local-dev }
-@example "find field paths mentioning 'city'" { mole-mongodb schema --find city -c mongodb-local-dev }
+@example "find field paths mentioning 'city' (among sampled collections)" { mole-mongodb schema --find city -c mongodb-local-dev }
 export def "schema" [
   --collection(-C): string@"mongo-collection"
   --find: string@"mongo-field"
@@ -594,19 +703,29 @@ export def "schema" [
   --set: record = {}
 ] {
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
-  let data = if $sample != null { mongo-catalog-load $conf --refresh=$refresh --sample $sample } else { mongo-catalog-load $conf --refresh=$refresh }
-  if $full { return $data }
-  let fields = ($data | get -o fields | default [])
-  if ($find | is-not-empty) {
-    return ($fields | where {|f| $f.name | str contains $find })
-  }
+  # --collection: sample just that collection (tier 2).
   if ($collection | is-not-empty) {
-    let cols = ($fields | where collection == $collection | select name types nullable occurrence)
-    let ixs = ($data | get -o collections | default [] | where name == $collection | get -o 0.indexes | default [])
-    return {collection: $collection, fields: $cols, indexes: ($ixs | each {|ix| {name: $ix.name, keys: $ix.key} })}
+    let data = if $sample != null { mongo-collschema-load $conf $collection --refresh=$refresh --sample $sample } else { mongo-collschema-load $conf $collection --refresh=$refresh }
+    if $full { return $data }
+    let cols = ($data | get -o fields | default [] | select name types nullable occurrence)
+    let ixs = ($data | get -o indexes | default [])
+    return {collection: $collection, count: ($data | get -o count), fields: $cols, indexes: ($ixs | each {|ix| {name: $ix.name, keys: $ix.key} })}
   }
-  ($data | get -o collections | default []) | each {|c|
-    {collection: $c.name, type: $c.type, fields: ($fields | where collection == $c.name | length), count: $c.count}
+  # No collection: the metadata sweep (tier 3), never sampling the whole database.
+  let colls = (mongo-collmeta-load $conf --refresh=$refresh)
+  if $full { return $colls }
+  if ($find | is-not-empty) {
+    # Field search spans only collections already sampled (their tier-2 cache).
+    return ($colls | each {|c|
+      let cf = (cache read (mongo-collcache-file $conf $c.name))
+      if ($cf | is-empty) { [] } else {
+        ($cf | get -o fields | default [] | where {|f| $f.name | str contains $find } | each {|f| {collection: $c.name} | merge ($f | select name types nullable occurrence) })
+      }
+    } | flatten)
+  }
+  $colls | each {|c|
+    let cf = (cache read (mongo-collcache-file $conf $c.name))
+    {collection: $c.name, type: $c.type, count: ($c | get -o count), fields: (if ($cf | is-empty) { null } else { ($cf | get -o fields | default [] | length) }), indexes: ($c | get -o indexes | default 0)}
   }
 }
 
@@ -628,15 +747,17 @@ export def "indexes" [
 ] {
   if ($collection | is-empty) { error make {msg: "indexes: --collection <name> is required"} }
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
-  (mongo-catalog-load $conf --refresh=$refresh | get -o collections | default [] | where name == $collection | get -o 0.indexes | default [])
+  (mongo-collschema-load $conf $collection --refresh=$refresh | get -o indexes | default [])
   | each {|ix| {name: $ix.name, keys: ($ix | get -o key), unique: ($ix | get -o unique | default false), sparse: ($ix | get -o sparse | default false)} }
 }
 
 # Make a mongodb connection the current one for this driver.
 #
 # Records the choice in `$env.MOLE_CURRENT.mongodb`, so later verbs can omit
-# `--connection`. Validates that `name` is a mongodb connection, and warms the
-# completion catalog (sampled schema) so tab-completion is ready right away.
+# `--connection`. Validates that `name` is a mongodb connection, and warms only the
+# lightweight SKELETON (database + collection names) — a fast, bounded metadata
+# round-trip, so this returns promptly even against a huge database. Per-collection
+# field schemas load lazily on first use, never here.
 @category mole-mongodb
 @example "make the local dev database current" { mole-mongodb set-connection mongodb-local-dev }
 export def --env "set-connection" [
@@ -644,5 +765,5 @@ export def --env "set-connection" [
 ]: nothing -> nothing {
   let conf = (conn resolve $name --driver mongodb)
   $env.MOLE_CURRENT = (($env.MOLE_CURRENT? | default {}) | upsert mongodb $name)
-  try { mongo-catalog-load $conf --refresh | ignore } catch { }
+  try { mongo-skeleton-load $conf --refresh --fast | ignore } catch { }
 }
