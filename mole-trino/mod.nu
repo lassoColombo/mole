@@ -192,21 +192,19 @@ def trino-conf [
 # These call trino-schema-load, so a first completion against a not-yet-cached (or
 # day-stale) connection introspects the live cluster once, then serves from cache.
 
+def trino-catalog [context: string]: nothing -> record {
+  complete catalog-ctx $context trino --get {|c| trino-schema-load $c }
+}
+
 def "trino-table" [context: string]: nothing -> list<string> {
-  try {
-    let conf = (conn with trino (sql parse-flag $context ["--connection" "-c"]) {})
-    sql complete-tables (trino-schema-load $conf | default {})
-  } catch { [] }
+  sql complete-tables (trino-catalog $context)
 }
 
 def "trino-column" [context: string]: nothing -> list<string> {
-  try {
-    let conf = (conn with trino (sql parse-flag $context ["--connection" "-c"]) {})
-    # `select` names its table with --from; `update`/`delete` take it as the leading
-    # positional — fall back to that so column completion works for the write verbs too.
-    let tbl = (sql parse-flag $context ["--from" "-F"] | default (sql lead-arg $context [update delete]))
-    sql complete-columns (trino-schema-load $conf | default {}) $tbl
-  } catch { [] }
+  # `select` names its table with --from; `update`/`delete` take it as the leading
+  # positional — fall back to that so column completion works for the write verbs too.
+  let tbl = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
+  sql complete-columns (trino-catalog $context) $tbl
 }
 
 # ---- SELECT clause renderers (trino-specific) ---------------------------------

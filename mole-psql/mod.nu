@@ -192,24 +192,23 @@ def pg-conf [
 }
 
 # ---- completers (cache-backed; build the schema on a cache miss) --------------
-# These call pg-schema-load, so a first completion against a not-yet-cached (or
-# day-stale) connection introspects the live DB once, then serves from cache.
+# The catalog the command line targets. `complete catalog-ctx` resolves the
+# connection robustly (typed -c → current → cached), reads/builds the schema via
+# pg-schema-load (a cache miss introspects the live DB once, then serves cached),
+# and never throws — an empty catalog just yields no candidates.
+def psql-catalog [context: string]: nothing -> record {
+  complete catalog-ctx $context psql --get {|c| pg-schema-load $c }
+}
 
 def "psql-table" [context: string]: nothing -> list<string> {
-  try {
-    let conf = (conn with psql (sql parse-flag $context ["--connection" "-c"]) {})
-    sql complete-tables (pg-schema-load $conf | default {})
-  } catch { [] }
+  sql complete-tables (psql-catalog $context)
 }
 
 def "psql-column" [context: string]: nothing -> list<string> {
-  try {
-    let conf = (conn with psql (sql parse-flag $context ["--connection" "-c"]) {})
-    # `select` names its table with --from; `update`/`delete` take it as the leading
-    # positional — fall back to that so column completion works for the write verbs too.
-    let tbl = (sql parse-flag $context ["--from" "-F"] | default (sql lead-arg $context [update delete]))
-    sql complete-columns (pg-schema-load $conf | default {}) $tbl
-  } catch { [] }
+  # `select` names its table with --from; `update`/`delete` take it as the leading
+  # positional — fall back to that so column completion works for the write verbs too.
+  let tbl = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
+  sql complete-columns (psql-catalog $context) $tbl
 }
 
 def "psql-lock" [context: string]: nothing -> list<string> { ["update" "share" "no key update" "key share"] }

@@ -100,21 +100,19 @@ def ma-conf [
 # These call ma-schema-load, so a first completion against a not-yet-cached (or
 # day-stale) connection introspects the live DB once, then serves from cache.
 
+def mariadb-catalog [context: string]: nothing -> record {
+  complete catalog-ctx $context mariadb --get {|c| ma-schema-load $c }
+}
+
 def "mariadb-table" [context: string]: nothing -> list<string> {
-  try {
-    let conf = (conn with mariadb (sql parse-flag $context ["--connection" "-c"]) {})
-    sql complete-tables (ma-schema-load $conf | default {})
-  } catch { [] }
+  sql complete-tables (mariadb-catalog $context)
 }
 
 def "mariadb-column" [context: string]: nothing -> list<string> {
-  try {
-    let conf = (conn with mariadb (sql parse-flag $context ["--connection" "-c"]) {})
-    # `select` names its table with --from; `update`/`delete` take it as the leading
-    # positional — fall back to that so column completion works for the write verbs too.
-    let tbl = (sql parse-flag $context ["--from" "-F"] | default (sql lead-arg $context [update delete]))
-    sql complete-columns (ma-schema-load $conf | default {}) $tbl
-  } catch { [] }
+  # `select` names its table with --from; `update`/`delete` take it as the leading
+  # positional — fall back to that so column completion works for the write verbs too.
+  let tbl = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
+  sql complete-columns (mariadb-catalog $context) $tbl
 }
 
 def "mariadb-lock" [context: string]: nothing -> list<string> { myql lock-modes }

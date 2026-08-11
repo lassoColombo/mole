@@ -98,21 +98,19 @@ def my-conf [
 # These call my-schema-load, so a first completion against a not-yet-cached (or
 # day-stale) connection introspects the live DB once, then serves from cache.
 
+def mysql-catalog [context: string]: nothing -> record {
+  complete catalog-ctx $context mysql --get {|c| my-schema-load $c }
+}
+
 def "mysql-table" [context: string]: nothing -> list<string> {
-  try {
-    let conf = (conn with mysql (sql parse-flag $context ["--connection" "-c"]) {})
-    sql complete-tables (my-schema-load $conf | default {})
-  } catch { [] }
+  sql complete-tables (mysql-catalog $context)
 }
 
 def "mysql-column" [context: string]: nothing -> list<string> {
-  try {
-    let conf = (conn with mysql (sql parse-flag $context ["--connection" "-c"]) {})
-    # `select` names its table with --from; `update`/`delete` take it as the leading
-    # positional — fall back to that so column completion works for the write verbs too.
-    let tbl = (sql parse-flag $context ["--from" "-F"] | default (sql lead-arg $context [update delete]))
-    sql complete-columns (my-schema-load $conf | default {}) $tbl
-  } catch { [] }
+  # `select` names its table with --from; `update`/`delete` take it as the leading
+  # positional — fall back to that so column completion works for the write verbs too.
+  let tbl = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
+  sql complete-columns (mysql-catalog $context) $tbl
 }
 
 def "mysql-lock" [context: string]: nothing -> list<string> { myql lock-modes }

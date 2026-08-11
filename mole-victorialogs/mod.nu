@@ -135,10 +135,7 @@ def vl-range-ctx [context: string]: nothing -> record {
 # one). Cache-only — the instant fallback that `vl-field` drops back to when its live
 # scoped lookup is empty or errors.
 def vl-catalog-ctx [context: string]: nothing -> record {
-  try {
-    let conf = (vl-conf (vl-flag $context ["--connection" "-c"]) null null {})
-    (cache read (cache path "victorialogs" ($conf | get -o name | default "_"))) | default {}
-  } catch { {} }
+  complete catalog-ctx $context victorialogs
 }
 
 # Field-name suggestions, scoped to the filters + window already on the line: a LIVE

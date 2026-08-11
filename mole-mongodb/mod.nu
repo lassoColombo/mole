@@ -228,7 +228,7 @@ def csv [v: any]: nothing -> list<string> {
 # The resolved connection a completion line names (via `-c`/`--connection` and an
 # optional `--database` override), or the current one. Null when nothing resolves.
 def mongo-ctx-conf [ctx: string]: nothing -> any {
-  try { conn with mongodb (mongo parse-flag $ctx ["--connection" "-c"]) {database: (mongo parse-flag $ctx ["--database" "-d"])} } catch { null }
+  complete conn-ctx $ctx mongodb --over {database: (complete flag $ctx [--database -d])}
 }
 
 # The SKELETON (db + collection names) for whatever connection/database the line

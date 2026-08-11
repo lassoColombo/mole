@@ -206,21 +206,19 @@ def duck-conf [
 # These call duck-schema-load, so a first completion against a not-yet-cached (or
 # day-stale) connection introspects the database once, then serves from cache.
 
+def duckdb-catalog [context: string]: nothing -> record {
+  complete catalog-ctx $context duckdb --get {|c| duck-schema-load $c }
+}
+
 def "duckdb-table" [context: string]: nothing -> list<string> {
-  try {
-    let conf = (conn with duckdb (sql parse-flag $context ["--connection" "-c"]) {})
-    sql complete-tables (duck-schema-load $conf | default {})
-  } catch { [] }
+  sql complete-tables (duckdb-catalog $context)
 }
 
 def "duckdb-column" [context: string]: nothing -> list<string> {
-  try {
-    let conf = (conn with duckdb (sql parse-flag $context ["--connection" "-c"]) {})
-    # `select` names its table with --from; `update`/`delete` take it as the leading
-    # positional — fall back to that so column completion works for the write verbs too.
-    let tbl = (sql parse-flag $context ["--from" "-F"] | default (sql lead-arg $context [update delete]))
-    sql complete-columns (duck-schema-load $conf | default {}) $tbl
-  } catch { [] }
+  # `select` names its table with --from; `update`/`delete` take it as the leading
+  # positional — fall back to that so column completion works for the write verbs too.
+  let tbl = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
+  sql complete-columns (duckdb-catalog $context) $tbl
 }
 
 # ---- SELECT clause renderers (duckdb-specific) --------------------------------

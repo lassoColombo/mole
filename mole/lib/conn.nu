@@ -7,6 +7,7 @@
 # filed under; `list` flattens the sections and tags each record with it.
 
 use ./config.nu
+use ./cache.nu
 
 # Raw connections, flattened from the driver-keyed `connections:` map.
 #
@@ -133,6 +134,9 @@ export def --env "set-current" [
 ]: nothing -> record {
   let conf = (resolve $name --driver $driver)
   $env.MOLE_CURRENT = (($env.MOLE_CURRENT? | default {}) | upsert $driver $name)
+  # Mirror the choice into a cache file so completion can resolve the current
+  # connection even when it can't see the session $env (completers usually can't).
+  try { {name: $name} | cache write (cache path $driver "__current__") } catch { }
   $conf
 }
 
