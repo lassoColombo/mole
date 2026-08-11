@@ -1,0 +1,56 @@
+# Local dev / test Redis for the mole-redis plugin.
+#
+#   docker compose -f mole-redis/_devutils/docker-compose.yaml up -d --wait
+#
+# Obscure host port 56379 (→ container 6379, Redis's default) to avoid colliding with
+# a local redis-server. Matches the `redis-local-dev` connection under the `redis:`
+# section of ~/.config/mole/connections.yaml:
+#
+#   connections:
+#     redis:
+#       - name: redis-local-dev
+#         host: 127.0.0.1
+#         port: 56379
+#         password: demo
+#         database: 0
+#
+# SEEDING — the official redis image has NO init hook (unlike mongo/mysql), so a
+# one-shot `seed` service waits for the server to be healthy and pipes
+# initdb/seed.redis through redis-cli (the sidecar pattern mole-victorialogs uses).
+# It FLUSHALLs first and there is no data volume, so every `up` re-seeds from scratch
+# (redis dev data is disposable). The seed lays down one key per Redis type (string,
+# hash, list, set, zset, stream) plus a TTL key, and values that exercise the
+# value-type inference the plugin will do (int, float, bool, json, and a leading-zero
+# id that must STAY a string).
+#
+# Auth: `--requirepass demo` (matches the connection's password) so the plugin's
+# REDISCLI_AUTH / --password path is exercised like a real server.
+name: mole-redis-devutils
+
+services:
+  redis:
+    image: redis:8-alpine
+    container_name: mole-redis-local-dev
+    command: ["redis-server", "--requirepass", "demo", "--save", "", "--appendonly", "no"]
+    ports:
+      - "56379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "demo", "--no-auth-warning", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  seed:
+    image: redis:8-alpine
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDISCLI_AUTH: demo
+    volumes:
+      - ./initdb:/initdb:ro
+    entrypoint:
+      - sh
+      - -c
+      - 'redis-cli -h redis --no-auth-warning FLUSHALL && redis-cli -h redis --no-auth-warning < /initdb/seed.redis && echo "mole-redis seed complete"'
+    restart: "no"

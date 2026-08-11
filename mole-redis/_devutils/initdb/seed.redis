@@ -1,0 +1,33 @@
+# Seed data for the mole-redis dev stack. One key per Redis type, plus values chosen
+# to exercise the plugin's per-value type inference. Piped through `redis-cli` by the
+# `seed` service in docker-compose.yaml (each line is one command; `*` is literal to
+# redis-cli, not a shell glob).
+
+# --- strings: scalar type inference (int / float / bool / json / string) ---
+SET greeting "hello world"
+SET counter 42
+SET ratio 3.14159
+SET enabled true
+SET config:json {"retries":3,"tags":["a","b"],"nested":{"k":1}}
+SET user:007 007
+
+# --- hash: becomes a record; mixed value types within one hash ---
+HSET user:1 name Ann age 30 active true balance 12.50 email ann@example.com
+HSET user:2 name Bob age 27 active false balance 0 email bob@example.com
+
+# --- list: ordered elements ---
+RPUSH recent:list alpha beta gamma delta
+
+# --- set: unordered members ---
+SADD tags redis nushell mole cli
+
+# --- sorted set: member + score table ---
+ZADD leaderboard 100 alice 250 bob 175 carol 90 dave
+
+# --- stream: entries with an id (embedded ms timestamp) + fields ---
+XADD events * level info  msg started        service api
+XADD events * level warn  msg "slow query"   service db
+XADD events * level error msg boom code 500  service api
+
+# --- a key with a TTL, so `keys --ttl` has something to show ---
+SET session:abc token-xyz EX 3600

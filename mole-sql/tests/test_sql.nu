@@ -25,6 +25,38 @@ def "missing from errors" [] {
     assert error { sql build-select }
 }
 
+# ---- build-update / build-delete ----------------------------------------------
+
+@test
+def "build-update composes SET WHERE RETURNING in order" [] {
+    assert equal (sql build-update --table users --set ["status = 'inactive'"] --where "id = 5") "UPDATE users SET status = 'inactive' WHERE id = 5"
+    assert equal (sql build-update --table users --set ["a = 1" "b = b + 1"] --where "id = 5" --returning ["id" "b"]) "UPDATE users SET a = 1, b = b + 1 WHERE id = 5 RETURNING id, b"
+}
+
+@test
+def "build-update drops an empty WHERE and empty RETURNING" [] {
+    assert equal (sql build-update --table t --set ["x = 1"]) "UPDATE t SET x = 1"
+}
+
+@test
+def "build-update requires a table and at least one assignment" [] {
+    assert error { sql build-update --set ["x = 1"] }        # no table
+    assert error { sql build-update --table t }              # no assignments
+    assert error { sql build-update --table t --set [] }     # empty assignments
+}
+
+@test
+def "build-delete composes WHERE and RETURNING, drops empties" [] {
+    assert equal (sql build-delete --table sessions --where "expires_at < now()") "DELETE FROM sessions WHERE expires_at < now()"
+    assert equal (sql build-delete --table sessions --where "id = 5" --returning ["*"]) "DELETE FROM sessions WHERE id = 5 RETURNING *"
+    assert equal (sql build-delete --table sessions) "DELETE FROM sessions"
+}
+
+@test
+def "build-delete requires a table" [] {
+    assert error { sql build-delete --where "id = 1" }
+}
+
 # ---- generic assembly helpers -------------------------------------------------
 
 @test

@@ -281,6 +281,122 @@ export def "select" [
   | sql apply-types (sql columns-for (my-schema-load $conf) (sql base-table $from)) {|c| my-type $c }
 }
 
+# Compose and run a single-table MySQL UPDATE.
+#
+# The SET assignments are the positional args — each a verbatim `"col = expr"`, so
+# expressions (`hits = hits + 1`, `updated_at = now()`) all work; you quote
+# identifiers and string literals yourself. Their column names complete against
+# the `--from` table. `--where` is the same verbatim predicate as `select`. MySQL
+# scopes a single-table UPDATE with an optional `ORDER BY ... LIMIT` (`--sort-by`
+# / `--limit`) — the bounded-rewrite idiom; there is NO RETURNING and NO join
+# support (reach for `raw-query` for multi-table updates).
+#
+# UPDATE always writes, so it prompts before running (skip with `--yes`) and
+# REFUSES to touch every row unless you pass `--all` (a missing `--where` would
+# otherwise rewrite the whole table). `--dry-run` returns a `{connection, query}`
+# record without running. Connection overridable via `--connection` + per-field
+# flags / `--set`, as in `raw-query`.
+@category mole-mysql
+@example "set a column on the matched rows" {
+  mole-mysql update "status = 'inactive'" --from users --where "id = 5" --dry-run | get query
+} --result "UPDATE users SET status = 'inactive' WHERE id = 5"
+@example "several assignments at once" {
+  mole-mysql update "status = 'active'" "verified = 1" --from users --where "email = 'a@b.c'" --dry-run | get query
+} --result "UPDATE users SET status = 'active', verified = 1 WHERE email = 'a@b.c'"
+@example "bounded rewrite: ORDER BY ... LIMIT (mysql-specific)" {
+  mole-mysql update "priority = priority + 1" --from jobs --where "queued = 1" --sort-by "created_at asc" --limit 100 --dry-run | get query
+} --result "UPDATE jobs SET priority = priority + 1 WHERE queued = 1 ORDER BY created_at ASC LIMIT 100"
+@example "guard: an unfiltered UPDATE needs --all" {
+  mole-mysql update "archived = 1" --from users --all --dry-run | get query
+} --result "UPDATE users SET archived = 1"
+export def "update" [
+  ...assignments: string@"mysql-column"            # SET assignments, verbatim "col = expr" (at least one required)
+  --from(-F): string@"mysql-table"                 # target table, single table only (an alias is allowed: "users u")
+  --where(-w): string                              # WHERE predicate (without the keyword)
+  --sort-by(-s): string                            # ORDER BY terms, comma-separated: "col [asc|desc]" (with --limit)
+  --limit(-l): int                                 # LIMIT N — cap the rows changed (mysql-specific)
+  --all                                            # allow an unfiltered UPDATE (every row) when --where is omitted
+  --connection(-c): string@complete-connection   # named connection (default: current)
+  --host(-h): string
+  --port(-p): int
+  --user(-u): string
+  --password(-P): string
+  --database(-d): string
+  --set: record = {}
+  --dry-run(-n)                                    # return a {connection, query} record instead of running
+  --yes(-y)                                         # skip the confirmation prompt
+] {
+  if ($from | is-empty) { error make {msg: "update: --from <table> is required"} }
+  if ($assignments | is-empty) { error make {msg: "update: at least one SET assignment is required, e.g. \"status = 'active'\""} }
+  if ($where | is-empty) and (not $all) {
+    error make {msg: "update: refusing to update every row without --where (pass --all to override)"}
+  }
+  let text = (sql assemble [
+    $"UPDATE ($from)"
+    (sql join-list $assignments --prefix "SET ")
+    (if ($where | is-not-empty) { $"WHERE ($where)" })
+    (myql order $sort_by)
+    (if $limit != null { $"LIMIT ($limit)" })
+  ])
+  let conf = (my-conf $connection $host $port $user $password $database $set)
+  if $dry_run { return {connection: ($conf | conn redact), query: $text} }
+  if (not (query confirm "This UPDATE will modify rows. Run it?" --yes=$yes)) { return }
+  my-rows $conf $text
+}
+
+# Compose and run a single-table MySQL DELETE.
+#
+# `--where` is the same verbatim predicate as `select`. Like UPDATE, MySQL scopes
+# a single-table DELETE with an optional `ORDER BY ... LIMIT` (`--sort-by` /
+# `--limit`) — delete the "oldest N" and so on. There is NO RETURNING and NO join
+# support (reach for `raw-query` for `DELETE ... USING`/multi-table).
+#
+# DELETE always writes, so it prompts before running (skip with `--yes`) and
+# REFUSES to delete every row unless you pass `--all`. `--dry-run` returns a
+# `{connection, query}` record without running. Connection overridable as in
+# `raw-query`.
+@category mole-mysql
+@example "delete the matched rows" {
+  mole-mysql delete --from sessions --where "expires_at < now()" --dry-run | get query
+} --result "DELETE FROM sessions WHERE expires_at < now()"
+@example "delete the oldest N (ORDER BY ... LIMIT)" {
+  mole-mysql delete --from logs --where "level = 'debug'" --sort-by "ts asc" --limit 1000 --dry-run | get query
+} --result "DELETE FROM logs WHERE level = 'debug' ORDER BY ts ASC LIMIT 1000"
+@example "guard: an unfiltered DELETE needs --all" {
+  mole-mysql delete --from staging_rows --all --dry-run | get query
+} --result "DELETE FROM staging_rows"
+export def "delete" [
+  --from(-F): string@"mysql-table"                 # target table, single table only (an alias is allowed: "users u")
+  --where(-w): string                              # WHERE predicate (without the keyword)
+  --sort-by(-s): string                            # ORDER BY terms, comma-separated: "col [asc|desc]" (with --limit)
+  --limit(-l): int                                 # LIMIT N — cap the rows removed (mysql-specific)
+  --all                                            # allow an unfiltered DELETE (every row) when --where is omitted
+  --connection(-c): string@complete-connection   # named connection (default: current)
+  --host(-h): string
+  --port(-p): int
+  --user(-u): string
+  --password(-P): string
+  --database(-d): string
+  --set: record = {}
+  --dry-run(-n)                                    # return a {connection, query} record instead of running
+  --yes(-y)                                         # skip the confirmation prompt
+] {
+  if ($from | is-empty) { error make {msg: "delete: --from <table> is required"} }
+  if ($where | is-empty) and (not $all) {
+    error make {msg: "delete: refusing to delete every row without --where (pass --all to override)"}
+  }
+  let text = (sql assemble [
+    $"DELETE FROM ($from)"
+    (if ($where | is-not-empty) { $"WHERE ($where)" })
+    (myql order $sort_by)
+    (if $limit != null { $"LIMIT ($limit)" })
+  ])
+  let conf = (my-conf $connection $host $port $user $password $database $set)
+  if $dry_run { return {connection: ($conf | conn redact), query: $text} }
+  if (not (query confirm "This DELETE will remove rows. Run it?" --yes=$yes)) { return }
+  my-rows $conf $text
+}
+
 # Inspect a connection's cached schema (introspection is cached for a day).
 #
 # The default view is one summary row per table: schema, name, type, column

@@ -118,6 +118,67 @@ export def "build-select" [
   ]
 }
 
+# Build an ANSI `UPDATE` statement from its parts, dialect-agnostic.
+#
+# Emits `UPDATE <table> SET <assignments> [WHERE ...] [RETURNING ...]` in fixed
+# order, dropping empty clauses. Each assignment is a verbatim `"col = expr"`
+# string (the caller quotes identifiers/literals), comma-joined into the SET body.
+# `--table` and at least one assignment are required — an assignment-less UPDATE
+# is a syntax error, and a `SET` with no body would silently corrupt the
+# statement. `--returning` is the Postgres/DuckDB output clause; dialects without
+# it (MySQL, Trino) simply pass `[]`. Non-standard tails a dialect appends after
+# WHERE (MySQL's `ORDER BY ... LIMIT`) are added by the plugin around this core,
+# exactly as `build-select` leaves DISTINCT ON / locking to the caller.
+@category mole-sql
+@example "one assignment, filtered" {
+  sql build-update --table users --set ["status = 'inactive'"] --where "id = 5"
+} --result "UPDATE users SET status = 'inactive' WHERE id = 5"
+@example "expression assignment + RETURNING" {
+  sql build-update --table users --set ["hits = hits + 1"] --where "id = 5" --returning [id hits]
+} --result "UPDATE users SET hits = hits + 1 WHERE id = 5 RETURNING id, hits"
+export def "build-update" [
+  --table: string                 # target table (required)
+  --set: list<string> = []        # SET assignments, verbatim "col = expr" (≥1 required)
+  --where: string                 # WHERE predicate, without the keyword
+  --returning: list<string> = []  # RETURNING columns (Postgres/DuckDB); dropped when empty
+]: nothing -> string {
+  if ($table | is-empty) { error make {msg: "sql build-update: --table <table> is required"} }
+  if ($set | is-empty) { error make {msg: "sql build-update: at least one --set assignment is required"} }
+  assemble [
+    $"UPDATE ($table)"
+    (join-list $set --prefix "SET ")
+    (if ($where | is-not-empty) { $"WHERE ($where)" })
+    (join-list $returning --prefix "RETURNING ")
+  ]
+}
+
+# Build an ANSI `DELETE` statement from its parts, dialect-agnostic.
+#
+# Emits `DELETE FROM <table> [WHERE ...] [RETURNING ...]`, dropping empty clauses.
+# `--table` is required; a missing `--where` deletes every row — this pure builder
+# stays mechanical, so the "refuse an unfiltered DELETE unless --all" guard lives
+# in the dialect plugin, not here. `--returning` is the Postgres/DuckDB output
+# clause; other dialects pass `[]`.
+@category mole-sql
+@example "filtered delete" {
+  sql build-delete --table sessions --where "expires_at < now()"
+} --result "DELETE FROM sessions WHERE expires_at < now()"
+@example "delete returning the removed rows" {
+  sql build-delete --table sessions --where "id = 5" --returning ["*"]
+} --result "DELETE FROM sessions WHERE id = 5 RETURNING *"
+export def "build-delete" [
+  --table: string                 # target table (required)
+  --where: string                 # WHERE predicate, without the keyword
+  --returning: list<string> = []  # RETURNING columns (Postgres/DuckDB); dropped when empty
+]: nothing -> string {
+  if ($table | is-empty) { error make {msg: "sql build-delete: --table <table> is required"} }
+  assemble [
+    $"DELETE FROM ($table)"
+    (if ($where | is-not-empty) { $"WHERE ($where)" })
+    (join-list $returning --prefix "RETURNING ")
+  ]
+}
+
 # ---- result typing ------------------------------------------------------------
 
 # Wrap a cell-coercion closure so a `null` cell survives as `null`.
