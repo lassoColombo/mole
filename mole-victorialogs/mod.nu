@@ -1,10 +1,11 @@
 # mole-victorialogs — VictoriaLogs driver plugin (READ-ONLY LogsQL HTTP API).
 #
 # A PLUGIN (data source): supports the `victorialogs` driver, registers itself as
-# a driver, and exposes read-only verbs — `raw-query` / `hits` / `raw-stats` / `fields` /
-# `field-values` / `streams` / `facets` / `set-connection`. It talks to
+# a driver, and exposes read-only verbs — `raw-query` / `select` / `hits` /
+# `raw-stats` / `stats` / `fields` / `field-values` / `streams` / `facets` /
+# `set-connection`. It talks to
 # VictoriaLogs over its HTTP API using Nushell's built-in `http` (no external
-# CLI), so `requires: []` in mole.nuon.
+# CLI), with no external dependencies.
 #
 # LAYERING (two files, like mole-prometheus's client+wrapper split):
 #   - client.nu  — HAND-WRITTEN, mechanical HTTP layer for the read-only
@@ -36,12 +37,8 @@ use mole/lib/complete.nu
 use ./client.nu
 use ./logsql.nu
 
-const HERE = (path self | path dirname)
-
 export-env {
-  let m = (open ([$HERE mole.nuon] | path join))
-  $env.MOLE_REGISTRY = (($env.MOLE_REGISTRY? | default {}) | upsert $m.driver $m)
-  $env.MOLE_CURRENT = ($env.MOLE_CURRENT? | default {})
+  conn register "victorialogs"
 }
 
 # ---- connection resolution ----------------------------------------------------
@@ -99,8 +96,44 @@ def vl-flag [ctx: string, names: list<string>]: nothing -> any {
   if ($m | is-empty) { null } else { $m | last | get v }
 }
 
-# The cached catalog for whatever connection the command line names (or the
-# current one). Cache-only — never hits the network, so completers stay instant.
+# The explicit `field:…` filter tokens already on the line, AND-joined into a LogsQL
+# scoping filter for contextual lookups (empty → `*`). The parser (`ast`) does the
+# flag/positional split, so flag values (`--select a,b`, `--url http://h:8428`,
+# `--start <datetime>`) are excluded without a hand-kept switch list, and quoted tokens
+# stay whole; only structured `field:value` positionals scope (bare terms are ignored).
+# The token under the cursor is dropped first (it is the one being completed). `ast` is
+# a debug builtin whose JSON is not a stable contract, so a parse mismatch is caught and
+# scoping simply falls back to `*` (global) — it never breaks completion.
+def vl-filters-ctx [context: string]: nothing -> string {
+  let prior = ($context | split row " " | drop 1 | str join " ")
+  let f = (try {
+    ast $prior --json | get block | from json
+    | get pipelines.0.elements.0.expr.expr.Call.arguments
+    | where {|a| "Positional" in ($a | columns) }
+    | each {|a| $a.Positional.expr | get -o String }
+    | compact
+    | where {|t| $t | str contains ":" }
+    | str join " "
+  } catch { "" })
+  if ($f | is-empty) { "*" } else { $f }
+}
+
+# The {start, end} window implied by the --last/--start/--end flags already on the
+# line, best-effort (absent/unparseable → unbounded). Lets contextual lookups honor
+# the time window the user has typed.
+def vl-range-ctx [context: string]: nothing -> record {
+  let lastRaw = (vl-flag $context ["--last" "-L"])
+  let startRaw = (vl-flag $context ["--start" "-a"])
+  let endRaw = (vl-flag $context ["--end" "-b"])
+  let last = (if ($lastRaw | is-empty) { null } else { try { $lastRaw | into duration } catch { null } })
+  let start = (if ($startRaw | is-empty) { null } else { try { $startRaw | into datetime } catch { null } })
+  let end = (if ($endRaw | is-empty) { null } else { try { $endRaw | into datetime } catch { null } })
+  vl-range $last $start $end
+}
+
+# The cached catalog for whatever connection the command line names (or the current
+# one). Cache-only — the instant fallback that `vl-field` drops back to when its live
+# scoped lookup is empty or errors.
 def vl-catalog-ctx [context: string]: nothing -> record {
   try {
     let conf = (vl-conf (vl-flag $context ["--connection" "-c"]) null null {})
@@ -108,7 +141,26 @@ def vl-catalog-ctx [context: string]: nothing -> record {
   } catch { {} }
 }
 
-def "vl-field" [context: string]: nothing -> list<string> { vl-catalog-ctx $context | get -o fields | default [] }
+# Field-name suggestions, scoped to the filters + window already on the line: a LIVE
+# `field_names` ∪ `stream_field_names` (short timeout) reflecting what actually exists
+# in the current query, falling back to the cached global catalog on empty/error.
+# Opt-in contextual completion — this hits the network per tab (the cache is only the
+# fallback), unlike the instant cache-only catalog it draws that fallback from.
+def "vl-field" [context: string]: nothing -> list<string> {
+  let cached = (vl-catalog-ctx $context | get -o fields | default [])
+  try {
+    let conf = (vl-conf (vl-flag $context ["--connection" "-c"]) null null {})
+    let filter = (vl-filters-ctx $context)
+    let r = (vl-range-ctx $context)
+    let s = (logsql vl-time $r.start)
+    let e = (logsql vl-time $r.end)
+    let live = (
+      (client field-names $conf $filter --start $s --end $e --timeout 3sec | logsql values $in | get -o value | default [])
+      ++ (client stream-field-names $conf $filter --start $s --end $e --timeout 3sec | logsql values $in | get -o value | default [])
+    ) | uniq | sort
+    if ($live | is-empty) { $cached } else { $live }
+  } catch { $cached }
+}
 
 # The token under the cursor: the last whitespace-delimited chunk of a completion
 # context. Both list-style completers below reason about it.
@@ -122,13 +174,14 @@ def vl-csv [v: any]: nothing -> list<string> {
 # Completer for the `--output` verbosity flag (see `logsql shape`).
 def "vl-output" []: nothing -> list<string> { ["compact" "wide" "full"] }
 
-# Rest-positional completer for `select` filter tokens. TWO STAGES on the token:
-#   - no `:` → field-name stage: `field:` for every cached field (cache-only, instant).
-#   - `field:…` → value stage: a LIVE `field_values` call (short timeout,
-#                 best-effort) so `level:er⇥` → `level:error`. The one completer
-#                 that hits the network — by design (values are not cached).
-# Nushell keeps `:` inside the word, so a `field:value` candidate replaces the
-# whole token and is prefix-filtered for us.
+# Rest-positional completer for `select` filter tokens. TWO STAGES on the token, both
+# contextual to the OTHER `field:…` filters and the time window already on the line:
+#   - no `:` → field-name stage: `field:` for each field (`vl-field`, live-scoped).
+#   - `field:…` → value stage: a LIVE `field_values` call scoped by the sibling
+#                 filters + window (short timeout), so `app:web level:er⇥` completes
+#                 only levels seen in `app:web`. Best-effort — errors → no candidates.
+# Nushell keeps `:` inside the word, so a `field:value` candidate replaces the whole
+# token and is prefix-filtered for us.
 def "vl-filter" [context: string]: nothing -> list<string> {
   let tok = (vl-token $context)
   if not ($tok | str contains ":") {
@@ -137,7 +190,8 @@ def "vl-filter" [context: string]: nothing -> list<string> {
     try {
       let field = ($tok | split row ":" | first)
       let conf = (vl-conf (vl-flag $context ["--connection" "-c"]) null null {})
-      client field-values $conf "*" $field --limit 50 --timeout 3sec
+      let r = (vl-range-ctx $context)
+      client field-values $conf (vl-filters-ctx $context) $field --start (logsql vl-time $r.start) --end (logsql vl-time $r.end) --limit 50 --timeout 3sec
       | logsql values $in | get -o value | default []
       | each {|v| $"($field):(logsql lit ($v | into string))" }
     } catch { [] }
@@ -152,6 +206,64 @@ def "vl-filter" [context: string]: nothing -> list<string> {
 def "vl-fields-csv" [context: string]: nothing -> list<string> {
   let prefix = (vl-token $context | str replace --regex '[^,]*$' '')
   vl-field $context | each {|f| $"($prefix)($f)" }
+}
+
+# Completer for `select`'s `--sort-by` / `--drop`: the `--select` projection when one
+# is on the line (you can only sort or drop within the columns you kept), else the
+# full contextual field list. Comma-list aware, like `vl-fields-csv`.
+def "vl-proj-csv" [context: string]: nothing -> list<string> {
+  let prefix = (vl-token $context | str replace --regex '[^,]*$' '')
+  let proj = (vl-csv (vl-flag $context ["--select" "-S"]))
+  let fields = (if ($proj | is-not-empty) { $proj } else { vl-field $context })
+  $fields | each {|f| $"($prefix)($f)" }
+}
+
+# Build the ordered [{expr, name}] stats aggregations from the metric flags. Each
+# field-list flag expands to one function per field, with an auto-derived result
+# column (`avg_<f>`, `p99_<f>`, `uniq_<f>`, …; dots sanitized via `logsql
+# stat-alias`); the fieldless `--count` (row count) becomes `count`. Order follows
+# the parameter order below, fields left-to-right. An empty selection defaults to a
+# single `count()` — so `stats --by level` counts rows per level. Shared by the
+# `stats` verb and its `--sort-by` completer, which needs the same result names.
+def vl-aggs [
+  count: bool, count_uniq: any, sum: any, avg: any, min: any, max: any,
+  median: any, p90: any, p95: any, p99: any
+]: nothing -> list {
+  let f = {|func: string, prefix: string, fields: any|
+    vl-csv $fields | each {|x| {expr: ($func + "(" + $x + ")"), name: ($prefix + "_" + (logsql stat-alias $x))} }
+  }
+  let q = {|phi: string, prefix: string, fields: any|
+    vl-csv $fields | each {|x| {expr: ("quantile(" + $phi + ", " + $x + ")"), name: ($prefix + "_" + (logsql stat-alias $x))} }
+  }
+  let specs = ([
+    (if $count { [{expr: "count()", name: "count"}] })
+    (do $f "count_uniq" "uniq" $count_uniq)
+    (do $f "sum" "sum" $sum)
+    (do $f "avg" "avg" $avg)
+    (do $f "min" "min" $min)
+    (do $f "max" "max" $max)
+    (do $f "median" "median" $median)
+    (do $q "0.9" "p90" $p90)
+    (do $q "0.95" "p95" $p95)
+    (do $q "0.99" "p99" $p99)
+  ] | compact | flatten)
+  if ($specs | is-empty) { [{expr: "count()", name: "count"}] } else { $specs }
+}
+
+# Completer for the post-stats `--sort-by`: the RESULT columns, not log fields —
+# the `--by` group fields plus the aggregation columns implied by the metric flags
+# already on the command line (`--count`→`count`, `--avg lat`→`avg_lat`).
+# Reconstructed from the context (like `vl-flag`) so server-side top-N completes.
+# Comma-list aware, mirroring `vl-fields-csv`.
+def "vl-stat-cols" [context: string]: nothing -> list<string> {
+  let prefix = (vl-token $context | str replace --regex '[^,]*$' '')
+  let by = (vl-csv (vl-flag $context ["--by" "-g"]))
+  let aggs = (vl-aggs
+    ($context =~ '(?:--count|-C)(?:\s|$)')
+    (vl-flag $context ["--count-uniq"]) (vl-flag $context ["--sum"]) (vl-flag $context ["--avg"])
+    (vl-flag $context ["--min"]) (vl-flag $context ["--max"]) (vl-flag $context ["--median"])
+    (vl-flag $context ["--p90"]) (vl-flag $context ["--p95"]) (vl-flag $context ["--p99"]))
+  ($by ++ ($aggs | get name)) | each {|c| $"($prefix)($c)" }
 }
 
 # ---- execution ----------------------------------------------------------------
@@ -269,8 +381,8 @@ export def "raw-query" [
 export def "select" [
   ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
   --select(-S): string@"vl-fields-csv"             # projected fields, comma-separated → `| fields ...`
-  --drop(-D): string@"vl-fields-csv"               # fields to remove, comma-separated → `| delete ...` (inverse of --select)
-  --sort-by(-s): string@"vl-fields-csv"            # sort fields, comma-separated → `| sort by (...)`
+  --drop(-D): string@"vl-proj-csv"                 # fields to remove, comma-separated → `| delete ...` (inverse of --select)
+  --sort-by(-s): string@"vl-proj-csv"              # sort fields, comma-separated → `| sort by (...)`
   --desc(-d)                                       # sort descending (default: ascending)
   --limit(-l): int                                 # `| limit N`
   --before: int                                    # stream_context: N log lines before each match
@@ -302,14 +414,17 @@ export def "select" [
 
 # Per-bucket hit counts over time. Returns tidy `{time, <group>, hits}` rows.
 #
-# The <expr> is the LogsQL filter (default `*`). `--step` sets the bucket width
-# (server default is auto); `--field` groups the counts by that field's values, so
-# each row carries the group columns. The window is `--last` or `--start`/`--end`.
+# Like `select`, the log set is composed from `...filters` — LogsQL filter tokens
+# (`level:error`, `status:>=500`) AND-joined and tab-completing field → value (a raw
+# regex/`OR` filter is just a quoted token); no filters counts everything. `--step`
+# sets the bucket width (server default is auto); `--field` groups the counts by that
+# field's values, so each row carries the group columns. The window is `--last` or
+# `--start`/`--end`.
 @category mole-victorialogs
-@example "hourly error counts over a day" { mole-victorialogs hits 'level:error' --last 1day --step 1hr }
-@example "counts grouped by level" { mole-victorialogs hits '*' --last 6hr --step 30min --field level }
+@example "hourly error counts over a day" { mole-victorialogs hits level:error --last 1day --step 1hr }
+@example "counts grouped by level" { mole-victorialogs hits --last 6hr --step 30min --field level }
 export def "hits" [
-  expr?: string                                    # LogsQL filter (default: *)
+  ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
   --last(-L): duration
   --start(-a): datetime
   --end(-b): datetime
@@ -322,7 +437,7 @@ export def "hits" [
 ] {
   let conf = (vl-conf $connection $url $token $set)
   let range = (vl-range $last $start $end)
-  (client hits $conf ($expr | default "*")
+  (client hits $conf (vl-compose-filter $filters)
     --start (logsql vl-time $range.start) --end (logsql vl-time $range.end)
     --step (logsql step $step) --field $field)
   | logsql hits $in
@@ -335,8 +450,8 @@ export def "hits" [
 # instead — one row per (series, point), `{..labels, metric, time, value}` over the
 # `--last` / `--start`/`--end` window at `--step` resolution (default 1hr).
 @category mole-victorialogs
-@example "instant counts by level" { mole-victorialogs raw-stats 'error | stats count() by (level)' }
-@example "a daily time series" { mole-victorialogs raw-stats '* | stats count() by (level)' --range --last 1day --step 1hr }
+@example "instant counts by level" { mole-victorialogs raw-stats 'error | stats by (level) count()' }
+@example "a daily time series" { mole-victorialogs raw-stats '* | stats by (level) count()' --range --last 1day --step 1hr }
 export def "raw-stats" [
   expr: string                                     # LogsQL ending in `| stats ...`
   --time(-t): datetime                             # instant to evaluate at (default: server now)
@@ -359,6 +474,100 @@ export def "raw-stats" [
   } else {
     (client stats-query $conf $expr --time (logsql vl-time $time)) | logsql stats $in
   }
+}
+
+# Compose and run a LogsQL stats aggregation from the command line, with completion.
+#
+# The autocompleting brother of `raw-stats`: instead of hand-writing the `| stats`
+# pipe you pick aggregations as flags and every part completes. The `...filters`
+# are the same completing filter tokens as `select` — the log set to aggregate.
+# `--by` groups the results (`by (...)`, completing; buckets like `_time:1h` or
+# `status:100` pass through). Each aggregation is a flag taking a comma-list of
+# fields, expanding to one function per field with an auto-named result column:
+# `--sum`/`--avg`/`--min`/`--max`/`--median f` → `avg_f`…, `--count-uniq f` →
+# `uniq_f`, `--p90`/`--p95`/`--p99 f` → `p99_f` (quantiles), and the fieldless
+# `--count` → `count`. With no aggregation flag it counts rows. `--sort-by`
+# (completing the RESULT columns) with `--desc`/`--limit` is server-side top-N.
+#
+# Output is WIDE by default — one row per group, one column per aggregation
+# (`{host, count, avg_latency_ms}`), the SQL-GROUP-BY shape; `--long` keeps the
+# tidy `{..by, metric, value}` rows instead (what `raw-stats` returns). Instant by
+# default (at `--time`, else server now); `--range` returns a time series over the
+# `--last` / `--start`/`--end` window at `--step` resolution (wide rows carry a
+# leading `time`). Anything the flags can't express — a `count() if(...)`
+# conditional, `values()`, an exotic quantile — is a job for `raw-stats`.
+# `--dry-run` returns `{connection, query}` without running.
+@category mole-victorialogs
+@example "count rows per level (count is the default aggregation)" {
+  mole-victorialogs stats --by level --dry-run | get query
+} --result "* | stats by (level) count() as count"
+@example "top 10 hosts by error volume" {
+  mole-victorialogs stats level:error --by host --sort-by count --desc --limit 10 --dry-run | get query
+} --result "level:error | stats by (host) count() as count | sort by (count) desc | limit 10"
+@example "a latency profile per app" {
+  mole-victorialogs stats --by app --avg latency_ms --p95 latency_ms --p99 latency_ms --dry-run | get query
+} --result "* | stats by (app) avg(latency_ms) as avg_latency_ms, quantile(0.95, latency_ms) as p95_latency_ms, quantile(0.99, latency_ms) as p99_latency_ms"
+@example "several fields through one aggregation" {
+  mole-victorialogs stats --by host --sum bytes,latency_ms --dry-run | get query
+} --result "* | stats by (host) sum(bytes) as sum_bytes, sum(latency_ms) as sum_latency_ms"
+@example "distinct values in the last hour, no grouping" {
+  mole-victorialogs stats --count-uniq host --last 1hr --dry-run | get query
+} --result "* | stats count_uniq(host) as uniq_host"
+@example "an hourly error time series" {
+  mole-victorialogs stats level:error --by level --range --last 1day --step 1hr
+}
+export def "stats" [
+  ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined) — the log set to aggregate
+  --by(-g): string@"vl-fields-csv"                 # group-by fields, comma-separated → `by (...)` (buckets ok: `_time:1h`)
+  --count(-C)                                      # count() → `count` (the default when no aggregation is given)
+  --count-uniq: string@"vl-fields-csv"             # count_uniq(f) per field → `uniq_<f>`
+  --sum: string@"vl-fields-csv"                    # sum(f) per field → `sum_<f>`
+  --avg: string@"vl-fields-csv"                    # avg(f) per field → `avg_<f>`
+  --min: string@"vl-fields-csv"                    # min(f) per field → `min_<f>`
+  --max: string@"vl-fields-csv"                    # max(f) per field → `max_<f>`
+  --median: string@"vl-fields-csv"                 # median(f) per field → `median_<f>`
+  --p90: string@"vl-fields-csv"                    # quantile(0.9, f) per field → `p90_<f>`
+  --p95: string@"vl-fields-csv"                    # quantile(0.95, f) per field → `p95_<f>`
+  --p99: string@"vl-fields-csv"                    # quantile(0.99, f) per field → `p99_<f>`
+  --sort-by(-s): string@"vl-stat-cols"             # post-stats sort over RESULT columns → `| sort by (...)`
+  --desc(-d)                                       # sort descending (default: ascending)
+  --limit(-l): int                                 # post-stats `| limit N` (server-side top-N)
+  --range(-r)                                       # time series instead of a single instant
+  --time(-t): datetime                             # instant to evaluate at (default: server now)
+  --last(-L): duration                             # window ending now (shorthand for --start (now - dur))
+  --start(-a): datetime                            # window start (overrides --last)
+  --end(-b): datetime                              # window end (default: now when --last is given)
+  --step: duration = 1hr                           # series step (with --range)
+  --long                                           # keep tidy {..by, metric, value} rows (skip the wide pivot)
+  --connection(-c): string@complete-connection   # named connection (default: current)
+  --url: string                                    # override the connection URL
+  --token: string                                  # override the bearer token
+  --set: record = {}                               # override any other connection field(s)
+  --dry-run(-n)                                     # return {connection, query} instead of running
+] {
+  let conf = (vl-conf $connection $url $token $set)
+  let filter = (vl-compose-filter $filters)
+  let by = (vl-csv $by)
+  let aggs = (vl-aggs $count $count_uniq $sum $avg $min $max $median $p90 $p95 $p99)
+  let q = (logsql build-stats $filter --aggs $aggs --by $by
+    --sort-by (vl-csv $sort_by) --desc=$desc --limit $limit)
+  if $dry_run { return {connection: ($conf | conn redact), query: $q} }
+  # Instant vs range: same endpoints/shapers as raw-stats, then pivot long→wide
+  # (unless --long) keyed on the by-fields (+ time for a range series).
+  let tidy = if $range {
+    let r = (vl-range $last $start $end)
+    (client stats-query-range $conf $q
+      --start (logsql vl-time $r.start) --end (logsql vl-time $r.end) --step (logsql step $step))
+    | logsql stats-range $in
+  } else {
+    (client stats-query $conf $q --time (logsql vl-time $time)) | logsql stats $in
+  }
+  if $long { return $tidy }
+  # Bucket syntax in --by (`_time:1h`) labels the response column by the bare
+  # field, so strip the `:bucket` suffix when naming the pivot's key columns.
+  let labels = ($by | each {|b| $b | split row ":" | first | str trim })
+  let keys = (if $range { ["time"] ++ $labels } else { $labels })
+  logsql stats-wide $tidy --keys $keys --cols ($aggs | get name)
 }
 
 # List the field names present in a query's results, with hit counts.

@@ -1,7 +1,7 @@
 # mole-sql — generic SQL LIBRARY (dialect-agnostic). Not a plugin/driver: it
 # exposes shared helpers that dialect plugins (mole-psql, mole-mysql) import via
 # `use mole-sql/sql.nu` (→ `sql build-select`, …). No export-env, no driver
-# registration; its mole-core dependency is declared as `api` in mole.nuon.
+# registration, no manifest — a pure library discovered via `NU_LIB_DIRS`.
 #
 # LAYERING: this file is a PURE library — it `use`s NOTHING (not mole core, not
 # any submodule) and every command is data-in / data-out with no I/O. Anything

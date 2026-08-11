@@ -28,9 +28,9 @@ sibling repo — mole's source is never edited, and there is no umbrella or
 │   └── lib/                  # plumbing, imported per concern (never user-visible)
 │       └── config.nu · conn.nu · cache.nu · query.nu · complete.nu
 ├── mole-sql/                 # a driver submodule (stub): `use mole/lib/*.nu`
-│   ├── mod.nu · mole.nuon
+│   ├── mod.nu
 └── mole-vlogs/               # a driver submodule (stub)
-    ├── mod.nu · mole.nuon
+    ├── mod.nu
 ```
 
 ## How it fits together
@@ -44,8 +44,9 @@ sibling repo — mole's source is never edited, and there is no umbrella or
   mole/lib/conn.nu` → `conn resolve` (a bare path resolved through
   `$env.NU_LIB_DIRS`; file modules keep their `.nu` extension).
 - **Registry self-assembles.** Each submodule's `export-env` runs on `use`,
-  registering its `mole.nuon` into `$env.MOLE_REGISTRY`; loading several
-  accumulates them. Its one consumer today is driver-scoped `--driver` completion.
+  calling `conn register "<driver>"` to announce its driver name into
+  `$env.MOLE_REGISTRY`; loading several accumulates them. No manifest file — just
+  the name. Its one consumer today is driver-scoped `--driver` completion.
 - **Install by hand.** Clone a submodule anywhere on `$env.NU_LIB_DIRS` (a shared
   modules dir, or beside `mole/`), then add a `use mole-<tool>` line. Update or pin
   with plain `git`. mole does not wrap this for now.

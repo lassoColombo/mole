@@ -1,8 +1,8 @@
 # mole-promql — generic Prometheus-HTTP-API LIBRARY (tool-agnostic). Not a
 # plugin/driver: it exposes shared helpers that metrics plugins (mole-prometheus,
 # mole-victoriametrics, …) import via `use mole-promql/promql.nu` (→ `promql
-# normalize`, `promql build`, …). No export-env, no driver registration; its
-# mole-core dependency is declared as `api` in mole.nuon.
+# normalize`, `promql build`, …). No export-env, no driver registration, no
+# manifest — a pure library discovered via `NU_LIB_DIRS`.
 #
 # LAYERING: this file is a PURE library — it `use`s NOTHING (not mole core, not
 # any plugin) and every command is data-in / data-out with NO I/O and NO clock.

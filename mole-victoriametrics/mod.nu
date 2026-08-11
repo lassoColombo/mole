@@ -5,7 +5,7 @@
 # `labels` / `label-values` / `metrics`, plus two VictoriaMetrics-specific reads
 # `tsdb-status` / `export-samples`. It talks to VictoriaMetrics over its
 # Prometheus-compatible HTTP querying API using Nushell's built-in `http` (no
-# external CLI), so `requires: []` in mole.nuon.
+# external CLI), with no external dependencies.
 #
 # CLOSE PORT OF mole-prometheus: VictoriaMetrics is Prometheus-querying-API
 # compatible — same `/api/v1` endpoints, same request params, same response
@@ -41,12 +41,8 @@ use mole/lib/complete.nu
 use ./client.nu
 use ./promql.nu
 
-const HERE = (path self | path dirname)
-
 export-env {
-  let m = (open ([$HERE mole.nuon] | path join))
-  $env.MOLE_REGISTRY = (($env.MOLE_REGISTRY? | default {}) | upsert $m.driver $m)
-  $env.MOLE_CURRENT = ($env.MOLE_CURRENT? | default {})
+  conn register "victoriametrics"
 }
 
 # ---- connection resolution ----------------------------------------------------

@@ -16,7 +16,8 @@
 # NOTE: submodule management (`mole submodules …`) and the version/compatibility
 # contract were removed for now — mole is currently just config + query
 # management plus the shared lib/ plumbing. Submodules still self-register into
-# `$env.MOLE_REGISTRY` at load (powering `--driver` resolution), and they import
+# `$env.MOLE_REGISTRY` at load via `conn register "<driver>"` (powering `--driver`
+# resolution — a set of loaded driver names, no manifest file), and they import
 # lib concerns directly.
 
 use ./lib/config.nu

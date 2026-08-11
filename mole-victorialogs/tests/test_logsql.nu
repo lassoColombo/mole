@@ -254,3 +254,65 @@ def "build-pipeline assembles filter plus stages in order" [] {
     ) "level:error | stream_context after 1 | fields _time, _msg, host | sort by (_time) desc | limit 5"
 }
 
+# ---- stats building (composable `stats`) --------------------------------------
+
+@test
+def "stat-alias sanitizes field names into result-name suffixes" [] {
+    assert equal (logsql stat-alias "latency_ms") "latency_ms"
+    assert equal (logsql stat-alias "tags.n") "tags_n"       # VL flattened dotted key
+    assert equal (logsql stat-alias "a-b.c") "a_b_c"
+}
+
+@test
+def "build-stats puts the by-clause before the functions" [] {
+    assert equal (logsql build-stats "*" --aggs [{expr: "count()", name: "count"}]) "* | stats count() as count"
+    assert equal (logsql build-stats "" --aggs [{expr: "count()", name: "count"}]) "* | stats count() as count"   # empty filter → *
+    # grouped, multi-aggregation — `by (...)` precedes the functions (the syntax this VL build wants)
+    assert equal (
+        logsql build-stats "level:error" --by [host] --aggs [{expr: "count()", name: "count"} {expr: "avg(latency_ms)", name: "avg_latency_ms"}]
+    ) "level:error | stats by (host) count() as count, avg(latency_ms) as avg_latency_ms"
+    # post-stats top-N over a result column
+    assert equal (
+        logsql build-stats "*" --by [host] --aggs [{expr: "count()", name: "count"}] --sort-by [count] --desc --limit 10
+    ) "* | stats by (host) count() as count | sort by (count) desc | limit 10"
+    # --desc without a sort field emits no sort stage
+    assert equal (logsql build-stats "*" --aggs [{expr: "count()", name: "count"}] --desc) "* | stats count() as count"
+    # a multi-field by-clause carries bucket syntax verbatim
+    assert equal (
+        logsql build-stats "*" --by ["_time:1h" level] --aggs [{expr: "count()", name: "count"}]
+    ) "* | stats by (_time:1h, level) count() as count"
+}
+
+@test
+def "stats-wide pivots tidy rows into one wide row per group" [] {
+    # a column per aggregation; the result is rectangular (a group missing one gets null)
+    let long = [
+        {level: error, metric: count, value: 2}
+        {level: error, metric: avg_bytes, value: 512.0}
+        {level: info, metric: count, value: 3}
+    ]
+    assert equal (logsql stats-wide $long --keys [level] --cols [count avg_bytes]) [
+        {level: error, count: 2, avg_bytes: 512.0}
+        {level: info, count: 3, avg_bytes: null}
+    ]
+}
+
+@test
+def "stats-wide preserves group order and leads with time for a series" [] {
+    # first-seen group order is kept, so a server-side top-N sort/limit survives the pivot
+    assert equal (
+        logsql stats-wide [{host: h2, metric: count, value: 5} {host: h1, metric: count, value: 3}] --keys [host] --cols [count]
+    ) [{host: h2, count: 5} {host: h1, count: 3}]
+    # range: `time` is a key column, led first
+    assert equal (
+        logsql stats-wide [{level: error, metric: count, value: 2, time: 2024-01-01T00:00:00Z}] --keys [time level] --cols [count]
+    ) [{time: 2024-01-01T00:00:00Z, level: error, count: 2}]
+}
+
+@test
+def "stats-wide passes non-stats input through unchanged" [] {
+    assert equal (logsql stats-wide []) []
+    assert equal (logsql stats-wide "nope") "nope"
+    assert equal (logsql stats-wide [{a: 1}]) [{a: 1}]        # no `metric` column → not stats-shaped
+}
+

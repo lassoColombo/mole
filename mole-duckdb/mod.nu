@@ -4,8 +4,7 @@
 # driver, and exposes the user verbs `raw-query` / `select` / `schema`. It DEPENDS on:
 #   - mole core plumbing        (`use mole/lib/*.nu`)
 #   - the generic mole-sql pure LIBRARY (`use mole-sql/sql.nu`)
-# The library dependency is also declared in mole.nuon (`deps`) so `mole
-# submodules doctor` can verify it's installed and version-compatible.
+# The mole-sql library must be reachable via `NU_LIB_DIRS`.
 #
 # LAYERING: everything driver-specific (how to invoke duckdb, the introspection
 # SQL, the type map, the danger regex) and all orchestration (resolve → exec →
@@ -26,12 +25,8 @@ use mole/lib/query.nu
 use mole/lib/complete.nu
 use mole-sql/sql.nu
 
-const HERE = (path self | path dirname)
-
 export-env {
-  let m = (open ([$HERE mole.nuon] | path join))
-  $env.MOLE_REGISTRY = (($env.MOLE_REGISTRY? | default {}) | upsert $m.driver $m)
-  $env.MOLE_CURRENT = ($env.MOLE_CURRENT? | default {})
+  conn register "duckdb"
 }
 
 # ---- dialect specifics (duckdb) ----------------------------------------------

@@ -3,8 +3,7 @@
 # A PLUGIN (data source): supports the `prometheus` driver, registers itself as a
 # driver, and exposes read-only verbs — `raw-query` / `raw-query-range` / `series` /
 # `labels` / `label-values` / `metrics`. It talks to Prometheus over its HTTP API
-# using Nushell's built-in `http` (no external CLI), so `requires: []` in
-# mole.nuon.
+# using Nushell's built-in `http` (no external CLI), with no external dependencies.
 #
 # LAYERING (two files, like the old client+wrapper split):
 #   - client.nu  — GENERATED, do not edit. A lean, typed HTTP client for the
@@ -32,12 +31,8 @@ use mole/lib/complete.nu
 use ./client.nu
 use mole-promql/promql.nu
 
-const HERE = (path self | path dirname)
-
 export-env {
-  let m = (open ([$HERE mole.nuon] | path join))
-  $env.MOLE_REGISTRY = (($env.MOLE_REGISTRY? | default {}) | upsert $m.driver $m)
-  $env.MOLE_CURRENT = ($env.MOLE_CURRENT? | default {})
+  conn register "prometheus"
 }
 
 # ---- connection resolution ----------------------------------------------------

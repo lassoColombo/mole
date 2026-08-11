@@ -153,6 +153,58 @@ export def "build-pipeline" [
   ] | where {|x| $x | is-not-empty } | str join " "
 }
 
+# ---- stats building (pure; the aggregation sibling of `build-pipeline`) --------
+# Render the `| stats` aggregation pipeline for the composable `stats` verb from
+# structured parts. No I/O — mod.nu resolves the connection/window and runs it.
+
+# Sanitize a field name into a valid LogsQL stats result-name suffix: any
+# non-word character (notably the `.` in VictoriaLogs' flattened keys like
+# `tags.n`) becomes `_`, so an auto-generated alias such as `avg_tags_n` parses.
+@category mole-victorialogs
+@example "a plain field is unchanged" { logsql stat-alias "latency_ms" } --result "latency_ms"
+@example "dotted keys collapse to underscores" { logsql stat-alias "tags.n" } --result "tags_n"
+export def "stat-alias" [field: string]: nothing -> string {
+  $field | str replace --all --regex '[^\w]' '_'
+}
+
+# Assemble a `| stats` pipeline: an optional `by (...)` grouping clause, then the
+# aggregation functions, then an optional post-stats `sort by (...)` / `limit`.
+# `aggs` is an ordered list of `{expr, name}` records rendered `expr as name`. The
+# `by (...)` clause comes BEFORE the functions — the order this VictoriaLogs build
+# requires (`stats by (level) count()`, not `stats count() by (level)`). The
+# post-stats sort/limit runs over the RESULT columns (server-side top-N). An empty
+# filter becomes `*`; empty stages are dropped. Mirrors `build-pipeline`.
+@category mole-victorialogs
+@example "a bare count" {
+  logsql build-stats "*" --aggs [{expr: "count()", name: "count"}]
+} --result "* | stats count() as count"
+@example "grouped, multi-aggregation" {
+  logsql build-stats "level:error" --by [host] --aggs [{expr: "count()", name: "count"} {expr: "avg(latency_ms)", name: "avg_latency_ms"}]
+} --result "level:error | stats by (host) count() as count, avg(latency_ms) as avg_latency_ms"
+@example "top-N: sort by a result column, then limit" {
+  logsql build-stats "*" --by [host] --aggs [{expr: "count()", name: "count"}] --sort-by [count] --desc --limit 10
+} --result "* | stats by (host) count() as count | sort by (count) desc | limit 10"
+export def "build-stats" [
+  filter: string                 # the LogsQL filter (empty → `*`)
+  --aggs: list<any> = []         # ordered [{expr, name}] → `expr as name, ...` (the stats functions)
+  --by: list<string> = []        # group-by fields → `by (a, b)` (may carry buckets, e.g. `_time:1h`)
+  --sort-by: list<string> = []   # post-stats sort over result columns → `| sort by (a, b)`
+  --desc                         # sort descending (default: ascending)
+  --limit: int                   # post-stats `| limit N`
+]: nothing -> string {
+  let stats = ([
+    "| stats"
+    (if ($by | is-not-empty) { "by (" + ($by | str join ", ") + ")" })
+    ($aggs | each {|a| $"($a.expr) as ($a.name)" } | str join ", ")
+  ] | where {|x| $x | is-not-empty } | str join " ")
+  [
+    (if ($filter | is-empty) { "*" } else { $filter })
+    $stats
+    (if ($sort_by | is-not-empty) { "| sort by (" + ($sort_by | str join ", ") + ")" + (if $desc { " desc" } else { "" }) })
+    (if $limit != null { $"| limit ($limit)" })
+  ] | where {|x| $x | is-not-empty } | str join " "
+}
+
 # ---- query (JSONL) ------------------------------------------------------------
 
 # A JSON-lines body → a table of records, one row per non-blank line. Every value
@@ -388,6 +440,51 @@ export def "stats" [resp: any]: nothing -> any {
 export def "stats-range" [resp: any]: nothing -> any {
   if (($resp | describe) !~ '^record') { return $resp }
   stats-matrix ($resp | get -o data | get -o result | default [])
+}
+
+# Pivot the tidy Prometheus-shaped stats rows (`{..labels, metric, value}`, plus a
+# `time` column for a range series) into WIDE rows — one row per group, each
+# aggregation its own column (`{level, count, avg_bytes}`). The group key is every
+# column except `metric`/`value`; `--keys` gives those columns a leading order (the
+# `by` fields, `time` first for a series) and `--cols` orders the aggregation
+# columns (their flag order). First-seen group order is preserved, so a server-side
+# top-N `sort`/`limit` survives the pivot; the result is rectangular — a group
+# missing an aggregation gets a null in that column. Non-stats input is returned
+# unchanged. This wide reshape is what makes the structured `stats` verb read like
+# SQL GROUP BY, while `raw-stats` keeps the tidy long shape.
+@category mole-victorialogs
+@example "instant: one row per group, a column per aggregation" {
+  logsql stats-wide [{level: error, metric: count, value: 2} {level: error, metric: avg_bytes, value: 512.0} {level: info, metric: count, value: 3}] --keys [level] --cols [count avg_bytes]
+} --result [{level: error, count: 2, avg_bytes: 512.0} {level: info, count: 3, avg_bytes: null}]
+@example "range: time leads each row" {
+  logsql stats-wide [{level: error, metric: count, value: 2, time: 2024-01-01T00:00:00Z}] --keys [time level] --cols [count]
+} --result [{time: 2024-01-01T00:00:00Z, level: error, count: 2}]
+export def "stats-wide" [
+  rows: any
+  --keys: list<string> = []      # key columns to lead with, in order (else inferred)
+  --cols: list<string> = []      # aggregation columns, in order (else first-seen)
+]: nothing -> any {
+  if (($rows | describe) !~ '^(table|list)') { return $rows }
+  if ($rows | is-empty) { return $rows }
+  let present = ($rows | each {|r| $r | columns } | flatten | uniq)
+  if ("metric" not-in $present) { return $rows }
+  let keycols = (
+    ($keys | where {|k| $k in $present })
+    ++ ($present | where {|c| ($c not-in ["metric" "value"]) and ($c not-in $keys) })
+  )
+  let wide = ($rows | reduce --fold [] {|r, acc|
+    let keyrec = ($keycols | reduce --fold {} {|k, m| $m | insert $k ($r | get -o $k) })
+    let name = ($r | get -o metric | into string)
+    let hit = ($acc | enumerate | where {|e| $keycols | all {|k| ($e.item | get -o $k) == ($keyrec | get -o $k) } } | get -o 0)
+    if ($hit == null) {
+      $acc | append ($keyrec | upsert $name ($r | get -o value))
+    } else {
+      $acc | update $hit.index {|row| $row | upsert $name ($r | get -o value) }
+    }
+  })
+  let metriccols = ($wide | each {|r| $r | columns } | flatten | uniq | where {|c| $c not-in $keycols })
+  let ordered = (($cols | where {|c| $c in $metriccols }) ++ ($metriccols | where {|c| $c not-in $cols }))
+  $wide | each {|r| $r | core-select --optional ...($keycols ++ $ordered) }
 }
 
 # ---- value / stream enumeration ----------------------------------------------

@@ -1,0 +1,46 @@
+# Local dev / test MongoDB for the mole-mongodb plugin.
+#
+#   docker compose -f mole-mongodb/_devutils/docker-compose.yaml up -d --wait
+#
+# Obscure host port 57017 (→ container 27017, MongoDB's default) to avoid colliding
+# with a local mongod. Matches the `mongodb-local-dev` connection under the
+# `mongodb:` section of ~/.config/mole/connections.yaml:
+#
+#   connections:
+#     mongodb:
+#       - name: mongodb-local-dev
+#         host: localhost
+#         port: 57017
+#         database: demo
+#
+# SEEDING — the official `mongo` image runs *.js in /docker-entrypoint-initdb.d on
+# FIRST boot (against MONGO_INITDB_DATABASE), so initdb/seed.js populates `demo`
+# with no sidecar (unlike mole-victorialogs, whose scratch image has no such hook).
+# The seed exercises the BSON type map (ObjectId, ISODate, NumberInt/Long,
+# Decimal128, nested docs, arrays), mixed-type fields (schema inference), and a
+# view (the `collections` type column). initdb runs only when the data volume is
+# empty — `docker compose ... down -v` first to re-seed from scratch.
+#
+# No auth (local dev): the connection carries just host/port/database. The plugin's
+# --user/--password/--auth-source override flags are still wired for real servers.
+name: mole-mongodb-devutils
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: mole-mongodb-local-dev
+    environment:
+      MONGO_INITDB_DATABASE: demo
+    ports:
+      - "57017:27017"
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - mole-mongodb-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  mole-mongodb-data:

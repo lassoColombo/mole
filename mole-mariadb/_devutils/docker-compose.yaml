@@ -1,0 +1,47 @@
+# Local dev / test engine for the mole-mariadb plugin.
+#
+#   docker compose -f mole-mariadb/_devutils/docker-compose.yaml up -d
+#
+# mole-mariadb exec is `^mariadb` over the MYSQL WIRE PROTOCOL. MariaDB speaks the
+# same wire and exposes the same information_schema our introspection reads, so the
+# plugin shares ALL of its dialect logic with mole-mysql (via mole-myql). Two
+# things make it a separate plugin rather than a mysql connection:
+#   - the CLIENT BINARY is `mariadb`. Modern MariaDB packages ship it and no longer
+#     guarantee the legacy `mysql` symlink, so a MariaDB-only host uses this plugin.
+#   - JSON is an ALIAS for LONGTEXT, so information_schema.data_type reports
+#     `longtext` (not `json`): the json cell-converter never fires and JSON columns
+#     come back as STRINGS (parse with `from json` yourself). This is the one
+#     typing divergence from mole-mysql, and the reason for two plugins.
+#
+# The official image honors the MYSQL_* env for drop-in compatibility and runs
+# ./initdb *.sql on first boot. File the connection under the `mariadb:` section.
+#
+# Host-port map (→ container 3306):
+#   mariadb   53317   (mariadb:11)   connection mariadb-local-dev
+#
+# The seed (initdb/01-seed.sql) is the mole-mysql seed verbatim — MariaDB accepts
+# the same DDL — so `schema`/`select`/`raw-query` can be exercised end to end. It
+# still declares a `json` column: MariaDB stores it as LONGTEXT, which is exactly
+# the behaviour this plugin documents (the column reads back as a string).
+name: mole-mariadb-devutils
+
+services:
+  mariadb:
+    image: mariadb:11
+    container_name: mole-mariadb-local-dev
+    environment:
+      MYSQL_ROOT_PASSWORD: mole
+      MYSQL_DATABASE: demo
+    ports:
+      - "53317:3306"
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - mole-mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  mole-mariadb-data:

@@ -53,8 +53,8 @@ on-disk layout**: cross-module imports go through `NU_LIB_DIRS` discovery
 │   ├── cfg.nu    # `mole cfg show/file/dir/edit`
 │   └── lib/      # plumbing concerns (private to mole; imported by submodules)
 │       ├── config.nu · conn.nu · cache.nu · query.nu · complete.nu
-├── mole-sql/    mod.nu · mole.nuon      (`use mole/lib/*.nu`)
-└── mole-vlogs/  mod.nu · mole.nuon
+├── mole-sql/    mod.nu      (`use mole/lib/*.nu`)
+└── mole-vlogs/  mod.nu
 ```
 
 `use mole` exposes **only management commands**: `mole cfg …` (connection config)
@@ -80,30 +80,29 @@ type results, how to exec).
 
 ## 5. The self-assembling registry — `$env.MOLE_REGISTRY`
 
-A record keyed by driver, built at load by each submodule's own `export-env`:
+A set of loaded driver names (`{<driver>: true}`), built at load by each
+submodule's own `export-env` via `conn register`:
 
 ```nushell
 # in mole-sql/mod.nu
 use mole/lib/conn.nu
-const HERE = (path self | path dirname)
 export-env {
-  let m = (open ([$HERE mole.nuon] | path join))   # its manifest (data)
-  $env.MOLE_REGISTRY = (($env.MOLE_REGISTRY? | default {}) | upsert $m.driver $m)
-  $env.MOLE_CURRENT  = ($env.MOLE_CURRENT? | default {})
+  conn register "sql"   # upserts {sql: true} into $env.MOLE_REGISTRY; seeds $env.MOLE_CURRENT
 }
 ```
 
-The registry's keys are the loaded driver names; `conn`'s `--driver` completer
+`conn register` (a `def --env` in `lib/conn.nu`) is the whole mechanism — no
+manifest, no file read; a submodule announces just its own driver name. The
+registry's keys are the loaded driver names; `conn`'s `--driver` completer
 (`driver-names`) reads them. (Connections are resolved from the driver-keyed
 config directly — §7 — so resolution itself needs no registry lookup.)
 
 ## 6. Submodule contract
 
 A `mole-<tool>` directory must:
-1. Ship `mole.nuon`: `{ kind, driver, version, family?, suffix?, summary }`. (Manifests may still carry `api`/`deps` fields — currently **dormant**, kept as forward-looking data for an eventual package manager; nothing reads them today.)
-2. `use mole/lib/<concern>.nu` for the plumbing it needs (no `*`); annotate completers `@"complete connection"`.
-3. Define verbs with clean names (`export def "select"` → `mole-<tool> select`).
-4. In `export-env`, upsert its manifest into `$env.MOLE_REGISTRY`.
+1. `use mole/lib/<concern>.nu` for the plumbing it needs (no `*`); annotate completers `@"complete connection"`.
+2. Define verbs with clean names (`export def "select"` → `mole-<tool> select`).
+3. In `export-env`, call `conn register "<driver>"` to announce its driver name into `$env.MOLE_REGISTRY`.
 
 `mole-sql`/`mole-vlogs` in this workspace are stubs demonstrating the contract.
 

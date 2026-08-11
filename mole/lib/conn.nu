@@ -32,6 +32,23 @@ def read-connections []: nothing -> list {
   $conns | items {|driver, rows| ($rows | default []) | each {|c| $c | upsert driver $driver } } | flatten
 }
 
+# Register a loaded driver into the session registry.
+#
+# Called from each submodule's `export-env` so `--driver` completion
+# (`driver-names`) can suggest it. The registry is a set of loaded driver names
+# ({<driver>: true}); entries accumulate across submodules, so a driver only
+# needs to announce its own name — no manifest, no file read. Also seeds
+# `$env.MOLE_CURRENT` so `set-connection` / `resolve --driver` have a map to
+# upsert into. Idempotent.
+@category mole-lib
+@example "register this submodule's driver" { register "psql" }
+export def --env "register" [
+  driver: string   # The driver name this submodule provides
+]: nothing -> nothing {
+  $env.MOLE_REGISTRY = (($env.MOLE_REGISTRY? | default {}) | upsert $driver true)
+  $env.MOLE_CURRENT = ($env.MOLE_CURRENT? | default {})
+}
+
 # Completer: driver names, from the self-assembled registry.
 #
 # Local (not from lib/complete) on purpose: `complete` imports this module, so

@@ -3,8 +3,7 @@
 # A PLUGIN (data source): supports the `alertmanager` driver, registers itself as
 # a driver, and exposes read-only verbs — `alerts` / `alert-groups` / `silences` /
 # `silence` / `receivers` / `status`. It talks to Alertmanager over its v2 HTTP
-# API using Nushell's built-in `http` (no external CLI), so `requires: []` in
-# mole.nuon.
+# API using Nushell's built-in `http` (no external CLI), with no external dependencies.
 #
 # LAYERING (two files, like mole-prometheus's client+wrapper split):
 #   - client.nu       — GENERATED, do not edit. A lean, typed HTTP client for the
@@ -36,12 +35,8 @@ use mole/lib/complete.nu
 use ./client.nu
 use ./alertmanager.nu
 
-const HERE = (path self | path dirname)
-
 export-env {
-  let m = (open ([$HERE mole.nuon] | path join))
-  $env.MOLE_REGISTRY = (($env.MOLE_REGISTRY? | default {}) | upsert $m.driver $m)
-  $env.MOLE_CURRENT = ($env.MOLE_CURRENT? | default {})
+  conn register "alertmanager"
 }
 
 # ---- connection resolution ----------------------------------------------------

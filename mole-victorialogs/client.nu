@@ -144,8 +144,9 @@ export def "field-names" [
   query: string
   --start: string
   --end: string
+  --timeout: duration
 ] {
-  request $conf "/select/logsql/field_names" { query: $query, start: $start, end: $end } | from json
+  request $conf "/select/logsql/field_names" { query: $query, start: $start, end: $end } --timeout $timeout | from json
 }
 
 # Distinct values of <field> in the query results. Returns `{values: [...]}`.
@@ -169,8 +170,9 @@ export def "stream-field-names" [
   query: string
   --start: string
   --end: string
+  --timeout: duration
 ] {
-  request $conf "/select/logsql/stream_field_names" { query: $query, start: $start, end: $end } | from json
+  request $conf "/select/logsql/stream_field_names" { query: $query, start: $start, end: $end } --timeout $timeout | from json
 }
 
 # Distinct values of stream label <field>. Returns `{values: [...]}`.
