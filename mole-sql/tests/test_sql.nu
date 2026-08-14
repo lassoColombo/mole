@@ -224,6 +224,84 @@ def "schema-find matches names and comments case-insensitively" [] {
     assert equal (sql schema-find (sample-data) "users" | where kind == "table" | length) 1
 }
 
+# ---- schema filtering ---------------------------------------------------------
+
+# A multi-table fixture with a cross-table foreign key (orders.user_id → users.id),
+# so the dangling-FK pruning has something to bite on.
+def filter-data [] {
+    {
+        meta: {driver: psql}
+        tables: [
+            {schema: public, name: users,     type: "BASE TABLE", comment: null, row_estimate: 5}
+            {schema: public, name: orders,    type: "BASE TABLE", comment: null, row_estimate: 9}
+            {schema: public, name: audit_log, type: "BASE TABLE", comment: "housekeeping", row_estimate: 99}
+        ]
+        columns: [
+            {schema: public, table: users,     name: id,      nullable: false}
+            {schema: public, table: orders,    name: id,      nullable: false}
+            {schema: public, table: orders,    name: user_id, nullable: false}
+            {schema: public, table: audit_log, name: id,      nullable: false}
+        ]
+        constraints: [
+            {schema: public, table: users,  name: users_pk, type: "PRIMARY KEY", columns: [id], ref_schema: null, ref_table: null, ref_columns: null}
+            {schema: public, table: orders, name: orders_users_fk, type: "FOREIGN KEY", columns: [user_id], ref_schema: public, ref_table: users, ref_columns: [id]}
+        ]
+    }
+}
+
+@test
+def "schema-filter with no patterns returns data untouched" [] {
+    assert equal (sql schema-filter (filter-data)) (filter-data)
+}
+
+@test
+def "schema-filter --only keeps just the listed tables and prunes their columns" [] {
+    let r = (sql schema-filter (filter-data) --only [users])
+    assert equal ($r.tables | get name) [users]
+    assert equal ($r.columns | get table | uniq) [users]
+    assert equal ($r.meta.driver) "psql"   # extra top-level keys survive
+}
+
+@test
+def "schema-filter --exclude drops matching tables, glob patterns included" [] {
+    assert equal (sql schema-filter (filter-data) --exclude ["*_log"] | get tables.name) [users orders]
+    assert equal (sql schema-filter (filter-data) --exclude [audit_log] | get tables.name) [users orders]
+}
+
+@test
+def "schema-filter drops a FK whose referenced table was pruned away" [] {
+    # keep orders, drop users → the orders→users FK would dangle; it must be removed
+    let r = (sql schema-filter (filter-data) --only [orders])
+    assert equal ($r.tables | get name) [orders]
+    assert equal ($r.constraints | length) 0
+}
+
+@test
+def "schema-filter keeps an FK when both endpoints survive" [] {
+    let r = (sql schema-filter (filter-data) --only [users orders])
+    assert equal ($r.constraints | where type == "FOREIGN KEY" | length) 1
+}
+
+@test
+def "schema-filter applies exclude after only, so exclude wins on overlap" [] {
+    let r = (sql schema-filter (filter-data) --only [users orders] --exclude [orders])
+    assert equal ($r.tables | get name) [users]
+}
+
+@test
+def "schema-filter matches qualified patterns against schema and name" [] {
+    assert equal (sql schema-filter (filter-data) --only ["public.orders"] | get tables.name) [orders]
+    # a wrong schema qualifier matches nothing
+    assert equal (sql schema-filter (filter-data) --only ["other.orders"] | get tables.name) []
+}
+
+@test
+def "csv-split normalizes a comma flag to a clean list" [] {
+    assert equal (sql csv-split "a, b ,,c") [a b c]
+    assert equal (sql csv-split "") []
+    assert equal (sql csv-split null) []
+}
+
 # ---- completion helpers -------------------------------------------------------
 
 @test

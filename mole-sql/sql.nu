@@ -417,6 +417,99 @@ export def "schema-body" [
   }
 }
 
+# ---- schema filtering (prune a cached `data` record to a table subset) --------
+
+# Split a comma-separated flag value into a clean `list<string>` (trims, drops
+# blanks); `null`/"" → `[]`. The list-valued schema filters (`--only a,b`) reach a
+# verb as ONE comma-joined string — Nushell can't complete inside a `[...]` list
+# literal — so this normalizes that wire form to the list the pure helpers want.
+@category mole-sql
+@example "split a comma list, trimming blanks and empties" {
+  sql csv-split "users, public.orders ,"
+} --result [users, public.orders]
+@example "null or empty yields an empty list" {
+  sql csv-split null
+} --result []
+export def "csv-split" [v: any]: nothing -> list<string> {
+  $v | default "" | into string | split row "," | str trim | where {|x| $x | is-not-empty }
+}
+
+# Does `value` match `pattern`? Plain string equality, UNLESS the pattern carries a
+# `*` wildcard — then `*` matches any run of characters and every other character
+# (`.` included) stays literal. Case-sensitive, like the rest of the schema helpers.
+def name-like [pattern: string, value: string]: nothing -> bool {
+  if not ($pattern | str contains "*") { return ($value == $pattern) }
+  let rx = "^" + ($pattern | split row "*" | each {|seg|
+    $seg | str replace --all --regex '([.^$+?(){}\[\]|\\])' '\${1}'
+  } | str join ".*") + "$"
+  $value =~ $rx
+}
+
+# Does table `schema`.`name` match ANY of `patterns`? A pattern is either BARE
+# (`users` / `tmp_*` — matches the NAME in any schema) or SCHEMA-QUALIFIED
+# (`public.users` / `public.*` — matches schema AND name); either side may glob
+# with `*`. An empty `patterns` list matches nothing.
+def table-matches [schema: string, name: string, patterns: list<string>]: nothing -> bool {
+  $patterns | any {|p|
+    let parts = ($p | split row ".")
+    if ($parts | length) >= 2 {
+      (name-like ($parts | first) $schema) and (name-like ($parts | skip 1 | str join ".") $name)
+    } else {
+      name-like $p $name
+    }
+  }
+}
+
+# Prune a schema-cache record to a subset of its tables, kept self-contained.
+#
+# `--only` keeps ONLY matching tables (empty = keep all); `--exclude` then drops
+# matching tables (applied AFTER `--only`, so on overlap exclude wins). Patterns are
+# bare or `schema.`-qualified names, either side globbable with `*` (see
+# `table-matches`). Besides removing the pruned tables' own rows from
+# `tables`/`columns`/`constraints`, it also drops any FOREIGN KEY whose REFERENCED
+# table was pruned away — otherwise that dangling relationship would make Mermaid
+# auto-create a phantom entity for a table you deliberately excluded. Extra
+# top-level keys (`meta`) survive, and with no filters `data` is returned untouched.
+# This backs `schema --only/--exclude`, so a filtered `schema --full` feeds
+# `mole-mermaid` a diagram of exactly the tables you want.
+@category mole-sql
+@example "keep only some tables — a now-dangling FK into a dropped table goes too" {
+  let data = {
+    tables: [{schema: public, name: users, type: "BASE TABLE", comment: null, row_estimate: 0}
+             {schema: public, name: orders, type: "BASE TABLE", comment: null, row_estimate: 0}]
+    columns: [{schema: public, table: orders, name: user_id, nullable: false}]
+    constraints: [{schema: public, table: orders, name: fk, type: "FOREIGN KEY", columns: [user_id], ref_schema: public, ref_table: users, ref_columns: [id]}]
+  }
+  let r = (sql schema-filter $data --only [orders])
+  [($r.tables | get name) ($r.constraints | length)]
+} --result [[orders], 0]
+@example "exclude housekeeping tables by glob" {
+  let data = {tables: [{schema: public, name: users} {schema: public, name: audit_log}], columns: [], constraints: []}
+  sql schema-filter $data --exclude ["*_log"] | get tables.name
+} --result [users]
+export def "schema-filter" [
+  data: record                  # a schema-cache record ({tables, columns, constraints}; `meta` & extra keys kept)
+  --only: list<string> = []     # keep ONLY tables matching these bare/qualified names or `*` globs
+  --exclude: list<string> = []  # drop tables matching these (applied after --only)
+]: nothing -> record {
+  if ($only | is-empty) and ($exclude | is-empty) { return $data }
+  let kept = ($data | get -o tables | default [] | where {|t|
+    let inc = (($only | is-empty) or (table-matches $t.schema $t.name $only))
+    let exc = (($exclude | is-not-empty) and (table-matches $t.schema $t.name $exclude))
+    $inc and (not $exc)
+  })
+  let keys = ($kept | each {|t| $"($t.schema).($t.name)" })
+  let in_set = {|sch, nam| $"($sch).($nam)" in $keys }
+  let columns = ($data | get -o columns | default [] | where {|c| do $in_set $c.schema $c.table })
+  let constraints = ($data | get -o constraints | default [] | where {|c|
+    (do $in_set $c.schema $c.table) and (
+      ($c.type != "FOREIGN KEY") or (($c | get -o ref_table) == null)
+      or (do $in_set ($c | get -o ref_schema | default $c.schema) ($c | get -o ref_table))
+    )
+  })
+  $data | merge {tables: $kept, columns: $columns, constraints: $constraints}
+}
+
 # ---- schema display (over a cached `data` record) -----------------------------
 
 def str-has [haystack: any, needle: string]: nothing -> bool {

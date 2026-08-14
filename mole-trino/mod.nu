@@ -200,6 +200,13 @@ def "trino-table" [context: string]: nothing -> list<string> {
   sql complete-tables (trino-catalog $context)
 }
 
+# Comma-list variant for the `schema --only/--exclude` filters: re-prepend the
+# already-typed tables so accepting a candidate extends the list.
+def "trino-tables-csv" [context: string]: nothing -> list<string> {
+  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
+  sql complete-tables (trino-catalog $context) | each {|t| $"($prefix)($t)" }
+}
+
 def "trino-column" [context: string]: nothing -> list<string> {
   # `select` names its table with --from; `update`/`delete` take it as the leading
   # positional — fall back to that so column completion works for the write verbs too.
@@ -461,7 +468,10 @@ export def "delete" [
 # columns; constraints are always empty); `--find` searches table and column
 # names and comments case-insensitively; `--full` returns the raw cache record,
 # including its `meta`. `--refresh` rebuilds the cache from the live server
-# before reading. Connection is overridable exactly as in `raw-query`.
+# before reading. `--only`/`--exclude` narrow the tables shown in EVERY view
+# (comma-separated names — bare or `schema.`-qualified, `*` globs allowed), most
+# useful with `--full` to feed `mole-mermaid` a diagram of just the tables you
+# want. Connection is overridable exactly as in `raw-query`.
 @category mole-trino
 @example "summary — one row per table" {
   mole-trino schema -c trino-local-dev
@@ -478,12 +488,17 @@ export def "delete" [
 @example "the raw cache record, including meta" {
   mole-trino schema --full -c trino-local-dev
 }
+@example "render only some tables as a Mermaid ER diagram" {
+  mole-trino schema --full --only "customer,orders,lineitem" -c trino-local-dev | mole-mermaid er-schema
+}
 export def "schema" [
   --connection(-c): string@complete-connection   # named connection (default: current)
   --table(-t): string@"trino-table"                # detail view for one table
   --find: string                                   # find tables/columns by name or comment (case-insensitive)
   --refresh(-r)                                    # rebuild the cache before reading
   --full                                           # return the full cache record
+  --only: string@"trino-tables-csv"                # keep only these tables — comma-sep names/globs (all views)
+  --exclude: string@"trino-tables-csv"             # drop these tables — comma-sep names/globs (all views)
   --host(-h): string                               # override host
   --port(-p): int                                  # override port
   --user(-u): string                               # override user
@@ -492,7 +507,7 @@ export def "schema" [
   --set: record = {}                               # override any other connection field(s)
 ] {
   let conf = (trino-conf $connection $host $port $user $catalog $schema $set)
-  let data = (trino-schema-load $conf --refresh=$refresh)
+  let data = (sql schema-filter (trino-schema-load $conf --refresh=$refresh) --only (sql csv-split $only) --exclude (sql csv-split $exclude))
   if $full { return $data }
   if ($find | is-not-empty) {
     sql schema-find $data $find
