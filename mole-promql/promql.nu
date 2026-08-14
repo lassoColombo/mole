@@ -219,6 +219,42 @@ export def "matchers" [
   if ($parts | is-empty) { "" } else { "{" + ($parts | str join ", ") + "}" }
 }
 
+# Split a matcher token `label<op>value` into {label, op, value}; `op` is one of
+# `=`, `!=`, `=~`, `!~`. Null when the token carries no operator. The operator is
+# anchored right after the label identifier and the alternation is longest-first,
+# so an operator that also appears INSIDE the value (e.g. `label=~a=b`) is never
+# mis-detected. This is the token form the `select`/`series`/… completers and the
+# `matchers-tokens` builder both parse.
+@category mole-promql
+@example "an equality token" { promql matcher-token "job=api" } --result {label: job, op: "=", value: api}
+@example "a negative-regex token" { promql matcher-token "status!~5.." } --result {label: status, op: "!~", value: "5.."}
+@example "a bare value keeps any later operators" { promql matcher-token "path=~/a=b" } --result {label: path, op: "=~", value: "/a=b"}
+@example "no operator yields null" { promql matcher-token "nolabel" } --result null
+export def "matcher-token" [token: string]: nothing -> any {
+  let m = ($token | parse --regex '^(?P<label>[a-zA-Z_][a-zA-Z0-9_]*)(?P<op>=~|!~|!=|=)(?P<value>.*)$')
+  if ($m | is-empty) { null } else { $m | first }
+}
+
+# Assemble the `{...}` matcher block from operator-carrying tokens (`job=api`,
+# `status=~5..`, `env!=dev`). Each value is quoted and escaped (via `esc`). An empty
+# list → "". Errors on a non-empty token that carries no operator — silently
+# dropping it would run a wrongly-unfiltered query, the worst failure for a metrics
+# tool. This is the single-list superset of `matchers` (each token names its own
+# operator instead of the caller splitting into four lists).
+@category mole-promql
+@example "mixed operators compose in order" {
+  promql matchers-tokens ["job=api" "status=~5.." "env!=dev"]
+} --result '{job="api", status=~"5..", env!="dev"}'
+@example "no tokens → empty string" { promql matchers-tokens [] } --result ""
+export def "matchers-tokens" [tokens: list<string>]: nothing -> string {
+  let parts = ($tokens | where {|t| $t | is-not-empty } | each {|t|
+    let p = (matcher-token $t)
+    if ($p == null) { error make {msg: $"not a matcher: '($t)' — use label=value | label!=value | label=~value | label!~value; single-quote a value with spaces"} }
+    $p.label + $p.op + '"' + (esc $p.value) + '"'
+  })
+  if ($parts | is-empty) { "" } else { "{" + ($parts | str join ", ") + "}" }
+}
+
 # Assemble a PromQL query from parts (pure):
 #   [agg [by/without (labels)]] ( [func] ( metric{matchers}[range] ) )
 # MetricsQL and every PromQL superset accept this syntax unchanged, so the builder

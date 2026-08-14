@@ -98,39 +98,147 @@ def vm-warm [conf: record]: nothing -> nothing {
   try { vm-catalog-load $conf | ignore } catch { }
 }
 
-# Resolve a connection FOR COMPLETION — by the `-c` on the line, else the current
-# one — WITHOUT the `--driver` assertion. Completion runs in an environment that
-# does NOT carry the self-assembled `$env.MOLE_REGISTRY`, so `conn with
-# victoriametrics` (which asserts the connection's `driver` is `victoriametrics`)
-# would throw; a bare `conn resolve <name>` only needs the config
-# file. A state file mirrors the current connection name so completion can find it
-# without the session `$env` (completion may not carry `$env.MOLE_CURRENT`); it is
-# written by `set-connection`. Returns the connection record, or null.
-def vm-current-file []: nothing -> string { cache path "victoriametrics" "__current__" }
+# ---- query composition (shared by the verbs) ----------------------------------
 
-def vm-conf-complete [context: string]: nothing -> any {
-  let named = (promql parse-flag $context ["--connection" "-c"])
-  let cur = ($env.MOLE_CURRENT? | default {} | get -o victoriametrics)
-  let filed = (cache read (vm-current-file) | get -o name)
-  let name = ([$named $cur $filed] | where {|x| $x | is-not-empty } | get -o 0)
-  if ($name | is-empty) { return null }
-  try { conn resolve $name } catch { null }
+# Split a comma-separated flag value into a clean list (trims, drops blanks). The
+# CSV-string workaround for `--by`/`--without`, since Nushell can't complete inside
+# a `[...]` list literal.
+def vm-csv [v: any]: nothing -> list<string> {
+  $v | default "" | split row "," | str trim | where {|x| $x | is-not-empty }
 }
 
-# The cached catalog for whatever connection the command line names (or the
-# current one). Cache-only — never hits the network, so completers stay instant.
+# Build a scoping selector from an optional metric + matcher tokens. A "metric" that
+# actually carries an operator (`labels job=api`) is folded into the matchers, so
+# the leading positional stays unambiguous. Returns `metric{block}`, a bare
+# `{block}`, or "" (match everything). Shared by the enumeration verbs; `select`
+# builds its own expression via `promql build` (it also wraps func/agg/range).
+def vm-scope [metric: any, matchers: list<string>]: nothing -> string {
+  let is_matcher = (($metric | is-not-empty) and ((promql matcher-token $metric) != null))
+  let m = if $is_matcher { null } else { $metric }
+  let toks = if $is_matcher { [$metric] ++ $matchers } else { $matchers }
+  let block = (promql matchers-tokens $toks)
+  if ($m | is-empty) { $block } else { $m + $block }
+}
+
+# ---- contextual completion ----------------------------------------------------
+# Every completer resolves the connection / catalog / metric / siblings / window the
+# line targets, then scopes its suggestions. The shared `complete` toolkit does the
+# parsing and NEVER throws, so a Tab never errors; these add the metrics-specific
+# projection on top.
+
+# The verb on a completion line (the first known-verb token), so metric recovery can
+# account for `label-values`' leading <label> positional.
+def vm-ctx-verb [context: string]: nothing -> string {
+  let known = [select series labels label-values tsdb-status export-samples metrics]
+  $context | split row --regex '\s+' | where {|t| $t in $known } | get -o 0 | default "select"
+}
+
+# The metric already typed on the line: the `--metric` flag if present (how
+# `label-values` names it, so the flag can precede the <label> and scope its
+# completion), else the first operator-free positional (how the metric-first verbs
+# name it). `label-values` has NO positional metric — its first positional is the
+# <label> — so it never mistakes that for a metric. Null when none is present.
+def vm-ctx-metric [context: string]: nothing -> any {
+  let flagged = (complete flag $context ["--metric" "-M"])
+  if ($flagged | is-not-empty) { return $flagged }
+  if (vm-ctx-verb $context) == "label-values" { return null }
+  complete positionals $context | where {|t| (promql matcher-token $t) == null } | get -o 0
+}
+
+# The sibling matcher tokens already typed (the operator-bearing positionals); the
+# metric and any <label> positional are operator-free, so they drop out naturally.
+def vm-ctx-siblings [context: string]: nothing -> list<string> {
+  complete positionals $context | where {|t| (promql matcher-token $t) != null }
+}
+
+# The selector the line implies (metric + siblings), for scoping live lookups.
+def vm-ctx-selector [context: string]: nothing -> string {
+  try { vm-scope (vm-ctx-metric $context) (vm-ctx-siblings $context) } catch { "" }
+}
+
+# The {start, end} window implied by the --last/--start/--end flags on the line
+# (absent/unparseable → unbounded), so contextual lookups honor the typed window.
+def vm-range-ctx [context: string]: nothing -> record {
+  let lastRaw = (complete flag $context ["--last" "-L"])
+  let startRaw = (complete flag $context ["--start" "-a"])
+  let endRaw = (complete flag $context ["--end" "-b"])
+  let last = (if ($lastRaw | is-empty) { null } else { try { $lastRaw | into duration } catch { null } })
+  let start = (if ($startRaw | is-empty) { null } else { try { $startRaw | into datetime } catch { null } })
+  let end = (if ($endRaw | is-empty) { null } else { try { $endRaw | into datetime } catch { null } })
+  promql resolve-range $last $start $end (date now)
+}
+
+# The cached catalog for whatever connection the line targets (cache-only, instant).
 def vm-catalog-ctx [context: string]: nothing -> record {
-  let conf = (vm-conf-complete $context)
-  if ($conf | is-empty) { return {} }
-  (cache read (cache path "victoriametrics" ($conf | get -o name | default "_"))) | default {}
+  complete catalog-ctx $context "victoriametrics"
 }
 
+# Metric NAMES from the cached catalog. `vm-expr` starts a raw MetricsQL expression;
+# the cheapest useful suggestion is a metric name. (Label-name completion is
+# `vm-mlabel`, which scopes to the metric on the line.)
 def "vm-metric" [context: string]: nothing -> list<string> { vm-catalog-ctx $context | get -o metrics | default [] }
-def "vm-label" [context: string]: nothing -> list<string> { vm-catalog-ctx $context | get -o labels | default [] }
-# MetricsQL is a full expression; the best cheap suggestion is a metric name to start.
 def "vm-expr" [context: string]: nothing -> list<string> { vm-metric $context }
-# A series selector usually starts with a metric name.
-def "vm-selector" [context: string]: nothing -> list<string> { vm-metric $context }
+
+# Metric-scoped label NAMES for completion. `__name__` is dropped — the metric
+# positional is how you pin it.
+#
+# With NO metric on the line, there is nothing to scope by, so the global cached
+# label names are the reasonable start. With a metric present, this is a LIVE
+# `/labels?match[]=<selector>` scoped to the metric + sibling matchers + the typed
+# window (short timeout), and the result is authoritative: a successful-but-EMPTY
+# result means the metric has no such labels (or doesn't exist), and an ERROR/timeout
+# means we can't tell — either way it returns EMPTY rather than the global catalog,
+# which would offer labels the metric does not have. (The global set is misleading
+# here precisely because it is NOT scoped; a Tab that shows nothing is honest.)
+def "vm-mlabel" [context: string]: nothing -> list<string> {
+  let conf = (complete conn-ctx $context "victoriametrics")
+  let sel = (vm-ctx-selector $context)
+  if ($conf | is-empty) or ($sel | is-empty) {
+    return (vm-catalog-ctx $context | get -o labels | default [] | where {|l| $l != "__name__" })
+  }
+  let r = (vm-range-ctx $context)
+  try {
+    (client labels get --qp-match [$sel] --start (promql ts $r.start) --end (promql ts $r.end)
+      --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf) --max-time 3sec
+      | get -o data | default [] | where {|l| $l != "__name__" })
+  } catch { [] }
+}
+
+# Rest-positional completer for matcher tokens. Two stages on the token under the
+# cursor, both contextual to the metric + sibling matchers + window on the line:
+#   - no operator → field stage: `label=` for each metric-scoped label (vm-mlabel).
+#   - `label<op>…` → value stage: a LIVE `label-values` for that label, scoped by the
+#      sibling selector + window, returning `label<op>value` (the operator the user
+#      chose is preserved). The stage branches on `matcher-token` (never `str contains
+#      "="`, which `!=`/`=~`/`!~` all satisfy). Best-effort — errors → no candidates.
+def "vm-matcher" [context: string]: nothing -> list<string> {
+  let tok = (complete token $context)
+  let parsed = (promql matcher-token $tok)
+  if ($parsed == null) {
+    (vm-mlabel $context) | each {|l| $l + "=" }
+  } else {
+    let conf = (complete conn-ctx $context "victoriametrics")
+    if ($conf | is-empty) { return [] }
+    let sel = (vm-ctx-selector $context)
+    let match = (if ($sel | is-empty) { [] } else { [$sel] })
+    let r = (vm-range-ctx $context)
+    try {
+      (client label-values get $parsed.label --qp-match $match
+        --start (promql ts $r.start) --end (promql ts $r.end)
+        --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf) --max-time 3sec
+      | get -o data | default []
+      | each {|v| $parsed.label + $parsed.op + $v })
+    } catch { [] }
+  }
+}
+
+# Completer for the comma-separated `--by`/`--without`: metric-scoped label names,
+# re-prepending the already-typed comma items so accepting a candidate EXTENDS the
+# list (`job,me⇥` → `job,method`).
+def "vm-by" [context: string]: nothing -> list<string> {
+  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
+  (vm-mlabel $context) | each {|l| $"($prefix)($l)" }
+}
 
 # Static MetricsQL function / aggregation / range-window completers (no server
 # call). MetricsQL is a PromQL SUPERSET: the base vocab comes from the library and
@@ -148,44 +256,6 @@ def "vm-agg" [context: string]: nothing -> list<string> {
   (promql aggs) ++ [median mad limitk outliersk outliers_mad zscore any distinct]
 }
 def "vm-window" [context: string]: nothing -> list<string> { promql windows }
-
-# Metric-scoped label NAMES for completion: a live `/labels?match[]=<metric>`
-# (short timeout), falling back to the cached global label names. Silent on failure.
-def "vm-mlabel" [context: string]: nothing -> list<string> {
-  let cached = (vm-catalog-ctx $context | get -o labels | default [])
-  let metric = (promql metric-arg $context)
-  let conf = (vm-conf-complete $context)
-  if ($metric | is-empty) or ($conf | is-empty) { return $cached }
-  try {
-    let live = (client labels get --qp-match [$metric]
-      --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf) --max-time 3sec
-      | get -o data | default [])
-    if ($live | is-empty) { $cached } else { $live }
-  } catch { $cached }
-}
-
-# Context-aware `label=value` matcher completion. Before the `=`: metric-scoped
-# label names, each with `=` appended. After the `=`: that label's live values
-# (scoped to the metric, short timeout), as `label=value`. Silent on failure so a
-# Tab never hangs the REPL.
-def "vm-eq" [context: string]: nothing -> list<string> {
-  let raw = ($context | str trim | split row --regex '\s+' | last | default "")
-  let bare = ($raw | str replace --regex '^\[' '' | str replace --regex '^"' '')
-  if ($bare | str contains "=") {
-    let label = ($bare | split row --number 2 "=" | first)
-    let metric = (promql metric-arg $context)
-    let conf = (vm-conf-complete $context)
-    if ($conf | is-empty) { return [] }
-    try {
-      let m = if ($metric | is-empty) { [] } else { [$metric] }
-      (client label-values get $label --qp-match $m
-        --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf) --max-time 3sec
-      | get -o data | default [] | each {|v| $label + "=" + $v })
-    } catch { [] }
-  } else {
-    (vm-mlabel $context) | each {|l| $l + "=" }
-  }
-}
 
 # ---- user verbs ---------------------------------------------------------------
 
@@ -270,40 +340,43 @@ export def "raw-query-range" [
   if $raw { $data } else { promql normalize $data }
 }
 
-# Compose and run a MetricsQL query from completion-aware flags — the ergonomic
+# Compose and run a MetricsQL query from completion-aware tokens — the ergonomic
 # alternative to writing raw MetricsQL in `raw-query`.
 #
 # Assembles `[agg [by/without (labels)]] ( [func] ( metric{matchers}[range] ) )`
-# from the flags, then runs it: INSTANT by default, or as a RANGE query when any
-# of `--last`/`--start`/`--end` is given. `--dry-run` returns a `{connection, query}` record — the resolved
-# connection (secrets dropped) and the assembled MetricsQL — without running. Completion is the point —
-# `<metric>` completes from the catalog; `--eq`/`--ne`/`--re`/`--nre` complete the
-# label name and, after `=`, that label's live values SCOPED TO THE METRIC;
-# `--func`/`--agg` complete from the MetricsQL function/aggregation sets (PromQL +
-# VM extras); `--by`/`--without` complete the metric's labels. Matcher tokens are
-# `label=value` (the value is quoted for you); use `--re`/`--nre` for regex values.
-# Results are typed exactly as `raw-query`/`raw-query-range`.
+# from the metric, the matcher tokens and the flags, then runs it: INSTANT by
+# default, or as a RANGE query when any of `--last`/`--start`/`--end` is given.
+# `--dry-run` returns a `{connection, query}` record — the resolved connection
+# (secrets dropped) and the assembled MetricsQL — without running.
+#
+# Completion is the point. `<metric>` completes from the catalog; each `...matchers`
+# token completes the label name first, then — after an operator — that label's LIVE
+# values, SCOPED to the metric and the sibling matchers already typed (and the time
+# window). A matcher token is `label=value` (→ `label="value"`), `label!=value`,
+# `label=~value` (regex) or `label!~value`; the value is quoted for you, so type
+# `code=~5..`, NOT `code=~"5.."`, and single-quote a value with spaces
+# (`'msg=hello world'`). `--func`/`--agg` complete from the MetricsQL
+# function/aggregation sets (PromQL + VM extras); `--by`/`--without` are
+# comma-separated lists of the metric's labels. Results are typed exactly as
+# `raw-query`/`raw-query-range`.
 @category mole-victoriametrics
 @example "filter a metric by labels (instant)" {
-  mole-victoriametrics select http_requests_total --eq [job=api method=GET] --dry-run | get query
+  mole-victoriametrics select http_requests_total job=api method=GET --dry-run | get query
 } --result 'http_requests_total{job="api", method="GET"}'
 @example "a rate aggregated by job (range window applied at run time)" {
-  mole-victoriametrics select http_requests_total --eq [job=api] --re [status=5..] --range 5m --func rate --agg sum --by [job] --last 1hr --step 1min --dry-run | get query
+  mole-victoriametrics select http_requests_total job=api status=~5.. --range 5m --func rate --agg sum --by job --last 1hr --step 1min --dry-run | get query
 } --result 'sum by (job) (rate(http_requests_total{job="api", status=~"5.."}[5m]))'
 @example "run it for real against a connection" {
-  mole-victoriametrics select up --eq [job=victoriametrics] -c victoriametrics-local-dev
+  mole-victoriametrics select up job=victoriametrics -c victoriametrics-local-dev
 }
 export def "select" [
   metric: string@"vm-metric"                       # metric name (completes from the catalog)
-  --eq(-e): list<string>@"vm-eq"                   # equality matchers:   label=value → label="value"
-  --ne: list<string>@"vm-eq"                       # inequality matchers: label=value → label!="value"
-  --re: list<string>@"vm-eq"                       # regex matchers:      label=value → label=~"value"
-  --nre: list<string>@"vm-eq"                      # negative-regex:      label=value → label!~"value"
+  ...matchers: string@"vm-matcher"                 # label matchers: label=value | label!=value | label=~value | label!~value
   --range(-r): string@"vm-window"                  # range-vector window, e.g. 5m → [5m] (for rate/increase/…)
   --func: string@"vm-func"                         # wrap the selector in this function (rate, rollup, …)
   --agg: string@"vm-agg"                           # aggregate with this operator (sum, avg, topk, …)
-  --by: list<string>@"vm-mlabel"                   # aggregation grouping: by (labels) — needs --agg
-  --without: list<string>@"vm-mlabel"              # aggregation grouping: without (labels) — needs --agg
+  --by: string@"vm-by"                             # aggregation grouping: by (labels), comma-separated — needs --agg
+  --without: string@"vm-by"                        # aggregation grouping: without (labels), comma-separated — needs --agg
   --time(-t): datetime                             # instant to evaluate at (default: server now)
   --last(-L): duration                             # range mode: window ending now
   --start(-a): datetime                            # range mode: window start
@@ -318,6 +391,11 @@ export def "select" [
   --full(-F)                                        # return the whole {status, data, …} envelope
   --dry-run(-n)                                    # return a {connection, query} record instead of running
 ] {
+  if ((promql matcher-token $metric) != null) {
+    error make {msg: "select: the first argument must be a metric name, not a matcher"}
+  }
+  let by = (vm-csv $by)
+  let without = (vm-csv $without)
   if (($by | is-not-empty) or ($without | is-not-empty)) and ($agg | is-empty) {
     error make {msg: "select: --by/--without require --agg"}
   }
@@ -325,12 +403,12 @@ export def "select" [
     error make {msg: "select: --by and --without are mutually exclusive"}
   }
   let expr = (promql build $metric
-    --matchers (promql matchers ($eq | default []) ($ne | default []) ($re | default []) ($nre | default []))
+    --matchers (promql matchers-tokens $matchers)
     --range ($range | default "")
     --func ($func | default "")
     --agg ($agg | default "")
-    --by ($by | default [])
-    --without ($without | default []))
+    --by $by
+    --without $without)
   if $dry_run { return {connection: (vm-conf $connection $url $token $set | conn redact), query: $expr} }
   if (($last | is-not-empty) or ($start | is-not-empty) or ($end | is-not-empty)) {
     raw-query-range $expr --last $last --start $start --end $end --step $step --limit $limit --connection $connection --url $url --token $token --set $set --raw=$raw --full=$full
@@ -339,17 +417,20 @@ export def "select" [
   }
 }
 
-# List the series matching one or more selectors.
+# List the series matching a selector.
 #
-# Each positional is a series selector (the `match[]` argument), e.g.
-# `'up{job="api"}'`; at least one is required. Returns one row per series — a
-# table of its label sets. The window (`--last` / `--start` / `--end`) is optional
-# and scopes the lookup; omit it to search all time.
+# Builds ONE selector from `<metric>` + matcher tokens (`series up job=api
+# status=~5..`), exactly like `select`, and returns one row per matching series — a
+# table of its label sets. A metric that is itself a matcher (`series job=api`)
+# becomes a bare `{job="api"}` selector. The window (`--last` / `--start` / `--end`)
+# is optional and scopes the lookup; omit it to search all time.
 @category mole-victoriametrics
-@example "series for a metric" { mole-victoriametrics series "up" }
-@example "series across two selectors in the last day" { mole-victoriametrics series 'up{job="api"}' 'process_start_time_seconds' --last 1day }
+@example "series for a metric" { mole-victoriametrics series up }
+@example "series for a filtered selector in the last day" { mole-victoriametrics series up job=api --last 1day }
+@example "inspect the composed selector without running" { mole-victoriametrics series up job=api --dry-run | get query } --result 'up{job="api"}'
 export def "series" [
-  ...match: string@"vm-selector"                   # series selector(s) — at least one required
+  metric?: string@"vm-metric"                      # metric name (completes from the catalog)
+  ...matchers: string@"vm-matcher"                 # label matchers (AND-joined into the selector)
   --last(-L): duration                             # scope to a window ending now
   --start(-a): datetime                            # window start
   --end(-b): datetime                              # window end
@@ -358,22 +439,31 @@ export def "series" [
   --url: string
   --token: string
   --set: record = {}
+  --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
-  if ($match | is-empty) { error make {msg: "series: at least one selector is required"} }
+  let sel = (vm-scope $metric $matchers)
+  if ($sel | is-empty) { error make {msg: "series: a metric or at least one matcher is required"} }
   let conf = (vm-conf $connection $url $token $set)
+  if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let range = (promql resolve-range $last $start $end (date now))
-  (client series get --qp-match $match --start (promql ts $range.start) --end (promql ts $range.end) --limit $limit
+  (client series get --qp-match [$sel] --start (promql ts $range.start) --end (promql ts $range.end) --limit $limit
     --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf))
   | get -o data | default []
   | each {|r| promql relabel $r }   # surface __name__ as `metric`, as raw-query/raw-query-range do
 }
 
-# List label names present in the data (optionally scoped by selectors/window).
+# List label names present in the data (optionally scoped by a selector/window).
+#
+# Scope with `[metric]` + matcher tokens (`labels up job=api`), exactly like
+# `select`; with no arguments it returns every label name. The window scopes the
+# lookup.
 @category mole-victoriametrics
 @example "all label names" { mole-victoriametrics labels }
-@example "label names used by a selector" { mole-victoriametrics labels --match ['up'] --last 1hr }
+@example "label names used by a selector" { mole-victoriametrics labels up --last 1hr }
+@example "inspect the composed selector without running" { mole-victoriametrics labels up job=api --dry-run | get query } --result 'up{job="api"}'
 export def "labels" [
-  --match(-m): list<string>@"vm-selector"          # series selector(s) to scope the label names
+  metric?: string@"vm-metric"                      # metric to scope by (completes from the catalog)
+  ...matchers: string@"vm-matcher"                 # label matchers to further scope the label names
   --last(-L): duration
   --start(-a): datetime
   --end(-b): datetime
@@ -382,21 +472,35 @@ export def "labels" [
   --url: string
   --token: string
   --set: record = {}
+  --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vm-conf $connection $url $token $set)
+  let sel = (vm-scope $metric $matchers)
+  if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let range = (promql resolve-range $last $start $end (date now))
+  let match = (if ($sel | is-empty) { null } else { [$sel] })
   (client labels get --qp-match $match --start (promql ts $range.start) --end (promql ts $range.end) --limit $limit
     --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf))
   | get -o data | default []
 }
 
-# List the distinct values of a label (optionally scoped by selectors/window).
+# List the distinct values of a label (optionally scoped by a metric/matchers/window).
+#
+# `--metric M` scopes the lookup — and, typed FIRST, makes the <label> itself
+# complete to only M's labels, so you can tab through a metric's labels while
+# exploring (`label-values --metric up ⇥`). Add matcher tokens to narrow further
+# (`label-values --metric up instance job=api`), like `select`. `--limit` caps the
+# values. With no `--metric`, <label> completes from the global catalog and the
+# values span every series.
 @category mole-victoriametrics
 @example "every job value" { mole-victoriametrics label-values job }
-@example "instance values for one job" { mole-victoriametrics label-values instance --match ['up{job="api"}'] }
+@example "explore a metric's labels, then a label's values" { mole-victoriametrics label-values --metric up instance }
+@example "values within a filtered selector" { mole-victoriametrics label-values --metric up instance job=api }
+@example "inspect the composed selector without running" { mole-victoriametrics label-values instance --metric up job=api --dry-run | get query } --result 'up{job="api"}'
 export def "label-values" [
-  label: string@"vm-label"                         # the label name to enumerate
-  --match(-m): list<string>@"vm-selector"          # series selector(s) to scope the values
+  label: string@"vm-mlabel"                        # the label name to enumerate (completes to --metric's labels when given)
+  --metric(-M): string@"vm-metric"                 # metric to scope by (completes from the catalog)
+  ...matchers: string@"vm-matcher"                 # label matchers to further scope the values
   --last(-L): duration
   --start(-a): datetime
   --end(-b): datetime
@@ -405,9 +509,13 @@ export def "label-values" [
   --url: string
   --token: string
   --set: record = {}
+  --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vm-conf $connection $url $token $set)
+  let sel = (vm-scope $metric $matchers)
+  if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let range = (promql resolve-range $last $start $end (date now))
+  let match = (if ($sel | is-empty) { null } else { [$sel] })
   (client label-values get $label --qp-match $match --start (promql ts $range.start) --end (promql ts $range.end) --limit $limit
     --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf))
   | get -o data | default []
@@ -438,42 +546,51 @@ export def "metrics" [
 # VictoriaMetrics TSDB status / cardinality stats (VM-specific read).
 #
 # Returns the parsed `data` of `/api/v1/status/tsdb`: series/label cardinality
-# breakdowns (seriesCountByMetricName, labelValueCountByLabelName, …). Pass
-# `--date YYYY-MM-DD` to scope to one day, `--topN` to cap each breakdown, and
-# `--match` to scope by selector(s). `--raw` is a no-op alias for the default here
-# (the payload is already a record); `--full` returns the whole envelope.
+# breakdowns (seriesCountByMetricName, labelValueCountByLabelName, …). Scope with
+# `[metric]` + matcher tokens (`tsdb-status up job=api`), like `select`; with no
+# selector it reports over everything. Pass `--date YYYY-MM-DD` to scope to one day
+# and `--topN` to cap each breakdown; `--full` returns the whole envelope.
 @category mole-victoriametrics
 @example "overall cardinality stats" { mole-victoriametrics tsdb-status }
 @example "top-5 series by metric name for a day" { mole-victoriametrics tsdb-status --date 2026-07-26 --topN 5 }
+@example "inspect the composed selector without running" { mole-victoriametrics tsdb-status up job=api --dry-run | get query } --result 'up{job="api"}'
 export def "tsdb-status" [
+  metric?: string@"vm-metric"                      # metric to scope the stats by
+  ...matchers: string@"vm-matcher"                 # label matchers to further scope the stats
   --date: string                                   # day (YYYY-MM-DD) to report stats for
   --topN(-t): int                                  # cap each breakdown to N entries
-  --match(-m): list<string>@"vm-selector"          # series selector(s) to scope the stats
   --connection(-c): string@complete-connection
   --url: string
   --token: string
   --set: record = {}
   --full(-F)                                       # return the whole {status, data, …} envelope
+  --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vm-conf $connection $url $token $set)
+  let sel = (vm-scope $metric $matchers)
+  if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
+  let match = (if ($sel | is-empty) { null } else { [$sel] })
   let resp = (client status-tsdb get --date $date --topN $topN --match $match
     --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf))
   if $full { $resp } else { $resp | get -o data | default {} }
 }
 
-# Export raw samples for selectors as tidy rows (VM-specific read).
+# Export raw samples for a selector as tidy rows (VM-specific read).
 #
 # Wraps `/api/v1/export`, which streams one JSON object per line
-# ({metric, values, timestamps}) rather than the query envelope. Each positional
-# is a `match[]` selector (at least one required). Returns tidy rows: one per
-# (series, sample) — every label a column (`__name__` as `metric`), plus
-# `timestamp` (datetime) and `value` (float). `--last`/`--start`/`--end` scope the
-# time window. `--raw` returns the parsed JSONL objects untouched (columnar form).
+# ({metric, values, timestamps}) rather than the query envelope. Builds ONE selector
+# from `<metric>` + matcher tokens (`export-samples up job=api`), like `select`.
+# Returns tidy rows: one per (series, sample) — every label a column (`__name__` as
+# `metric`), plus `timestamp` (datetime) and `value` (float). `--last`/`--start`/
+# `--end` scope the time window. `--raw` returns the parsed JSONL objects untouched
+# (columnar form).
 @category mole-victoriametrics
-@example "export a metric over the last hour" { mole-victoriametrics export-samples "up" --last 1hr }
-@example "export two selectors, raw columnar form" { mole-victoriametrics export-samples 'up{job="api"}' 'process_cpu_seconds_total' --raw }
+@example "export a metric over the last hour" { mole-victoriametrics export-samples up --last 1hr }
+@example "export a filtered selector, raw columnar form" { mole-victoriametrics export-samples up job=api --raw }
+@example "inspect the composed selector without running" { mole-victoriametrics export-samples up job=api --dry-run | get query } --result 'up{job="api"}'
 export def "export-samples" [
-  ...match: string@"vm-selector"                   # series selector(s) — at least one required
+  metric?: string@"vm-metric"                      # metric name (completes from the catalog)
+  ...matchers: string@"vm-matcher"                 # label matchers (AND-joined into the selector)
   --last(-L): duration                             # scope to a window ending now
   --start(-a): datetime                            # window start
   --end(-b): datetime                              # window end
@@ -483,13 +600,16 @@ export def "export-samples" [
   --token: string
   --set: record = {}
   --raw(-R)                                         # return the parsed JSONL objects (columnar), untidied
+  --dry-run(-n)                                     # return {connection, query} instead of running
 ] {
-  if ($match | is-empty) { error make {msg: "export-samples: at least one selector is required"} }
+  let sel = (vm-scope $metric $matchers)
+  if ($sel | is-empty) { error make {msg: "export-samples: a metric or at least one matcher is required"} }
   let conf = (vm-conf $connection $url $token $set)
+  if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let range = (promql resolve-range $last $start $end (date now))
   # --raw fetch: /export is JSON LINES, not a single JSON document, so parse each
   # non-empty line as its own JSON object.
-  let text = (client export get --match $match --start (promql ts $range.start) --end (promql ts $range.end)
+  let text = (client export get --match [$sel] --start (promql ts $range.start) --end (promql ts $range.end)
     --max-rows-per-line $max_rows_per_line
     --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf) --raw)
   let lines = ($text | lines | where {|l| $l | str trim | is-not-empty } | each {|l| $l | from json })
@@ -508,6 +628,5 @@ export def --env "set-connection" [
   name: string@complete-connection               # a victoriametrics connection name (from the connections file)
 ]: nothing -> nothing {
   let conf = (conn set-current victoriametrics $name)
-  {name: $name} | cache write (vm-current-file)   # so completion finds it without $env
   try { vm-catalog-load $conf --refresh | ignore } catch { }
 }

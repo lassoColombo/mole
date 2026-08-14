@@ -420,7 +420,7 @@ export def "schema-body" [
 # ---- schema filtering (prune a cached `data` record to a table subset) --------
 
 # Split a comma-separated flag value into a clean `list<string>` (trims, drops
-# blanks); `null`/"" → `[]`. The list-valued schema filters (`--only a,b`) reach a
+# blanks); `null`/"" → `[]`. The list-valued schema filters (`--include a,b`) reach a
 # verb as ONE comma-joined string — Nushell can't complete inside a `[...]` list
 # literal — so this normalizes that wire form to the list the pure helpers want.
 @category mole-sql
@@ -462,16 +462,17 @@ def table-matches [schema: string, name: string, patterns: list<string>]: nothin
 
 # Prune a schema-cache record to a subset of its tables, kept self-contained.
 #
-# `--only` keeps ONLY matching tables (empty = keep all); `--exclude` then drops
-# matching tables (applied AFTER `--only`, so on overlap exclude wins). Patterns are
+# `--include` keeps ONLY matching tables (empty = keep all); `--exclude` then drops
+# matching tables (applied AFTER `--include`, so on overlap exclude wins). Patterns are
 # bare or `schema.`-qualified names, either side globbable with `*` (see
 # `table-matches`). Besides removing the pruned tables' own rows from
 # `tables`/`columns`/`constraints`, it also drops any FOREIGN KEY whose REFERENCED
 # table was pruned away — otherwise that dangling relationship would make Mermaid
 # auto-create a phantom entity for a table you deliberately excluded. Extra
 # top-level keys (`meta`) survive, and with no filters `data` is returned untouched.
-# This backs `schema --only/--exclude`, so a filtered `schema --full` feeds
-# `mole-mermaid` a diagram of exactly the tables you want.
+# This backs `schema --include/--exclude` (which the driver verbs expose as
+# mutually-exclusive flags), so a filtered `schema --full` feeds `mole-mermaid`
+# a diagram of exactly the tables you want.
 @category mole-sql
 @example "keep only some tables — a now-dangling FK into a dropped table goes too" {
   let data = {
@@ -480,7 +481,7 @@ def table-matches [schema: string, name: string, patterns: list<string>]: nothin
     columns: [{schema: public, table: orders, name: user_id, nullable: false}]
     constraints: [{schema: public, table: orders, name: fk, type: "FOREIGN KEY", columns: [user_id], ref_schema: public, ref_table: users, ref_columns: [id]}]
   }
-  let r = (sql schema-filter $data --only [orders])
+  let r = (sql schema-filter $data --include [orders])
   [($r.tables | get name) ($r.constraints | length)]
 } --result [[orders], 0]
 @example "exclude housekeeping tables by glob" {
@@ -489,12 +490,12 @@ def table-matches [schema: string, name: string, patterns: list<string>]: nothin
 } --result [users]
 export def "schema-filter" [
   data: record                  # a schema-cache record ({tables, columns, constraints}; `meta` & extra keys kept)
-  --only: list<string> = []     # keep ONLY tables matching these bare/qualified names or `*` globs
-  --exclude: list<string> = []  # drop tables matching these (applied after --only)
+  --include: list<string> = []  # keep ONLY tables matching these bare/qualified names or `*` globs
+  --exclude: list<string> = []  # drop tables matching these (applied after --include)
 ]: nothing -> record {
-  if ($only | is-empty) and ($exclude | is-empty) { return $data }
+  if ($include | is-empty) and ($exclude | is-empty) { return $data }
   let kept = ($data | get -o tables | default [] | where {|t|
-    let inc = (($only | is-empty) or (table-matches $t.schema $t.name $only))
+    let inc = (($include | is-empty) or (table-matches $t.schema $t.name $include))
     let exc = (($exclude | is-not-empty) and (table-matches $t.schema $t.name $exclude))
     $inc and (not $exc)
   })

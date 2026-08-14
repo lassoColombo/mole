@@ -106,7 +106,7 @@ def "mysql-table" [context: string]: nothing -> list<string> {
   sql complete-tables (mysql-catalog $context)
 }
 
-# Comma-list variant for the `schema --only/--exclude` filters: re-prepend the
+# Comma-list variant for the `schema --include/--exclude` filters: re-prepend the
 # already-typed tables so accepting a candidate extends the list.
 def "mysql-tables-csv" [context: string]: nothing -> list<string> {
   let prefix = (complete token $context | str replace --regex '[^,]*$' '')
@@ -410,8 +410,9 @@ export def "delete" [
 # detail for one table (its columns and constraints); `--find` searches table and
 # column names and comments case-insensitively; `--full` returns the raw cache
 # record, including its `meta`. `--refresh` rebuilds the cache from the live
-# database before reading. `--only`/`--exclude` narrow the tables shown in EVERY
-# view (comma-separated names — bare or `schema.`-qualified, `*` globs allowed);
+# database before reading. `--include`/`--exclude` (mutually exclusive) narrow the
+# tables shown in EVERY view (comma-separated names — bare or `schema.`-qualified,
+# `*` globs allowed);
 # excluding a table also drops any foreign key that pointed at it, so a filtered
 # `--full` feeds `mole-mermaid` a clean diagram of just the tables you want.
 # Connection is overridable exactly as in `run`.
@@ -432,7 +433,7 @@ export def "delete" [
   mole-mysql schema --full -c mysql-local-dev
 }
 @example "render only the core tables as a Mermaid ER diagram" {
-  mole-mysql schema --full --only "users,orders,order_items" -c mysql-local-dev | mole-mermaid er-schema
+  mole-mysql schema --full --include "users,orders,order_items" -c mysql-local-dev | mole-mermaid er-schema
 }
 @example "dump everything except housekeeping tables" {
   mole-mysql schema --full --exclude "*_audit,django_*" -c mysql-local-dev
@@ -443,8 +444,8 @@ export def "schema" [
   --find: string                                   # find tables/columns by name or comment (case-insensitive)
   --refresh(-r)                                    # rebuild the cache before reading
   --full                                           # return the full cache record
-  --only: string@"mysql-tables-csv"                # keep only these tables — comma-sep names/globs (all views)
-  --exclude: string@"mysql-tables-csv"             # drop these tables — comma-sep names/globs (all views)
+  --include: string@"mysql-tables-csv"             # keep ONLY these tables — comma-sep names/globs (mutually exclusive with --exclude)
+  --exclude: string@"mysql-tables-csv"             # drop these tables — comma-sep names/globs (mutually exclusive with --include)
   --host(-h): string                               # override host
   --port(-p): int                                  # override port
   --user(-u): string                               # override user
@@ -452,8 +453,11 @@ export def "schema" [
   --database(-d): string                           # override database
   --set: record = {}                               # override any other connection field(s)
 ] {
+  if ($include | is-not-empty) and ($exclude | is-not-empty) {
+    error make {msg: "schema: --include and --exclude are mutually exclusive"}
+  }
   let conf = (my-conf $connection $host $port $user $password $database $set)
-  let data = (sql schema-filter (my-schema-load $conf --refresh=$refresh) --only (sql csv-split $only) --exclude (sql csv-split $exclude))
+  let data = (sql schema-filter (my-schema-load $conf --refresh=$refresh) --include (sql csv-split $include) --exclude (sql csv-split $exclude))
   if $full { return $data }
   if ($find | is-not-empty) {
     sql schema-find $data $find

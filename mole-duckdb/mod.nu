@@ -214,7 +214,7 @@ def "duckdb-table" [context: string]: nothing -> list<string> {
   sql complete-tables (duckdb-catalog $context)
 }
 
-# Comma-list variant for the `schema --only/--exclude` filters: re-prepend the
+# Comma-list variant for the `schema --include/--exclude` filters: re-prepend the
 # already-typed tables so accepting a candidate extends the list.
 def "duckdb-tables-csv" [context: string]: nothing -> list<string> {
   let prefix = (complete token $context | str replace --regex '[^,]*$' '')
@@ -500,8 +500,9 @@ export def "delete" [
 # detail for one table (its columns and constraints); `--find` searches table and
 # column names and comments case-insensitively; `--full` returns the raw cache
 # record, including its `meta`. `--refresh` rebuilds the cache from the live
-# database before reading. `--only`/`--exclude` narrow the tables shown in EVERY
-# view (comma-separated names — bare or `schema.`-qualified, `*` globs allowed);
+# database before reading. `--include`/`--exclude` (mutually exclusive) narrow the
+# tables shown in EVERY view (comma-separated names — bare or `schema.`-qualified,
+# `*` globs allowed);
 # excluding a table also drops any foreign key that pointed at it, so a filtered
 # `--full` feeds `mole-mermaid` a clean diagram of just the tables you want.
 # Connection/target overridable as in `raw-query`.
@@ -522,7 +523,7 @@ export def "delete" [
   mole-duckdb schema --full -c duckdb-local-dev
 }
 @example "render only the core tables as a Mermaid ER diagram" {
-  mole-duckdb schema --full --only "users,orders,order_items" -c duckdb-local-dev | mole-mermaid er-schema
+  mole-duckdb schema --full --include "users,orders,order_items" -c duckdb-local-dev | mole-mermaid er-schema
 }
 @example "dump everything except staging tables" {
   mole-duckdb schema --full --exclude "stg_*,tmp_*" -c duckdb-local-dev
@@ -533,14 +534,17 @@ export def "schema" [
   --find: string                                   # find tables/columns by name or comment (case-insensitive)
   --refresh(-r)                                    # rebuild the cache before reading
   --full                                           # return the full cache record
-  --only: string@"duckdb-tables-csv"               # keep only these tables — comma-sep names/globs (all views)
-  --exclude: string@"duckdb-tables-csv"            # drop these tables — comma-sep names/globs (all views)
+  --include: string@"duckdb-tables-csv"            # keep ONLY these tables — comma-sep names/globs (mutually exclusive with --exclude)
+  --exclude: string@"duckdb-tables-csv"            # drop these tables — comma-sep names/globs (mutually exclusive with --include)
   --path(-p): string                               # override the database file path (or :memory:)
   --database(-d): string                           # override the database file path (alias of --path)
   --set: record = {}                               # override any other connection field(s)
 ] {
+  if ($include | is-not-empty) and ($exclude | is-not-empty) {
+    error make {msg: "schema: --include and --exclude are mutually exclusive"}
+  }
   let conf = (duck-conf $connection $path $database $set)
-  let data = (sql schema-filter (duck-schema-load $conf --refresh=$refresh) --only (sql csv-split $only) --exclude (sql csv-split $exclude))
+  let data = (sql schema-filter (duck-schema-load $conf --refresh=$refresh) --include (sql csv-split $include) --exclude (sql csv-split $exclude))
   if $full { return $data }
   if ($find | is-not-empty) {
     sql schema-find $data $find

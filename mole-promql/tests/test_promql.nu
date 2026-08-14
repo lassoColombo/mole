@@ -111,6 +111,26 @@ def "matchers escapes quotes and backslashes in values" [] {
 }
 
 @test
+def "matcher-token splits a token into label, operator and value, longest operator first" [] {
+    assert equal (promql matcher-token "job=api") {label: job, op: "=", value: api}
+    assert equal (promql matcher-token "env!=dev") {label: env, op: "!=", value: dev}
+    assert equal (promql matcher-token "status=~5..") {label: status, op: "=~", value: "5.."}
+    assert equal (promql matcher-token "status!~5..") {label: status, op: "!~", value: "5.."}
+    assert equal (promql matcher-token "path=~/a=b") {label: path, op: "=~", value: "/a=b"}   # operator anchored after the label
+    assert equal (promql matcher-token "job=") {label: job, op: "=", value: ""}                # empty value is legal (value-stage trigger)
+    assert equal (promql matcher-token "nolabel") null                                         # no operator
+    assert equal (promql matcher-token "=api") null                                            # no label
+}
+
+@test
+def "matchers-tokens builds the block, quoting values, erroring on a bare token" [] {
+    assert equal (promql matchers-tokens ["job=api" "status=~5.." "env!=dev"]) '{job="api", status=~"5..", env!="dev"}'
+    assert equal (promql matchers-tokens []) ""
+    assert equal (promql matchers-tokens ['path=a"b']) '{path="a\"b"}'                          # escapes like `matchers`
+    assert error { promql matchers-tokens ["world"] }                                          # a bare non-matcher is a hard error, never a silent drop
+}
+
+@test
 def "build assembles selector, range, func and aggregation in order" [] {
     assert equal (promql build "up") "up"
     assert equal (promql build "up" --matchers '{job="api"}') 'up{job="api"}'

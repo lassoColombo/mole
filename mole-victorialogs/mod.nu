@@ -420,6 +420,7 @@ export def "select" [
 @category mole-victorialogs
 @example "hourly error counts over a day" { mole-victorialogs hits level:error --last 1day --step 1hr }
 @example "counts grouped by level" { mole-victorialogs hits --last 6hr --step 30min --field level }
+@example "inspect the composed filter without running" { mole-victorialogs hits level:error --dry-run | get query } --result "level:error"
 export def "hits" [
   ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
   --last(-L): duration
@@ -431,10 +432,13 @@ export def "hits" [
   --url: string
   --token: string
   --set: record = {}
+  --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vl-conf $connection $url $token $set)
+  let filter = (vl-compose-filter $filters)
+  if $dry_run { return {connection: ($conf | conn redact), query: $filter} }
   let range = (vl-range $last $start $end)
-  (client hits $conf (vl-compose-filter $filters)
+  (client hits $conf $filter
     --start (logsql vl-time $range.start) --end (logsql vl-time $range.end)
     --step (logsql step $step) --field $field)
   | logsql hits $in
@@ -576,6 +580,7 @@ export def "stats" [
 @category mole-victorialogs
 @example "all field names" { mole-victorialogs fields }
 @example "field names among errors in the last hour" { mole-victorialogs fields level:error --last 1hr }
+@example "inspect the composed filter without running" { mole-victorialogs fields level:error --dry-run | get query } --result "level:error"
 export def "fields" [
   ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
   --last(-L): duration
@@ -585,10 +590,13 @@ export def "fields" [
   --url: string
   --token: string
   --set: record = {}
+  --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vl-conf $connection $url $token $set)
+  let filter = (vl-compose-filter $filters)
+  if $dry_run { return {connection: ($conf | conn redact), query: $filter} }
   let range = (vl-range $last $start $end)
-  (client field-names $conf (vl-compose-filter $filters)
+  (client field-names $conf $filter
     --start (logsql vl-time $range.start) --end (logsql vl-time $range.end))
   | logsql values $in
 }
@@ -602,6 +610,7 @@ export def "fields" [
 @category mole-victorialogs
 @example "every level value" { mole-victorialogs field-values level }
 @example "top hosts among errors" { mole-victorialogs field-values host level:error --limit 20 }
+@example "inspect the composed filter without running" { mole-victorialogs field-values host level:error --dry-run | get query } --result "level:error"
 export def "field-values" [
   field: string@"vl-field"                         # the field name to enumerate
   ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
@@ -613,10 +622,13 @@ export def "field-values" [
   --url: string
   --token: string
   --set: record = {}
+  --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vl-conf $connection $url $token $set)
+  let filter = (vl-compose-filter $filters)
+  if $dry_run { return {connection: ($conf | conn redact), query: $filter} }
   let range = (vl-range $last $start $end)
-  (client field-values $conf (vl-compose-filter $filters) $field
+  (client field-values $conf $filter $field
     --start (logsql vl-time $range.start) --end (logsql vl-time $range.end) --limit $limit)
   | logsql values $in
 }
@@ -630,6 +642,7 @@ export def "field-values" [
 @category mole-victorialogs
 @example "all active streams" { mole-victorialogs streams }
 @example "streams carrying errors, last day" { mole-victorialogs streams level:error --last 1day --limit 50 }
+@example "inspect the composed filter without running" { mole-victorialogs streams level:error --dry-run | get query } --result "level:error"
 export def "streams" [
   ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
   --last(-L): duration
@@ -640,10 +653,13 @@ export def "streams" [
   --url: string
   --token: string
   --set: record = {}
+  --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vl-conf $connection $url $token $set)
+  let filter = (vl-compose-filter $filters)
+  if $dry_run { return {connection: ($conf | conn redact), query: $filter} }
   let range = (vl-range $last $start $end)
-  (client streams $conf (vl-compose-filter $filters)
+  (client streams $conf $filter
     --start (logsql vl-time $range.start) --end (logsql vl-time $range.end) --limit $limit)
   | logsql values $in
 }
@@ -657,6 +673,7 @@ export def "streams" [
 @category mole-victorialogs
 @example "the facet breakdown of the last hour" { mole-victorialogs facets --last 1hr }
 @example "facets among errors, 10 values per field" { mole-victorialogs facets level:error --limit 10 }
+@example "inspect the composed filter without running" { mole-victorialogs facets level:error --dry-run | get query } --result "level:error"
 export def "facets" [
   ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
   --last(-L): duration
@@ -667,10 +684,13 @@ export def "facets" [
   --url: string
   --token: string
   --set: record = {}
+  --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vl-conf $connection $url $token $set)
+  let filter = (vl-compose-filter $filters)
+  if $dry_run { return {connection: ($conf | conn redact), query: $filter} }
   let range = (vl-range $last $start $end)
-  (client facets $conf (vl-compose-filter $filters)
+  (client facets $conf $filter
     --start (logsql vl-time $range.start) --end (logsql vl-time $range.end) --limit $limit)
   | logsql facets $in
 }

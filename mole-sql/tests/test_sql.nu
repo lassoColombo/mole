@@ -255,8 +255,8 @@ def "schema-filter with no patterns returns data untouched" [] {
 }
 
 @test
-def "schema-filter --only keeps just the listed tables and prunes their columns" [] {
-    let r = (sql schema-filter (filter-data) --only [users])
+def "schema-filter --include keeps just the listed tables and prunes their columns" [] {
+    let r = (sql schema-filter (filter-data) --include [users])
     assert equal ($r.tables | get name) [users]
     assert equal ($r.columns | get table | uniq) [users]
     assert equal ($r.meta.driver) "psql"   # extra top-level keys survive
@@ -271,28 +271,28 @@ def "schema-filter --exclude drops matching tables, glob patterns included" [] {
 @test
 def "schema-filter drops a FK whose referenced table was pruned away" [] {
     # keep orders, drop users → the orders→users FK would dangle; it must be removed
-    let r = (sql schema-filter (filter-data) --only [orders])
+    let r = (sql schema-filter (filter-data) --include [orders])
     assert equal ($r.tables | get name) [orders]
     assert equal ($r.constraints | length) 0
 }
 
 @test
 def "schema-filter keeps an FK when both endpoints survive" [] {
-    let r = (sql schema-filter (filter-data) --only [users orders])
+    let r = (sql schema-filter (filter-data) --include [users orders])
     assert equal ($r.constraints | where type == "FOREIGN KEY" | length) 1
 }
 
 @test
-def "schema-filter applies exclude after only, so exclude wins on overlap" [] {
-    let r = (sql schema-filter (filter-data) --only [users orders] --exclude [orders])
+def "schema-filter applies exclude after include, so exclude wins on overlap" [] {
+    let r = (sql schema-filter (filter-data) --include [users orders] --exclude [orders])
     assert equal ($r.tables | get name) [users]
 }
 
 @test
 def "schema-filter matches qualified patterns against schema and name" [] {
-    assert equal (sql schema-filter (filter-data) --only ["public.orders"] | get tables.name) [orders]
+    assert equal (sql schema-filter (filter-data) --include ["public.orders"] | get tables.name) [orders]
     # a wrong schema qualifier matches nothing
-    assert equal (sql schema-filter (filter-data) --only ["other.orders"] | get tables.name) []
+    assert equal (sql schema-filter (filter-data) --include ["other.orders"] | get tables.name) []
 }
 
 @test

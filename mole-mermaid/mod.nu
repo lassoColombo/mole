@@ -88,7 +88,7 @@ def rose-pine-mermaid-config []: nothing -> record {
   mole-psql schema --full -c my-pg | mole-mermaid er-schema
 }
 @example "narrow the diagram to just the tables you care about (filtered at the source)" {
-  mole-psql schema --full --only "users,orders,order_items" -c my-pg | mole-mermaid er-schema
+  mole-psql schema --full --include "users,orders,order_items" -c my-pg | mole-mermaid er-schema
 }
 @example "or exclude the noise (foreign keys into dropped tables are pruned too)" {
   mole-psql schema --full --exclude "*_audit,django_*" -c my-pg | mole-mermaid er-schema

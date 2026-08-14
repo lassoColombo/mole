@@ -135,3 +135,28 @@ export def "catalog-ctx" [
   let getter = if ($get == null) { {|c| cache read (cache path $driver ($c | get -o name | default "_")) } } else { $get }
   try { (do $getter $conf) | default {} } catch { {} }
 }
+
+# The verbatim positional tokens already on a completion line, in order — the
+# command head and every flag (with its argument) stripped by the PARSER using the
+# command's real signature, and the token under the cursor dropped. [] on any parse
+# failure, so a completer that projects off this never throws.
+#
+# Reads `.span.span_source` (the raw token text), NOT the typed `.expr` — a bare
+# `key=value` positional collides with builtins like `select`/`labels` and parses as
+# a CellPath/garbage whose `.expr.String` is null, whereas `span_source` always
+# survives. Uses `ast --json` (not `--flatten`) so a range token like `status=~5..`
+# stays whole. ast's JSON is an unstable debug contract, so the whole read is
+# wrapped in `try` — a shape change degrades to global (unscoped) suggestions.
+#
+# A driver projects what it needs off this: the metric is `positionals.0`, the
+# matcher siblings are the operator-bearing tokens, etc.
+@category mole-lib
+@example "the positionals a select line carries" { positionals "mydriver select up job=api inst" }
+export def "positionals" [context: string]: nothing -> list<string> {
+  let prior = ($context | split row " " | drop 1 | str join " ")   # drop the cursor token
+  try {
+    ast $prior --json | get block | from json
+    | get pipelines.0.elements.0.expr.expr.Call.arguments
+    | each {|a| $a.Positional?.span?.span_source? } | compact
+  } catch { [] }
+}
