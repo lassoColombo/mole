@@ -63,6 +63,18 @@ export def "token" [context: string]: nothing -> string {
   $context | split row " " | last
 }
 
+# Split a comma-separated flag value into a clean list (trims and drops blanks; a
+# null or "" yields []). Multi-value flags are typed as ONE comma-string rather than
+# a `list<string>` `[...]` literal because Nushell can't tab-complete inside a list
+# literal — the flag's completer offers comma-joined candidates and the verb body
+# splits them here. Shared by every driver's `--by`/`--select`/`--without`/… flags.
+@category mole-lib
+@example "split a comma list, trimming blanks" { csv "job, method ,, host" } --result [job method host]
+@example "null or empty yields no items" { csv null } --result []
+export def "csv" [v: any]: nothing -> list<string> {
+  $v | default "" | into string | split row "," | str trim | where {|x| $x | is-not-empty }
+}
+
 # The value a value-flag already carries on the line, quote-aware. `names` are the
 # spellings to try (long + short); `--from "users u"` yields `users u` as ONE token
 # (a regex split would stop at the space). `--flag=value` is handled; the last

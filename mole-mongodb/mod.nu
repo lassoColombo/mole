@@ -220,11 +220,6 @@ def mongo-warm [conf: record]: nothing -> nothing {
 # The token under the cursor: the last whitespace-delimited chunk of the context.
 def mongo-token [ctx: string]: nothing -> string { $ctx | split row " " | last }
 
-# Split a comma-separated flag value into a clean list (trims, drops blanks).
-def csv [v: any]: nothing -> list<string> {
-  $v | default "" | split row "," | str trim | where {|x| $x | is-not-empty }
-}
-
 # The resolved connection a completion line names (via `-c`/`--connection` and an
 # optional `--database` override), or the current one. Null when nothing resolves.
 def mongo-ctx-conf [ctx: string]: nothing -> any {
@@ -281,10 +276,10 @@ def mongo-fields-for [ctx: string]: nothing -> list<string> {
 # group keys and the `--agg` accumulator aliases ALREADY on the line — so `--having`
 # and `--sort-by` complete columns that don't exist until the aggs are typed.
 def mongo-result-cols [ctx: string]: nothing -> list<string> {
-  let by = (csv (mongo parse-flag $ctx ["--by" "-b"]))
+  let by = (complete csv (mongo parse-flag $ctx ["--by" "-b"]))
   let dbk = (mongo parse-flag $ctx ["--date-bucket"])
   let bydate = if ($dbk | is-not-empty) { [($dbk | split row ":" | first)] } else { [] }
-  let aliases = (csv (mongo parse-flag $ctx ["--agg" "-a"]) | each {|t| try { (mongo parse-agg-token $t).alias } catch { null } } | where {|x| $x != null })
+  let aliases = (complete csv (mongo parse-flag $ctx ["--agg" "-a"]) | each {|t| try { (mongo parse-agg-token $t).alias } catch { null } } | where {|x| $x != null })
   $by ++ $bydate ++ $aliases
 }
 
@@ -464,8 +459,8 @@ export def "find" [
   if ($collection | is-empty) { error make {msg: "find: --collection <name> is required"} }
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
   let filter = (mongo build-filter $filters)
-  let proj = (mongo projection-spec (csv $select) (csv $exclude))
-  let sort = (mongo sort-spec (csv $sort_by))
+  let proj = (mongo projection-spec (complete csv $select) (complete csv $exclude))
+  let sort = (mongo sort-spec (complete csv $sort_by))
   let js = (mongo build-find $collection $filter --project $proj --sort $sort --limit $limit --skip $skip)
   if $dry_run { return {connection: ($conf | conn redact), query: $js} }
   let rows = (mongo-run $conf $js $raw)
@@ -519,8 +514,8 @@ export def "aggregate" [
   --dry-run(-n)
 ] {
   if ($collection | is-empty) { error make {msg: "aggregate: --collection <name> is required"} }
-  let by = (csv $by)
-  let aggs = (csv $agg)
+  let by = (complete csv $by)
+  let aggs = (complete csv $agg)
   if ($by | is-empty) and ($aggs | is-empty) and ($date_bucket | is-empty) {
     error make {msg: "aggregate: need at least --by, --date-bucket or --agg (use `find` for plain queries)"}
   }
@@ -528,8 +523,8 @@ export def "aggregate" [
   let js = (mongo build-pipeline $collection
     --match (mongo build-filter $match)
     --unwind $unwind --by $by --date-bucket $date_bucket --agg $aggs
-    --having (mongo build-filter (csv $having))
-    --sort (mongo sort-spec (csv $sort_by))
+    --having (mongo build-filter (complete csv $having))
+    --sort (mongo sort-spec (complete csv $sort_by))
     --limit $limit --skip $skip)
   if $dry_run { return {connection: ($conf | conn redact), query: $js} }
   let rows = (mongo-run $conf $js $raw)

@@ -100,13 +100,6 @@ def vm-warm [conf: record]: nothing -> nothing {
 
 # ---- query composition (shared by the verbs) ----------------------------------
 
-# Split a comma-separated flag value into a clean list (trims, drops blanks). The
-# CSV-string workaround for `--by`/`--without`, since Nushell can't complete inside
-# a `[...]` list literal.
-def vm-csv [v: any]: nothing -> list<string> {
-  $v | default "" | split row "," | str trim | where {|x| $x | is-not-empty }
-}
-
 # Build a scoping selector from an optional metric + matcher tokens. A "metric" that
 # actually carries an operator (`labels job=api`) is folded into the matchers, so
 # the leading positional stays unambiguous. Returns `metric{block}`, a bare
@@ -394,8 +387,8 @@ export def "select" [
   if ((promql matcher-token $metric) != null) {
     error make {msg: "select: the first argument must be a metric name, not a matcher"}
   }
-  let by = (vm-csv $by)
-  let without = (vm-csv $without)
+  let by = (complete csv $by)
+  let without = (complete csv $without)
   if (($by | is-not-empty) or ($without | is-not-empty)) and ($agg | is-empty) {
     error make {msg: "select: --by/--without require --agg"}
   }

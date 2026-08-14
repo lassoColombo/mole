@@ -163,11 +163,6 @@ def "vl-field" [context: string]: nothing -> list<string> {
 # context. Both list-style completers below reason about it.
 def vl-token [context: string]: nothing -> string { $context | split row " " | last }
 
-# Split a comma-separated flag value into a clean list (trims, drops blanks).
-def vl-csv [v: any]: nothing -> list<string> {
-  $v | default "" | split row "," | str trim | where {|x| $x | is-not-empty }
-}
-
 # Completer for the `--output` verbosity flag (see `logsql shape`).
 def "vl-output" []: nothing -> list<string> { ["compact" "wide" "full"] }
 
@@ -210,7 +205,7 @@ def "vl-fields-csv" [context: string]: nothing -> list<string> {
 # full contextual field list. Comma-list aware, like `vl-fields-csv`.
 def "vl-proj-csv" [context: string]: nothing -> list<string> {
   let prefix = (vl-token $context | str replace --regex '[^,]*$' '')
-  let proj = (vl-csv (vl-flag $context ["--select" "-S"]))
+  let proj = (complete csv (vl-flag $context ["--select" "-S"]))
   let fields = (if ($proj | is-not-empty) { $proj } else { vl-field $context })
   $fields | each {|f| $"($prefix)($f)" }
 }
@@ -227,10 +222,10 @@ def vl-aggs [
   median: any, p90: any, p95: any, p99: any
 ]: nothing -> list {
   let f = {|func: string, prefix: string, fields: any|
-    vl-csv $fields | each {|x| {expr: ($func + "(" + $x + ")"), name: ($prefix + "_" + (logsql stat-alias $x))} }
+    complete csv $fields | each {|x| {expr: ($func + "(" + $x + ")"), name: ($prefix + "_" + (logsql stat-alias $x))} }
   }
   let q = {|phi: string, prefix: string, fields: any|
-    vl-csv $fields | each {|x| {expr: ("quantile(" + $phi + ", " + $x + ")"), name: ($prefix + "_" + (logsql stat-alias $x))} }
+    complete csv $fields | each {|x| {expr: ("quantile(" + $phi + ", " + $x + ")"), name: ($prefix + "_" + (logsql stat-alias $x))} }
   }
   let specs = ([
     (if $count { [{expr: "count()", name: "count"}] })
@@ -254,7 +249,7 @@ def vl-aggs [
 # Comma-list aware, mirroring `vl-fields-csv`.
 def "vl-stat-cols" [context: string]: nothing -> list<string> {
   let prefix = (vl-token $context | str replace --regex '[^,]*$' '')
-  let by = (vl-csv (vl-flag $context ["--by" "-g"]))
+  let by = (complete csv (vl-flag $context ["--by" "-g"]))
   let aggs = (vl-aggs
     ($context =~ '(?:--count|-C)(?:\s|$)')
     (vl-flag $context ["--count-uniq"]) (vl-flag $context ["--sum"]) (vl-flag $context ["--avg"])
@@ -401,8 +396,8 @@ export def "select" [
   # by vl-compose-filter). `raw-query` is the escape hatch for a full LogsQL pipeline.
   let filter = (vl-compose-filter $filters)
   let q = (logsql build-pipeline $filter
-    --fields (vl-csv $select) --drop (vl-csv $drop)
-    --sort-by (vl-csv $sort_by) --desc=$desc --limit $limit
+    --fields (complete csv $select) --drop (complete csv $drop)
+    --sort-by (complete csv $sort_by) --desc=$desc --limit $limit
     --context-before $before --context-after $after)
   if $dry_run { return {connection: ($conf | conn redact), query: $q} }
   # Limit rides the `| limit` pipe in $q (so it applies after the sort), not the client param.
@@ -548,10 +543,10 @@ export def "stats" [
 ] {
   let conf = (vl-conf $connection $url $token $set)
   let filter = (vl-compose-filter $filters)
-  let by = (vl-csv $by)
+  let by = (complete csv $by)
   let aggs = (vl-aggs $count $count_uniq $sum $avg $min $max $median $p90 $p95 $p99)
   let q = (logsql build-stats $filter --aggs $aggs --by $by
-    --sort-by (vl-csv $sort_by) --desc=$desc --limit $limit)
+    --sort-by (complete csv $sort_by) --desc=$desc --limit $limit)
   if $dry_run { return {connection: ($conf | conn redact), query: $q} }
   # Instant vs range: same endpoints/shapers as raw-stats, then pivot long→wide
   # (unless --long) keyed on the by-fields (+ time for a range series).
