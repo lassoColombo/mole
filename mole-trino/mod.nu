@@ -41,6 +41,10 @@ export-env {
 # spelling.
 const TRINO_NULLS = [""]
 
+# The mole-sql predicate-rendering dialect spec. Trino string literals are ANSI: `\`
+# is literal, only `''` doubles a quote — so no backslash escaping.
+const TRINO_DIALECT = {backslash_escapes: false}
+
 # Statements that warrant a confirmation prompt before running. Trino writes/DDL
 # plus session-mutating statements (USE, SET SESSION, CALL, GRANT, …).
 def trino-dangerous []: nothing -> string {
@@ -214,6 +218,59 @@ def "trino-column" [context: string]: nothing -> list<string> {
   sql complete-columns (trino-catalog $context) $tbl
 }
 
+# Comma-list variant of `trino-column` for the multi-value `--group-by` flag:
+# re-prepend the already-typed columns so accepting a candidate extends the list
+# (Nushell can't complete inside a `[...]` list literal).
+def "trino-columns-csv" [context: string]: nothing -> list<string> {
+  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
+  trino-column $context | each {|c| $"($prefix)($c)" }
+}
+
+# Completion-only bounded/quiet distinct-value probe: a read-only SELECT run with a
+# short `--client-request-timeout` (the LIMIT bounds the result), returning the `v`
+# column's values (empty on any non-zero exit). Separate from `trino-exec` so the
+# verbs are untouched; the caller wraps it in `try`.
+def trino-probe [conf: record, sql: string]: nothing -> list<string> {
+  let server = $"($conf.host):($conf | get -o port | default 8080)"
+  let r = (^trino
+    --server $server
+    --user ($conf | get -o user | default "admin")
+    --catalog ($conf | get -o catalog)
+    --schema ($conf | get -o schema)
+    --client-request-timeout 3s
+    --output-format CSV_HEADER
+    --execute $sql
+  | complete)
+  if ($r.exit_code != 0) { return [] }
+  $r.stdout | from csv --no-infer | get -o v | default []
+}
+
+# Completer for the rest slot that holds BOTH projections and `col<op>value`
+# predicate tokens (`select`'s ...columns, `delete`'s ...predicates). A BARE token
+# completes column names (like `trino-column`). An `=`/`!=` token runs a LIVE,
+# bounded `SELECT DISTINCT <col>` — scoped to the sibling predicates and `--from`
+# table already on the line — and offers `col<op>value` for each distinct value
+# (best-effort: unreachable/slow/errored → no candidates). Comparison/LIKE/`in:`
+# tokens complete nothing; a distinct value with spaces/quotes may need manual
+# quoting when accepted.
+def "trino-arg" [context: string]: nothing -> list<string> {
+  let p = (sql predicate-token (complete token $context))
+  if ($p == null) { return (trino-column $context) }
+  if ($p.op not-in ["=" "!="]) or ($p.value | str starts-with "in:") { return [] }
+  let table = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
+  let conf = (complete conn-ctx $context "trino")
+  if ($table | is-empty) or ($conf | is-empty) { return [] }
+  let siblings = (sql split-args (complete positionals $context) | get predicates | where col != $p.col)
+  # The probe SELECT frame (incl. LIMIT) is the driver's — mole-sql only composes the WHERE.
+  let where = (sql build-where $siblings --dialect $TRINO_DIALECT)
+  let q = (sql assemble [
+    $"SELECT DISTINCT ($p.col) AS v FROM ($table)"
+    (if ($where | is-not-empty) { $"WHERE ($where)" })
+    "LIMIT 50"
+  ])
+  (try { trino-probe $conf $q } catch { [] }) | each {|v| $p.col + $p.op + $v }
+}
+
 # ---- SELECT clause renderers (trino-specific) ---------------------------------
 
 # SELECT head: `SELECT [DISTINCT] <cols>` (cols verbatim). Trino has no DISTINCT ON.
@@ -297,7 +354,17 @@ export def "raw-query" [
 # Clause bodies (columns, --where, --having, --sort-by terms) are passed to the
 # `trino` CLI VERBATIM — expressions like `count(*)`, `lower(x)` work; quote
 # reserved identifiers yourself. There is NO join support: the query always reads
-# the single `--from` table. Only the `--from` table's cached columns are
+# the single `--from` table.
+#
+# A positional token shaped `col<op>value` (`status=active`, `age>=30`,
+# `name~%acme%`, `role=in:admin,ops`, `deleted=null`) is composed into the WHERE
+# clause — AND-joined, and AND-combined with any raw `--where` — with its column
+# name tab-completing. Operators are `= != > >= < <=`, `~`/`!~` (LIKE / NOT LIKE),
+# and the `=null` / `=in:` forms; the value is quoted by shape (numbers/bools bare,
+# else a string literal). Bare tokens stay projected columns. Anything the grammar
+# can't express (an expression RHS, `OR`, a sub-select) goes in `--where`.
+#
+# Only the `--from` table's cached columns are
 # DB-typed; computed/aliased columns come back as lossless strings (use --raw to
 # skip typing entirely). --dry-run returns a {connection, query} record without running (secrets dropped). Connection is
 # overridable via --connection + per-field flags / --catalog / --schema / --set.
@@ -313,7 +380,7 @@ export def "raw-query" [
   mole-trino select mktsegment --distinct --from customer --dry-run | get query
 } --result "SELECT DISTINCT mktsegment FROM customer"
 @example "aggregate with GROUP BY and HAVING" {
-  mole-trino select custkey "count(*) AS n" --from orders --group-by [custkey] --having "count(*) > 5" --sort-by "n desc" --dry-run | get query
+  mole-trino select custkey "count(*) AS n" --from orders --group-by custkey --having "count(*) > 5" --sort-by "n desc" --dry-run | get query
 } --result "SELECT custkey, count(*) AS n FROM orders GROUP BY custkey HAVING count(*) > 5 ORDER BY n DESC"
 @example "ORDER BY ... NULLS LAST" {
   mole-trino select name acctbal --from customer --sort-by "acctbal desc nulls last" --dry-run | get query
@@ -321,14 +388,20 @@ export def "raw-query" [
 @example "pagination with LIMIT + OFFSET" {
   mole-trino select --from customer --sort-by custkey --limit 5 --offset 10 --dry-run | get query
 } --result "SELECT * FROM customer ORDER BY custkey LIMIT 5 OFFSET 10"
+@example "predicate tokens compose the WHERE clause (columns complete)" {
+  mole-trino select custkey name --from customer mktsegment=BUILDING acctbal>=5000 --dry-run | get query
+} --result "SELECT custkey, name FROM customer WHERE mktsegment = 'BUILDING' AND acctbal >= 5000"
+@example "IN, LIKE and NULL predicate forms, AND-combined with a raw --where" {
+  mole-trino select --from customer mktsegment=in:BUILDING,MACHINERY name~%Corp% phone=null --where "acctbal > 0" --dry-run | get query
+} --result "SELECT * FROM customer WHERE mktsegment IN ('BUILDING', 'MACHINERY') AND name LIKE '%Corp%' AND phone IS NULL AND (acctbal > 0)"
 @example "run for real — choose catalog/schema explicitly (tpch.tiny)" {
   mole-trino select custkey name acctbal --from customer --catalog tpch --schema tiny -c trino-local-dev
 }
 export def "select" [
-  ...columns: string@"trino-column"                # projected columns/expressions (default: *)
+  ...columns: string@"trino-arg"                   # projected columns, or `col<op>value` predicate tokens (default: *)
   --from(-F): string@"trino-table"                 # source table, single table only (an alias is allowed: "customer c")
-  --where(-w): string                              # WHERE predicate (without the keyword)
-  --group-by(-g): list<string>@"trino-column"      # GROUP BY keys
+  --where(-w): string                              # raw WHERE predicate, AND-combined with any col<op>value tokens
+  --group-by(-g): string@"trino-columns-csv"       # GROUP BY keys, comma-separated
   --having: string                                 # HAVING predicate (without the keyword)
   --sort-by(-s): string                            # ORDER BY terms, comma-separated: "col [asc|desc] [nulls first|last]"
   --limit(-l): int                                 # LIMIT N
@@ -346,10 +419,17 @@ export def "select" [
   --yes(-y)                                         # skip the dangerous-query prompt
 ] {
   if ($from | is-empty) { error make {msg: "select: --from <table> is required"} }
+  # --group-by arrives as ONE comma-joined string (Nushell can't complete inside a `[...]`
+  # literal); decode to the list `join-list` wants, shadowing the param.
+  let group_by = (sql csv-split $group_by)
+  # Split the rest slot: bare tokens are projections, `col<op>value` tokens are WHERE
+  # predicates, AND-combined with the raw --where.
+  let parts = (sql split-args $columns)
+  let where_sql = (sql build-where $parts.predicates --raw ($where | default "") --dialect $TRINO_DIALECT)
   let text = (sql assemble [
-    (trino-projection $columns $distinct)
+    (trino-projection $parts.projections $distinct)
     $"FROM ($from)"
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
+    (if ($where_sql | is-not-empty) { $"WHERE ($where_sql)" })
     (sql join-list ($group_by | default []) --prefix "GROUP BY ")
     (if ($having | is-not-empty) { $"HAVING ($having)" })
     (trino-order $sort_by)
@@ -420,17 +500,23 @@ export def "update" [
 
 # Compose and run a single-table Trino DELETE.
 #
-# Reads like the statement: `delete <table>`. The table is the leading positional
-# (completing table names). `--where` is the same verbatim predicate as `select`.
-# Trino DELETE is connector-dependent and has no RETURNING, no ORDER BY/LIMIT and
-# no join support — reach for `raw-query` for anything more.
+# Reads like the statement: `delete <table> <predicate>...`. The table is the
+# leading positional (completing table names); the `col<op>value` predicate tokens
+# (`user_id=7`, `status=inactive`, `role=in:a,b`) are AND-joined into the WHERE
+# clause, their column names completing — the same grammar as `select`. `--where`
+# is the raw escape (for an expression RHS, `OR`, a sub-select), AND-combined with
+# the tokens. Trino DELETE is connector-dependent and has no RETURNING, no ORDER
+# BY/LIMIT and no join support — reach for `raw-query` for anything more.
 #
 # DELETE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to delete every row unless you pass `--all`. `--dry-run` returns a
 # `{connection, query}` record without running. Connection overridable as in
 # `update`.
 @category mole-trino
-@example "delete the matched rows" {
+@example "predicate tokens build the filter (columns complete)" {
+  mole-trino delete sessions user_id=7 --dry-run | get query
+} --result "DELETE FROM sessions WHERE user_id = 7"
+@example "an expression filter uses the raw --where" {
   mole-trino delete sessions --where "expires_at < now()" --dry-run | get query
 } --result "DELETE FROM sessions WHERE expires_at < now()"
 @example "guard: an unfiltered DELETE needs --all" {
@@ -438,8 +524,9 @@ export def "update" [
 } --result "DELETE FROM staging_rows"
 export def "delete" [
   table: string@"trino-table"                      # target table (DELETE FROM <table>); single table, an alias is allowed: "customer c"
-  --where(-w): string                              # WHERE predicate (without the keyword)
-  --all                                            # allow an unfiltered DELETE (every row) when --where is omitted
+  ...predicates: string@"trino-arg"                # `col<op>value` filter tokens (AND-joined): user_id=7  status=inactive  role=in:a,b
+  --where(-w): string                              # raw WHERE predicate, AND-combined with any predicate tokens
+  --all                                            # allow an unfiltered DELETE (every row) when no filter is given
   --connection(-c): string@complete-connection   # named connection (default: current)
   --host(-h): string
   --port(-p): int
@@ -450,10 +537,15 @@ export def "delete" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($where | is-empty) and (not $all) {
-    error make {msg: "delete: refusing to delete every row without --where (pass --all to override)"}
+  let parts = (sql split-args $predicates)
+  if ($parts.projections | is-not-empty) {
+    error make {msg: ("delete: incomplete predicate(s): " + ($parts.projections | str join ", ") + " — use col=value, col>=value, col~pattern, col=in:a,b or col=null")}
   }
-  let text = (sql build-delete --table $table --where ($where | default ""))
+  let where_sql = (sql build-where $parts.predicates --raw ($where | default "") --dialect $TRINO_DIALECT)
+  if ($where_sql | is-empty) and (not $all) {
+    error make {msg: "delete: refusing to delete every row without a filter (pass --all to override)"}
+  }
+  let text = (sql build-delete --table $table --where ($where_sql | default ""))
   let conf = (trino-conf $connection $host $port $user $catalog $schema $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This DELETE will remove rows. Run it?" --yes=$yes)) { return }

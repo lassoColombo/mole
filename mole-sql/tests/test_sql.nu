@@ -334,3 +334,77 @@ def "complete-columns returns bare, unqualified names even without a table" [] {
     assert equal (sql complete-columns (sample-data)) [id name]
     assert equal (sql complete-columns (sample-data) | any {|c| $c =~ '\.'}) false
 }
+
+# ---- predicate tokens ---------------------------------------------------------
+
+@test
+def "predicate-token parses operator tokens and rejects projections" [] {
+    assert equal (sql predicate-token "status=active") {col: status, op: "=", value: active}
+    assert equal (sql predicate-token "age>=30") {col: age, op: ">=", value: "30"}   # longest-first: >= not >
+    assert equal (sql predicate-token "age<10") {col: age, op: "<", value: "10"}
+    assert equal (sql predicate-token "name~%a%") {col: name, op: "~", value: "%a%"}
+    assert equal (sql predicate-token "name!~%a%") {col: name, op: "!~", value: "%a%"}
+    assert equal (sql predicate-token "t.col!=x") {col: "t.col", op: "!=", value: x}   # dotted column
+    # projections / bare tokens carry no operator
+    assert equal (sql predicate-token "id") null
+    assert equal (sql predicate-token "count(*) AS n") null
+}
+
+@test
+def "sql-literal quotes by value shape and escapes backslash per dialect" [] {
+    assert equal (sql sql-literal "active") "'active'"
+    assert equal (sql sql-literal "30") "30"
+    assert equal (sql sql-literal "-3.5") "-3.5"
+    assert equal (sql sql-literal "true") "true"
+    assert equal (sql sql-literal "False") "false"
+    assert equal (sql sql-literal "O'Brien") "'O''Brien'"
+    # backslash: LITERAL by default (psql/trino/duckdb); DOUBLED where the dialect
+    # treats `\` as an escape char (mysql/mariadb). Single-quoted nu strings are raw,
+    # so 'a\b' is a,\,b and 'a\\b' is a,\,\,b.
+    let q = "'"
+    assert equal (sql sql-literal 'a\b') ($q + 'a\b' + $q)                                 # default: 'a\b'
+    assert equal (sql sql-literal 'a\b' {backslash_escapes: true}) ($q + 'a\\b' + $q)      # mysql:   'a\\b'
+    assert equal (sql sql-literal "O'Brien" {backslash_escapes: true}) "'O''Brien'"        # quote-doubling still applies
+}
+
+@test
+def "render-predicate covers every operator form" [] {
+    assert equal (sql render-predicate {col: status, op: "=", value: active}) "status = 'active'"
+    assert equal (sql render-predicate {col: age, op: ">=", value: "30"}) "age >= 30"
+    assert equal (sql render-predicate {col: x, op: "!=", value: y}) "x <> 'y'"           # != → <>
+    assert equal (sql render-predicate {col: deleted, op: "=", value: "null"}) "deleted IS NULL"
+    assert equal (sql render-predicate {col: deleted, op: "!=", value: "null"}) "deleted IS NOT NULL"
+    assert equal (sql render-predicate {col: role, op: "=", value: "in:admin,ops"}) "role IN ('admin', 'ops')"
+    assert equal (sql render-predicate {col: role, op: "!=", value: "in:a,b"}) "role NOT IN ('a', 'b')"
+    assert equal (sql render-predicate {col: name, op: "~", value: "%acme%"}) "name LIKE '%acme%'"
+    assert equal (sql render-predicate {col: name, op: "!~", value: "%acme%"}) "name NOT LIKE '%acme%'"
+}
+
+@test
+def "split-args partitions projections from predicates" [] {
+    let r = (sql split-args ["id" "status=active" "count(*) AS n" "age>=30"])
+    assert equal $r.projections ["id" "count(*) AS n"]
+    assert equal $r.predicates [{col: status, op: "=", value: active} {col: age, op: ">=", value: "30"}]
+    assert equal (sql split-args []) {projections: [], predicates: []}
+}
+
+@test
+def "build-where AND-joins predicates and a raw where" [] {
+    let preds = [{col: status, op: "=", value: active} {col: age, op: ">=", value: "30"}]
+    assert equal (sql build-where $preds) "status = 'active' AND age >= 30"
+    assert equal (sql build-where $preds --raw "total > 0") "status = 'active' AND age >= 30 AND (total > 0)"
+    assert equal (sql build-where [] --raw "x IS NOT NULL") "x IS NOT NULL"   # raw-only: verbatim, no parens
+    assert equal (sql build-where []) null
+    assert equal (sql build-where [] --raw "") null
+}
+
+@test
+def "render-predicate and build-where forward the dialect escaping" [] {
+    let q = "'"
+    # a backslash value: default leaves it literal; the mysql spec doubles it
+    assert equal (sql render-predicate {col: path, op: "=", value: 'a\b'}) ("path = " + $q + 'a\b' + $q)
+    assert equal (sql render-predicate {col: path, op: "=", value: 'a\b'} {backslash_escapes: true}) ("path = " + $q + 'a\\b' + $q)
+    # build-where threads the dialect down to each predicate's literal
+    assert equal (sql build-where [{col: path, op: "=", value: 'a\b'}] --dialect {backslash_escapes: true}) ("path = " + $q + 'a\\b' + $q)
+    assert equal (sql build-where [{col: path, op: "=", value: 'a\b'}]) ("path = " + $q + 'a\b' + $q)
+}

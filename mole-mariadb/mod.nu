@@ -122,6 +122,55 @@ def "mariadb-column" [context: string]: nothing -> list<string> {
   sql complete-columns (mariadb-catalog $context) $tbl
 }
 
+# Comma-list variant of `mariadb-column` for the multi-value `--group-by` flag:
+# re-prepend the already-typed columns so accepting a candidate extends the list
+# (Nushell can't complete inside a `[...]` list literal).
+def "mariadb-columns-csv" [context: string]: nothing -> list<string> {
+  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
+  mariadb-column $context | each {|c| $"($prefix)($c)" }
+}
+
+# Completion-only bounded/quiet distinct-value probe: a read-only SELECT run with a
+# short connect timeout and MariaDB's per-statement `SET STATEMENT max_statement_time`
+# (seconds), returning the `v` column's values (empty on any non-zero exit). Separate
+# from `ma-exec` so the verbs are untouched; the caller wraps it in `try`.
+def ma-probe [conf: record, sql: string]: nothing -> list<string> {
+  let db = ($conf | get -o database)
+  let db_args = if ($db | is-not-empty) { ["-D" $db] } else { [] }
+  let bounded = ("SET STATEMENT max_statement_time=3 FOR " + $sql)
+  let r = (with-env { MYSQL_PWD: ($conf | get -o password | default "") } {
+    $bounded | ^mariadb --connect-timeout=3 -u ($conf | get -o user) -h ($conf | get -o host) -P ($conf | get -o port | default 3306) ...$db_args | complete
+  })
+  if ($r.exit_code != 0) { return [] }
+  $r.stdout | from tsv --no-infer | get -o v | default []
+}
+
+# Completer for the rest slot that holds BOTH projections and `col<op>value`
+# predicate tokens (`select`'s ...columns, `delete`'s ...predicates). A BARE token
+# completes column names (like `mariadb-column`). An `=`/`!=` token runs a LIVE,
+# bounded `SELECT DISTINCT <col>` — scoped to the sibling predicates and `--from`
+# table already on the line — and offers `col<op>value` for each distinct value
+# (best-effort: unreachable/slow/errored → no candidates). Comparison/LIKE/`in:`
+# tokens complete nothing; a distinct value with spaces/quotes may need manual
+# quoting when accepted.
+def "mariadb-arg" [context: string]: nothing -> list<string> {
+  let p = (sql predicate-token (complete token $context))
+  if ($p == null) { return (mariadb-column $context) }
+  if ($p.op not-in ["=" "!="]) or ($p.value | str starts-with "in:") { return [] }
+  let table = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
+  let conf = (complete conn-ctx $context "mariadb")
+  if ($table | is-empty) or ($conf | is-empty) { return [] }
+  let siblings = (sql split-args (complete positionals $context) | get predicates | where col != $p.col)
+  # The probe SELECT frame (incl. LIMIT) is the driver's — mole-sql only composes the WHERE.
+  let where = (sql build-where $siblings --dialect (myql dialect))
+  let q = (sql assemble [
+    $"SELECT DISTINCT ($p.col) AS v FROM ($table)"
+    (if ($where | is-not-empty) { $"WHERE ($where)" })
+    "LIMIT 50"
+  ])
+  (try { ma-probe $conf $q } catch { [] }) | each {|v| $p.col + $p.op + $v }
+}
+
 def "mariadb-lock" [context: string]: nothing -> list<string> { myql lock-modes }
 
 # ---- user verbs ---------------------------------------------------------------
@@ -172,7 +221,16 @@ export def "raw-query" [
 # keys, `--sort-by` terms — is passed to mariadb VERBATIM, so expressions like
 # `count(*)`, `json_extract(x,'$.k')` all work; you quote reserved identifiers
 # yourself. There is NO join support: the query always reads the single `--from`
-# table. Flags render the mysql-dialect frame around the clause bodies:
+# table.
+#
+# A positional token shaped `col<op>value` (`status=active`, `age>=30`,
+# `name~%acme%`, `role=in:admin,ops`, `deleted=null`) is composed into the WHERE
+# clause — AND-joined, and AND-combined with any raw `--where` — with its column
+# name tab-completing. Operators are `= != > >= < <=`, `~`/`!~` (LIKE / NOT LIKE),
+# and the `=null` / `=in:` forms; the value is quoted by shape (numbers/bools bare,
+# else a string literal). Bare tokens stay projected columns. Anything the grammar
+# can't express (an expression RHS like `now()`, `OR`, a sub-select) goes in
+# `--where`. Flags render the mysql-dialect frame around the clause bodies:
 # `GROUP BY ... WITH ROLLUP` (`--rollup`), and the locks
 # `FOR UPDATE|SHARE [OF ...] [SKIP LOCKED|NOWAIT]` plus the legacy
 # `LOCK IN SHARE MODE` (`--lock share-mode`). MariaDB has no `NULLS FIRST|LAST` and
@@ -200,10 +258,10 @@ export def "raw-query" [
   mole-mariadb select status --distinct --from orders --dry-run | get query
 } --result "SELECT DISTINCT status FROM orders"
 @example "aggregate with GROUP BY and HAVING" {
-  mole-mariadb select user_id "count(*) AS n" --from orders --group-by [user_id] --having "count(*) > 1" --sort-by "n desc" --dry-run | get query
+  mole-mariadb select user_id "count(*) AS n" --from orders --group-by user_id --having "count(*) > 1" --sort-by "n desc" --dry-run | get query
 } --result "SELECT user_id, count(*) AS n FROM orders GROUP BY user_id HAVING count(*) > 1 ORDER BY n DESC"
 @example "GROUP BY ... WITH ROLLUP — subtotal + grand-total rows" {
-  mole-mariadb select dept "count(*) AS n" --from employees --group-by [dept] --rollup --dry-run | get query
+  mole-mariadb select dept "count(*) AS n" --from employees --group-by dept --rollup --dry-run | get query
 } --result "SELECT dept, count(*) AS n FROM employees GROUP BY dept WITH ROLLUP"
 @example "multi-key ORDER BY" {
   mole-mariadb select name salary --from employees --sort-by "salary desc, name asc" --dry-run | get query
@@ -220,14 +278,20 @@ export def "raw-query" [
 @example "extract JSON verbatim (the column stays a string on MariaDB)" {
   mole-mariadb select sku "json_extract(attrs, '$.color') AS color" --from products --dry-run | get query
 } --result "SELECT sku, json_extract(attrs, '$.color') AS color FROM products"
+@example "predicate tokens compose the WHERE clause (columns complete)" {
+  mole-mariadb select id email --from users status=active age>=30 --dry-run | get query
+} --result "SELECT id, email FROM users WHERE status = 'active' AND age >= 30"
+@example "IN, LIKE and NULL predicate forms, AND-combined with a raw --where" {
+  mole-mariadb select --from users role=in:admin,ops name~%acme% deleted=null --where "score > 0" --dry-run | get query
+} --result "SELECT * FROM users WHERE role IN ('admin', 'ops') AND name LIKE '%acme%' AND deleted IS NULL AND (score > 0)"
 @example "run for real — tinyint(1)→bool, decimal→float (JSON stays a string)" {
   mole-mariadb select sku in_stock price tags --from products --sort-by id -c mariadb-local-dev
 }
 export def "select" [
-  ...columns: string@"mariadb-column"              # projected columns/expressions (default: *)
+  ...columns: string@"mariadb-arg"                 # projected columns, or `col<op>value` predicate tokens (default: *)
   --from(-F): string@"mariadb-table"               # source table, single table only (an alias is allowed: "users u")
-  --where(-w): string                              # WHERE predicate (without the keyword)
-  --group-by(-g): list<string>@"mariadb-column"    # GROUP BY keys
+  --where(-w): string                              # raw WHERE predicate, AND-combined with any col<op>value tokens
+  --group-by(-g): string@"mariadb-columns-csv"     # GROUP BY keys, comma-separated
   --rollup                                         # append WITH ROLLUP to GROUP BY
   --having: string                                 # HAVING predicate (without the keyword)
   --sort-by(-s): string                            # ORDER BY terms, comma-separated: "col [asc|desc]"
@@ -235,7 +299,7 @@ export def "select" [
   --offset(-o): int                                # OFFSET N (requires --limit)
   --distinct                                       # SELECT DISTINCT
   --lock: string@"mariadb-lock"                    # row lock: update | share | share-mode (LOCK IN SHARE MODE)
-  --lock-of: list<string>@"mariadb-table"          # FOR ... OF <tables> (update/share only)
+  --lock-of: string@"mariadb-tables-csv"           # FOR ... OF <tables>, comma-separated (update/share only)
   --skip-locked                                    # locking wait policy (update/share only)
   --nowait                                         # locking wait policy (update/share only)
   --connection(-c): string@complete-connection   # named connection (default: current)
@@ -249,6 +313,10 @@ export def "select" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the lock-confirmation prompt (with --lock)
 ] {
+  # Multi-value flags arrive as ONE comma-joined string (Nushell can't complete inside a
+  # `[...]` literal); decode to the list the clause renderers want, shadowing the params.
+  let group_by = (sql csv-split $group_by)
+  let lock_of = (sql csv-split $lock_of)
   if $skip_locked and $nowait {
     error make {msg: "select: --skip-locked and --nowait are mutually exclusive"}
   }
@@ -265,12 +333,16 @@ export def "select" [
     error make {msg: "select: --offset requires --limit (MariaDB rejects a bare OFFSET)"}
   }
   if ($from | is-empty) { error make {msg: "select: --from <table> is required"} }
+  # Split the rest slot: bare tokens are projections, `col<op>value` tokens are WHERE
+  # predicates, AND-combined with the raw --where.
+  let parts = (sql split-args $columns)
+  let where_sql = (sql build-where $parts.predicates --raw ($where | default "") --dialect (myql dialect))
   let group_frag = (sql join-list ($group_by | default []) --prefix "GROUP BY ")
   let group_frag = if ($group_frag != null) and $rollup { $group_frag + " WITH ROLLUP" } else { $group_frag }
   let text = (sql assemble [
-    (myql projection $columns $distinct)
+    (myql projection $parts.projections $distinct)
     $"FROM ($from)"
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
+    (if ($where_sql | is-not-empty) { $"WHERE ($where_sql)" })
     $group_frag
     (if ($having | is-not-empty) { $"HAVING ($having)" })
     (myql order $sort_by)
@@ -356,19 +428,25 @@ export def "update" [
 
 # Compose and run a single-table MariaDB DELETE.
 #
-# Reads like the statement: `delete <table>`. The table is the leading positional
-# (completing table names). `--where` is the same verbatim predicate as `select`.
-# Like UPDATE, MariaDB scopes a single-table DELETE with an optional
-# `ORDER BY ... LIMIT` (`--sort-by` / `--limit`) — delete the "oldest N" and so on.
-# There is NO RETURNING and NO join support (reach for `raw-query` for
-# `DELETE ... USING`/multi-table).
+# Reads like the statement: `delete <table> <predicate>...`. The table is the
+# leading positional (completing table names); the `col<op>value` predicate tokens
+# (`user_id=7`, `status=inactive`, `role=in:a,b`) are AND-joined into the WHERE
+# clause, their column names completing — the same grammar as `select`. `--where`
+# is the raw escape (for an expression RHS like `now()`, `OR`, a sub-select),
+# AND-combined with the tokens. Like UPDATE, MariaDB scopes a single-table DELETE
+# with an optional `ORDER BY ... LIMIT` (`--sort-by` / `--limit`) — delete the
+# "oldest N" and so on. There is NO RETURNING and NO join support (reach for
+# `raw-query` for `DELETE ... USING`/multi-table).
 #
 # DELETE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to delete every row unless you pass `--all`. `--dry-run` returns a
 # `{connection, query}` record without running. Connection overridable as in
 # `raw-query`.
 @category mole-mariadb
-@example "delete the matched rows" {
+@example "predicate tokens build the filter (columns complete)" {
+  mole-mariadb delete sessions user_id=7 --dry-run | get query
+} --result "DELETE FROM sessions WHERE user_id = 7"
+@example "an expression filter uses the raw --where" {
   mole-mariadb delete sessions --where "expires_at < now()" --dry-run | get query
 } --result "DELETE FROM sessions WHERE expires_at < now()"
 @example "delete the oldest N (ORDER BY ... LIMIT)" {
@@ -379,7 +457,8 @@ export def "update" [
 } --result "DELETE FROM staging_rows"
 export def "delete" [
   table: string@"mariadb-table"                    # target table (DELETE FROM <table>); single table, an alias is allowed: "users u"
-  --where(-w): string                              # WHERE predicate (without the keyword)
+  ...predicates: string@"mariadb-arg"              # `col<op>value` filter tokens (AND-joined): user_id=7  status=inactive  role=in:a,b
+  --where(-w): string                              # raw WHERE predicate, AND-combined with any predicate tokens
   --sort-by(-s): string                            # ORDER BY terms, comma-separated: "col [asc|desc]" (with --limit)
   --limit(-l): int                                 # LIMIT N — cap the rows removed
   --all                                            # allow an unfiltered DELETE (every row) when --where is omitted
@@ -393,11 +472,16 @@ export def "delete" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($where | is-empty) and (not $all) {
-    error make {msg: "delete: refusing to delete every row without --where (pass --all to override)"}
+  let parts = (sql split-args $predicates)
+  if ($parts.projections | is-not-empty) {
+    error make {msg: ("delete: incomplete predicate(s): " + ($parts.projections | str join ", ") + " — use col=value, col>=value, col~pattern, col=in:a,b or col=null")}
+  }
+  let where_sql = (sql build-where $parts.predicates --raw ($where | default "") --dialect (myql dialect))
+  if ($where_sql | is-empty) and (not $all) {
+    error make {msg: "delete: refusing to delete every row without a filter (pass --all to override)"}
   }
   let text = (sql assemble [
-    (sql build-delete --table $table --where ($where | default ""))
+    (sql build-delete --table $table --where ($where_sql | default ""))
     (myql order $sort_by)
     (if $limit != null { $"LIMIT ($limit)" })
   ])

@@ -179,6 +179,143 @@ export def "build-delete" [
   ]
 }
 
+# ---- predicate tokens (compose a WHERE from `col<op>value` tokens) -------------
+# The autocompleting-filter surface shared by every dialect's `select`/`delete`:
+# a rest-positional token shaped `col<op>value` (`status=active`, `age>=30`) is a
+# WHERE predicate; anything else (`id`, `count(*) AS n`) is a projection. This
+# mirrors `promql matcher-token` / `matchers-tokens` — the parse + compose is pure
+# and lives here; the plugins dispatch the rest slot, frame their own SELECT, and
+# wire the completer.
+#
+# The composed WHERE uses only the ANSI-COMMON vocabulary (`<>`, `LIKE`, `IS NULL`,
+# `IN`, `AND`, `''`-doubled quotes) — the same register as `build-update`/
+# `build-delete`. The ONE thing that genuinely varies across the supported dialects
+# is STRING-LITERAL BACKSLASH escaping: MySQL/MariaDB treat `\` as an escape char (a
+# value like `\'` would break out of the quotes), while Postgres/Trino/DuckDB take it
+# literally. That is INJECTED as a `dialect` record `{backslash_escapes: bool}` —
+# never hardcoded — exactly as the NULL placeholder is injected as `nulls`. Pagination
+# (`LIMIT`) and the rest of the SELECT frame are NOT built here: the plugins render
+# their own, as they already do for `select`. Anything the grammar can't express (an
+# expression RHS, `OR`, a sub-select) is a job for the raw `--where`.
+
+# Split a token into {col, op, value} when it carries a comparison operator; null
+# otherwise (⇒ the token is a projection, not a predicate). The operator is anchored
+# right after the column identifier and the alternation is longest-first, so `>=`
+# wins over `>` and an operator INSIDE the value is never mis-detected. `col` may be
+# dotted (`t.col`). This is the token form `select`/`delete` dispatch on.
+@category mole-sql
+@example "an equality token" { sql predicate-token "status=active" } --result {col: status, op: "=", value: active}
+@example "a comparison keeps a longest-first operator" { sql predicate-token "age>=30" } --result {col: age, op: ">=", value: "30"}
+@example "a projection carries no operator" { sql predicate-token "count(*) AS n" } --result null
+export def "predicate-token" [
+  token: string   # a rest-positional token, e.g. "status=active", "age>=30"
+]: nothing -> any {
+  let m = ($token | parse --regex '^(?P<col>[a-zA-Z_][a-zA-Z0-9_.]*)(?P<op>!=|>=|<=|!~|=|>|<|~)(?P<value>.*)$')
+  if ($m | is-empty) { null } else { $m | first }
+}
+
+# A value token → a SQL string literal, quoted by SHAPE: `true`/`false` and a plain
+# number stay bare; everything else is single-quoted with `'` doubled (`''`, which
+# every supported dialect accepts). The one dialect-varying bit — whether `\` is an
+# escape character inside a string literal — is INJECTED via `dialect`: pass
+# `{backslash_escapes: true}` (MySQL/MariaDB) to also double `\`→`\\`; an empty/absent
+# record (Postgres/Trino/DuckDB) leaves `\` literal. This matters for correctness AND
+# safety — on MySQL an un-escaped `\'` would break out of the quotes.
+@category mole-sql
+@example "a word is quoted" { sql sql-literal "active" } --result "'active'"
+@example "a number stays bare" { sql sql-literal "30" } --result "30"
+@example "an embedded quote is doubled (every dialect)" { sql sql-literal "O'Brien" } --result "'O''Brien'"
+export def "sql-literal" [
+  value: string
+  dialect: record = {}   # {backslash_escapes: bool}; injected by the plugin (default = ANSI, `\` literal)
+]: nothing -> string {
+  if ($value | str lowercase) in ["true" "false"] { return ($value | str lowercase) }
+  if ($value =~ '^-?[0-9]+(\.[0-9]+)?$') { return $value }
+  # `'`→`''` is universal; `\`→`\\` only where the dialect treats `\` as an escape
+  # char (do it FIRST, so the quotes we add aren't themselves backslash-escaped).
+  let esc = if ($dialect | get -o backslash_escapes | default false) {
+    $value | str replace --all '\' '\\' | str replace --all "'" "''"
+  } else {
+    $value | str replace --all "'" "''"
+  }
+  "'" + $esc + "'"
+}
+
+# Render one parsed predicate ({col, op, value}) as a SQL WHERE term. `=`/`!=` with
+# a `null` value become `IS [NOT] NULL`; with an `in:a,b` value become `[NOT] IN
+# (...)`; `~`/`!~` become `[NOT] LIKE`; every other operator is a direct comparison
+# (`!=` rendered as the portable `<>`). Values are quoted by `sql-literal`, to which
+# the injected `dialect` record (its string-escaping rules) is forwarded.
+@category mole-sql
+@example "an equality becomes a quoted comparison" { sql render-predicate {col: status, op: "=", value: active} } --result "status = 'active'"
+@example "a numeric comparison stays bare" { sql render-predicate {col: age, op: ">=", value: "30"} } --result "age >= 30"
+@example "null becomes IS NULL" { sql render-predicate {col: deleted, op: "=", value: "null"} } --result "deleted IS NULL"
+@example "an in: value becomes an IN list" { sql render-predicate {col: role, op: "=", value: "in:admin,ops"} } --result "role IN ('admin', 'ops')"
+@example "a tilde becomes LIKE" { sql render-predicate {col: name, op: "~", value: "%acme%"} } --result "name LIKE '%acme%'"
+export def "render-predicate" [
+  pred: record
+  dialect: record = {}   # {backslash_escapes: bool}, forwarded to `sql-literal`
+]: nothing -> string {
+  let col = $pred.col
+  let op = $pred.op
+  let value = ($pred.value | into string)
+  if (($value | str lowercase) == "null") and ($op in ["=" "!="]) {
+    return ($col + (if $op == "=" { " IS NULL" } else { " IS NOT NULL" }))
+  }
+  if ($value | str starts-with "in:") and ($op in ["=" "!="]) {
+    let items = ($value | str replace --regex '^in:' '' | split row "," | where {|x| $x | is-not-empty } | each {|x| sql-literal ($x | str trim) $dialect })
+    let kw = (if $op == "=" { "IN" } else { "NOT IN" })
+    return ($col + " " + $kw + " (" + ($items | str join ", ") + ")")
+  }
+  if $op == "~" { return ($col + " LIKE " + (sql-literal $value $dialect)) }
+  if $op == "!~" { return ($col + " NOT LIKE " + (sql-literal $value $dialect)) }
+  let sqlop = (if $op == "!=" { "<>" } else { $op })
+  $col + " " + $sqlop + " " + (sql-literal $value $dialect)
+}
+
+# Partition a rest-positional list into {projections, predicates}: operator-free
+# tokens are projections (kept verbatim), operator-bearing tokens are parsed
+# predicate records. `select` uses both halves; `delete` treats any leftover
+# projection as an incomplete predicate (its rest is filters-only).
+@category mole-sql
+@example "projections and predicates split by operator" {
+  sql split-args ["id" "status=active" "count(*) AS n"]
+} --result {projections: [id, "count(*) AS n"], predicates: [{col: status, op: "=", value: active}]}
+export def "split-args" [tokens: list<string>]: nothing -> record {
+  let tagged = ($tokens | each {|t| {tok: $t, pred: (predicate-token $t)} })
+  {
+    projections: ($tagged | where pred == null | get tok)
+    predicates: ($tagged | where pred != null | get pred)
+  }
+}
+
+# AND-join rendered predicates with an optional raw `--where` body (parenthesized,
+# so its precedence is preserved) into one WHERE clause body — null when both are
+# empty, so the caller's `WHERE (...)` slot drops. This is what `select`/`delete`
+# hand to `assemble` in place of the old raw `--where`.
+@category mole-sql
+@example "predicates AND-join with a raw where" {
+  sql build-where [{col: status, op: "=", value: active}] --raw "total > 0"
+} --result "status = 'active' AND (total > 0)"
+@example "no predicates and no raw where is null" {
+  sql build-where []
+} --result null
+export def "build-where" [
+  predicates: list<any>   # parsed predicate records (from `split-args` / `predicate-token`)
+  --raw: string = ""      # a raw `--where` body to AND-in, or ""
+  --dialect: record = {}  # {backslash_escapes: bool}, forwarded to `render-predicate` → `sql-literal`
+]: nothing -> any {
+  let composed = ($predicates | each {|p| render-predicate $p $dialect })
+  # No tokens ⇒ the raw --where stands alone, VERBATIM (unchanged legacy behavior);
+  # only when mixing tokens with a raw --where is the raw part parenthesized, so its
+  # own precedence (an `OR`, say) can't leak across the AND-joins.
+  if ($composed | is-empty) {
+    return (if ($raw | is-empty) { null } else { $raw })
+  }
+  let raw_part = (if ($raw | is-not-empty) { [("(" + $raw + ")")] } else { [] })
+  ($composed ++ $raw_part) | str join " AND "
+}
+
 # ---- result typing ------------------------------------------------------------
 
 # Wrap a cell-coercion closure so a `null` cell survives as `null`.

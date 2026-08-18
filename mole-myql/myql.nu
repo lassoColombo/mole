@@ -32,6 +32,16 @@ use mole-sql/sql.nu
 @example "the batch-mode NULL placeholder" { myql nulls } --result ["NULL"]
 export def "nulls" []: nothing -> list<string> { ["NULL"] }
 
+# The `mole-sql` predicate-rendering dialect spec for the MySQL family. Both MySQL
+# and MariaDB treat `\` as an escape character inside string literals by default
+# (unlike Postgres/Trino/DuckDB), so a value with a backslash must be doubled to be
+# safe — `backslash_escapes: true` tells `sql sql-literal` to do so. Fed to
+# `sql build-where` / `sql render-predicate` so the generic library carries no
+# per-dialect escaping knowledge.
+@category mole-myql
+@example "the MySQL-family escaping spec" { myql dialect } --result {backslash_escapes: true}
+export def "dialect" []: nothing -> record { {backslash_escapes: true} }
+
 # Statements that warrant a confirmation prompt before running (writes, DDL,
 # grants, admin). A superset guard, identical across MySQL and MariaDB.
 @category mole-myql

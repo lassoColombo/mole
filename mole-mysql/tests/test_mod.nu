@@ -41,7 +41,7 @@ def "dry-run distinct projection" [] {
 @test
 def "dry-run group-by with rollup and having" [] {
   fixture
-  assert equal (mole-mysql select dept "count(*) AS n" --from employees --group-by [dept] --rollup --having "count(*) > 1" -c mysql-local-dev --dry-run | get query) "SELECT dept, count(*) AS n FROM employees GROUP BY dept WITH ROLLUP HAVING count(*) > 1"
+  assert equal (mole-mysql select dept "count(*) AS n" --from employees --group-by dept --rollup --having "count(*) > 1" -c mysql-local-dev --dry-run | get query) "SELECT dept, count(*) AS n FROM employees GROUP BY dept WITH ROLLUP HAVING count(*) > 1"
 }
 
 @test
@@ -60,6 +60,18 @@ def "dry-run legacy lock in share mode" [] {
 def "dry-run pagination with limit and offset" [] {
   fixture
   assert equal (mole-mysql select --from users --sort-by id --limit 2 --offset 2 -c mysql-local-dev --dry-run | get query) "SELECT * FROM users ORDER BY id LIMIT 2 OFFSET 2"
+}
+
+@test
+def "dry-run predicate tokens compose the WHERE clause" [] {
+  fixture
+  assert equal (mole-mysql select id email --from users status=active age>=30 -c mysql-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE status = 'active' AND age >= 30"
+}
+
+@test
+def "dry-run predicate tokens AND-combine with a raw --where; IN, LIKE, NULL forms" [] {
+  fixture
+  assert equal (mole-mysql select --from users role=in:admin,ops name~%acme% deleted=null --where "score > 0" -c mysql-local-dev --dry-run | get query) "SELECT * FROM users WHERE role IN ('admin', 'ops') AND name LIKE '%acme%' AND deleted IS NULL AND (score > 0)"
 }
 
 # ---- connection handling ------------------------------------------------------
@@ -101,7 +113,7 @@ def "skip-locked and nowait are mutually exclusive" [] {
 @test
 def "lock-of without lock errors" [] {
   fixture
-  assert error { mole-mysql select --from orders --lock-of [t] -c mysql-local-dev --dry-run }
+  assert error { mole-mysql select --from orders --lock-of t -c mysql-local-dev --dry-run }
 }
 
 @test
@@ -148,6 +160,18 @@ def "dry-run delete filtered" [] {
 def "dry-run delete with order-by and limit" [] {
   fixture
   assert equal (mole-mysql delete logs --where "level = 'debug'" --sort-by "ts asc" --limit 1000 -c mysql-local-dev --dry-run | get query) "DELETE FROM logs WHERE level = 'debug' ORDER BY ts ASC LIMIT 1000"
+}
+
+@test
+def "dry-run delete builds the filter from predicate tokens" [] {
+  fixture
+  assert equal (mole-mysql delete sessions user_id=7 status=expired -c mysql-local-dev --dry-run | get query) "DELETE FROM sessions WHERE user_id = 7 AND status = 'expired'"
+}
+
+@test
+def "delete rejects an incomplete (operator-less) predicate token" [] {
+  fixture
+  assert error { mole-mysql delete sessions foo -c mysql-local-dev --dry-run }
 }
 
 # ---- write verbs: connection handling + safety guards -------------------------
