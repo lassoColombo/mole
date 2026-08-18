@@ -1,0 +1,41 @@
+// mole — a database dev workspace tab: a full-window nvim editor with a single
+// FLOATING, focused query REPL (90%×90%) on top.
+//
+// Installed into ~/.config/zellij/layouts/ by `mole-zellij install` and opened by
+// name via `mole-zellij dev <connection>` (which passes --cwd <project> --name
+// <connection>). The floating query pane runs `mole-zellij enter`, which activates
+// the connection dev recorded (sets $env.MOLE_CURRENT), so `mole-<driver> select …`
+// works with no --connection.
+//
+// Deliberately a bare tab: NO new_tab_template and NO swap_* layouts. And it
+// declares its OWN `floating_panes` (the single query pane) ON PURPOSE — that stops
+// zellij from inheriting the SESSION layout's scratch floating pane into this tab
+// (an editor-only layout with no floating_panes block falls back to that template,
+// which is what produced a second, stray floating window). `focus=true` sits on the
+// floating query ONLY — the editor is left unfocused so the query gets focus.
+//
+// MANAGED FILE: `mole-zellij dev`/`install` keep this identical to the shipped
+// version and will overwrite local edits — customise via the mole layouts/ source.
+layout {
+    cwd "/Users/colombos/"
+    tab name="mole" focus=true {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        pane command="nvim" name="editor" {
+            args "."
+        }
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+        floating_panes {
+            pane name="query" focus=true command="nu" {
+                args "--execute" "use mole-zellij; mole-zellij enter"
+                width "90%"
+                height "90%"
+                x "5%"
+                y "5%"
+            }
+        }
+    }
+}
