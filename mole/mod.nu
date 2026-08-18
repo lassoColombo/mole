@@ -36,8 +36,25 @@ export def "query edit" [
   queryfile?: string@"complete queryfile"   # Saved query to open, relative to the query dir; omit to open the dir itself
 ]: nothing -> nothing {
   let d = config querydir
+  mkdir $d   # ensure the query dir exists so `cd` below can't fail on first use
   let target = if ($queryfile | is-not-empty) { [$d $queryfile] | path join } else { $d }
-  nu -c $"cd ($d); ($env.EDITOR) ($target)"
+  # `$EDITOR` may carry flags (e.g. "code -w"); split them off the command name.
+  let ed = ($env.EDITOR? | default "vi" | split row " " | where {|w| $w != "" })
+  let cmd = ($ed | first)
+  let flags = ($ed | skip 1)
+  # Run the editor WITH the query dir as its working directory. `cd` is scoped to
+  # this command (query edit is not `--env`), so it sets the launched editor's cwd
+  # without changing the caller's dir. We launch the editor DIRECTLY (no `nu -c`
+  # subprocess / string interpolation, which mangled cwd/quoting).
+  cd $d
+  # For vim-family editors, also pin the working dir from inside the editor: a late
+  # `VimEnter` autocmd runs after the user's own config autocmds, so the query dir
+  # sticks even if a plugin would otherwise reset the cwd (e.g. to $HOME) on startup.
+  if (($cmd | path basename) in ["nvim" "vim" "gvim" "mvim" "vi" "view"]) {
+    ^$cmd ...$flags -c $"autocmd VimEnter * cd ($d)" $target
+  } else {
+    ^$cmd ...$flags $target
+  }
 }
 
 # Print the text of a saved query.
