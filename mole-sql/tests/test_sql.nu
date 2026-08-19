@@ -381,30 +381,145 @@ def "render-predicate covers every operator form" [] {
 }
 
 @test
-def "split-args partitions projections from predicates" [] {
-    let r = (sql split-args ["id" "status=active" "count(*) AS n" "age>=30"])
-    assert equal $r.projections ["id" "count(*) AS n"]
-    assert equal $r.predicates [{col: status, op: "=", value: active} {col: age, op: ">=", value: "30"}]
-    assert equal (sql split-args []) {projections: [], predicates: []}
+def "operators are injected: a dialect ops table renders via symbol/keyword/function/null-safe primitives" [] {
+    assert equal (sql ansi-ops | get token) ["=" "!=" ">=" "<=" ">" "<" "~" "!~"]   # the shared base (~ = LIKE, universal)
+    # a driver extends the base with dialect operators rendered four ways — a keyword
+    # (ILIKE via render-like), a function call (regex via render-func), and a null-safe
+    # comparator (render-nullsafe). These closures are DEFINED here (test module) and
+    # INVOKED inside mole-sql's render-predicate — the cross-module case drivers rely on.
+    let ops = (sql ansi-ops
+      | append {token: "~*",  desc: "ILIKE",      render: {|c, v, lit| sql render-like "ILIKE" $c $v $lit }}
+      | append {token: "!~*", desc: "NOT ILIKE",  render: {|c, v, lit| sql render-like "NOT ILIKE" $c $v $lit }}
+      | append {token: "=~",  desc: "regex",      render: {|c, v, lit| sql render-func "regexp_like" $c $v $lit }}
+      | append {token: "!=~", desc: "not regex",  render: {|c, v, lit| "NOT " + (sql render-func "regexp_like" $c $v $lit) }}
+      | append {token: "<=>", desc: "null-safe",  render: {|c, v, lit| sql render-nullsafe "<=>" $c $v $lit }})
+    # parse: longest-first precedence — ~* beats ~; =~ beats =; !=~ beats != ; <=> beats <= beats <
+    assert equal (sql predicate-token "name~*acme" --ops $ops) {col: name, op: "~*", value: acme}
+    assert equal (sql predicate-token "name~acme"  --ops $ops) {col: name, op: "~", value: acme}
+    assert equal (sql predicate-token "a=~^x"  --ops $ops) {col: a, op: "=~", value: "^x"}
+    assert equal (sql predicate-token "a=5"    --ops $ops) {col: a, op: "=", value: "5"}
+    assert equal (sql predicate-token "a!=~^x" --ops $ops) {col: a, op: "!=~", value: "^x"}
+    assert equal (sql predicate-token "a!=5"   --ops $ops) {col: a, op: "!=", value: "5"}
+    assert equal (sql predicate-token "a<=>b"  --ops $ops) {col: a, op: "<=>", value: b}
+    assert equal (sql predicate-token "a<=5"   --ops $ops) {col: a, op: "<=", value: "5"}
+    # render: keyword form (ILIKE), function form (regexp_like), null-safe (bare NULL on null value)
+    assert equal (sql render-predicate {col: name, op: "~*", value: acme} --ops $ops) "name ILIKE 'acme'"
+    assert equal (sql render-predicate {col: name, op: "=~", value: "^a"} --ops $ops) "regexp_like(name, '^a')"
+    assert equal (sql render-predicate {col: name, op: "!=~", value: "^a"} --ops $ops) "NOT regexp_like(name, '^a')"
+    assert equal (sql render-predicate {col: a, op: "<=>", value: b} --ops $ops) "a <=> 'b'"
+    assert equal (sql render-predicate {col: a, op: "<=>", value: "null"} --ops $ops) "a <=> NULL"
+    assert equal (sql render-predicate {col: name, op: "~", value: acme} --ops $ops) "name LIKE 'acme'"   # base ~ still LIKE
+    # build-where threads the SAME injected ops end-to-end (dual-mode, structured path)
+    assert equal (sql build-where "status=active,name=~^a" --ops $ops) "status = 'active' AND regexp_like(name, '^a')"
 }
 
 @test
-def "build-where AND-joins predicates and a raw where" [] {
-    let preds = [{col: status, op: "=", value: active} {col: age, op: ">=", value: "30"}]
-    assert equal (sql build-where $preds) "status = 'active' AND age >= 30"
-    assert equal (sql build-where $preds --raw "total > 0") "status = 'active' AND age >= 30 AND (total > 0)"
-    assert equal (sql build-where [] --raw "x IS NOT NULL") "x IS NOT NULL"   # raw-only: verbatim, no parens
-    assert equal (sql build-where []) null
-    assert equal (sql build-where [] --raw "") null
+def "regex-escape shields operator metacharacters" [] {
+    assert equal (sql regex-escape "~*") '~\*'
+    assert equal (sql regex-escape "<=>") "<=>"       # no regex metacharacters
+    assert equal (sql regex-escape "a.b") 'a\.b'
 }
 
 @test
-def "render-predicate and build-where forward the dialect escaping" [] {
+def "op-completions offers col<op> with descriptions" [] {
+    let cs = (sql op-completions "status" (sql ansi-ops))
+    assert equal ($cs | first) {value: "status=", description: equals}
+    assert equal ($cs | get value) ["status=" "status!=" "status>=" "status<=" "status>" "status<" "status~" "status!~"]
+}
+
+@test
+def "parse-where discriminates token-lists from raw SQL" [] {
+    assert equal (sql parse-where "status=active,age>=30") [{col: status, op: "=", value: active} {col: age, op: ">=", value: "30"}]
+    assert equal (sql parse-where "role=in:admin,ops") [{col: role, op: "=", value: "in:admin,ops"}]   # in: list folds back over the comma
+    assert equal (sql parse-where "status=active,role=in:a,b,age>=1") [{col: status, op: "=", value: active} {col: role, op: "=", value: "in:a,b"} {col: age, op: ">=", value: "1"}]
+    assert equal (sql parse-where "status = 'active' AND age > 5") null    # spaced operators ⇒ not a token-list ⇒ raw
+    assert equal (sql parse-where "(a OR b) AND c") null                    # leading non-token ⇒ raw
+    assert equal (sql parse-where "") []                                    # empty ⇒ no predicates (still structured)
+}
+
+@test
+def "render-where AND-joins predicate records" [] {
+    assert equal (sql render-where [{col: status, op: "=", value: active} {col: age, op: ">=", value: "30"}]) "status = 'active' AND age >= 30"
+    assert equal (sql render-where []) null
+    let q = "'"
+    assert equal (sql render-where [{col: path, op: "=", value: 'a\b'}] --dialect {backslash_escapes: true}) ("path = " + $q + 'a\\b' + $q)   # dialect escaping threads through
+}
+
+@test
+def "build-where is dual-mode: structured tokens or raw SQL verbatim" [] {
+    # structured: parses ⇒ rendered per-dialect (the token grammar)
+    assert equal (sql build-where "status=active,age>=30") "status = 'active' AND age >= 30"
+    assert equal (sql build-where "role=in:admin,ops") "role IN ('admin', 'ops')"
+    assert equal (sql build-where "deleted=null") "deleted IS NULL"
+    assert equal (sql build-where "name~%John Smith%") "name LIKE '%John Smith%'"   # a space in the VALUE is fine
+    # raw fallback: doesn't parse ⇒ verbatim (idiomatic spaced SQL, functions, parens)
+    assert equal (sql build-where "created_at > now() - interval '1 day'") "created_at > now() - interval '1 day'"
+    assert equal (sql build-where "id = 42") "id = 42"
+    assert equal (sql build-where "(a OR b) AND c") "(a OR b) AND c"
+    assert equal (sql build-where "") null
+    # dual-mode threads INJECTED dialect ops into the structured path (regex → function form)
+    let ops = (sql ansi-ops | append {token: "=~", desc: "regex", render: {|c, v, lit| sql render-func "regexp_like" $c $v $lit }})
+    assert equal (sql build-where "name=~^a" --ops $ops) "regexp_like(name, '^a')"
+    assert equal (sql build-where "name ~ '^a'" --ops $ops) "name ~ '^a'"           # spaced ⇒ raw even with custom ops
+}
+
+@test
+def "sort-token parses col and optional direction" [] {
+    assert equal (sql sort-token "created_at") {col: "created_at", dir: ""}
+    assert equal (sql sort-token "amount:desc") {col: "amount", dir: "DESC"}
+    assert equal (sql sort-token "name:asc") {col: "name", dir: "ASC"}
+    assert equal (sql sort-token "") null
+}
+
+@test
+def "build-order renders sort tokens or null" [] {
+    assert equal (sql build-order ["region" "amount:desc"]) "ORDER BY region, amount DESC"
+    assert equal (sql build-order ["id"]) "ORDER BY id"
+    assert equal (sql build-order []) null
+}
+
+@test
+def "sanitize-name flattens non-word chars" [] {
+    assert equal (sql sanitize-name "order.total") "order_total"
+    assert equal (sql sanitize-name "a b") "a_b"
+}
+
+@test
+def "build-aggs expands requests into SQL-like named specs" [] {
+    assert equal (sql build-aggs [{fn: "count"} {fn: "sum", cols: "amount"}]) [{expr: "count(*)", name: "count"} {expr: "sum(amount)", name: "sum_amount"}]
+    assert equal (sql build-aggs []) [{expr: "count(*)", name: "count"}]                              # empty → default count(*)
+    assert equal (sql build-aggs [{fn: "count-distinct", cols: "customer.id"}]) [{expr: "count(distinct customer.id)", name: "count_distinct_customer_id"}]
+    assert equal (sql build-aggs [{fn: "count"} {fn: "sum", cols: "x"} {fn: "avg", cols: "y"} {fn: "max", cols: "z"}] | get name) ["count" "sum_x" "avg_y" "max_z"]   # request order preserved
+    # a driver's INJECTED dialect aggregate renders via its own closure (string_agg here)
+    let aggs = (sql ansi-aggs | append {flag: "string_agg", fieldless: false, render: {|col| $"string_agg\(($col), ','\)" }})
+    assert equal (sql build-aggs [{fn: "string_agg", cols: "tags"}] $aggs) [{expr: "string_agg(tags, ',')", name: "string_agg_tags"}]
+}
+
+@test
+def "build-having expands aliases to expressions and count is always available" [] {
+    assert equal (sql build-having ["sum_amount>=1000"] [{expr: "sum(amount)", name: "sum_amount"}]) "HAVING sum(amount) >= 1000"
+    assert equal (sql build-having ["count>5"] []) "HAVING count(*) > 5"                            # count without --count
+    assert equal (sql build-having ["sum_amount>1" "count>=2"] [{expr: "sum(amount)", name: "sum_amount"}]) "HAVING sum(amount) > 1 AND count(*) >= 2"
+    assert equal (sql build-having []) null
+}
+
+@test
+def "apply-agg-types coerces numeric aggregate columns" [] {
+    let aggs = (sql build-aggs [{fn: "count"} {fn: "avg", cols: "amount"} {fn: "sum", cols: "x"} {fn: "min", cols: "ts"}])
+    let out = ([{count: "3", avg_amount: "4.5", sum_x: "10", min_ts: "2024-01-01"}] | sql apply-agg-types $aggs | first)
+    assert equal $out.count 3            # count → int
+    assert equal $out.avg_amount 4.5     # avg → float
+    assert equal $out.sum_x 10.0         # sum → float
+    assert equal $out.min_ts "2024-01-01"   # min/max untouched (schema types them)
+}
+
+@test
+def "render-predicate and render-where forward the dialect escaping" [] {
     let q = "'"
     # a backslash value: default leaves it literal; the mysql spec doubles it
     assert equal (sql render-predicate {col: path, op: "=", value: 'a\b'}) ("path = " + $q + 'a\b' + $q)
     assert equal (sql render-predicate {col: path, op: "=", value: 'a\b'} {backslash_escapes: true}) ("path = " + $q + 'a\\b' + $q)
-    # build-where threads the dialect down to each predicate's literal
-    assert equal (sql build-where [{col: path, op: "=", value: 'a\b'}] --dialect {backslash_escapes: true}) ("path = " + $q + 'a\\b' + $q)
-    assert equal (sql build-where [{col: path, op: "=", value: 'a\b'}]) ("path = " + $q + 'a\b' + $q)
+    # render-where threads the dialect down to each predicate's literal
+    assert equal (sql render-where [{col: path, op: "=", value: 'a\b'}] --dialect {backslash_escapes: true}) ("path = " + $q + 'a\\b' + $q)
+    assert equal (sql render-where [{col: path, op: "=", value: 'a\b'}]) ("path = " + $q + 'a\b' + $q)
 }

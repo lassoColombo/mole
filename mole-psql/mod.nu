@@ -38,6 +38,47 @@ const PG_NULLS = [""]
 # library carries no per-dialect escaping knowledge.
 const PG_DIALECT = {backslash_escapes: false}
 
+# The dialect's WHERE-operator vocabulary: the ANSI base (`= != >= <= > < ~ !~`, where
+# `~`/`!~` are the universal LIKE shortcut, plus the `=null`→IS NULL and `=in:`→IN forms)
+# EXTENDED with Postgres's own operators, each rendered natively and carrying a per-dialect
+# completion note: `~*`/`!~*`→ILIKE, `=~`/`!=~`→POSIX regex (`~`/`!~`), `<=>`→null-safe
+# equality (`IS NOT DISTINCT FROM`). Injected into every predicate-token / parse-where /
+# build-where / build-having call so the operators the grammar accepts AND completes (with
+# their notes) are Postgres's. Closures compose the `mole-sql` render primitives.
+def "pg-ops" []: nothing -> list {
+  sql ansi-ops
+  | append {token: "~*",  desc: "case-insensitive LIKE (ILIKE)",     render: {|c, v, lit| sql render-like "ILIKE" $c $v $lit }}
+  | append {token: "!~*", desc: "case-insensitive NOT LIKE (NOT ILIKE)", render: {|c, v, lit| sql render-like "NOT ILIKE" $c $v $lit }}
+  | append {token: "=~",  desc: "regex match (~)",  render: {|c, v, lit| sql render-cmp "~" $c $v $lit }}
+  | append {token: "!=~", desc: "not regex (!~)",   render: {|c, v, lit| sql render-cmp "!~" $c $v $lit }}
+  | append {token: "<=>", desc: "null-safe = (IS NOT DISTINCT FROM)", render: {|c, v, lit| sql render-nullsafe "IS NOT DISTINCT FROM" $c $v $lit }}
+}
+
+# The dialect's aggregate vocabulary: the ANSI base (count/sum/avg/min/max/count-distinct)
+# plus Postgres's `string_agg(col, ',')` (comma-joined string aggregation) → `string_agg_<col>`.
+# Injected into `sql build-aggs` so `stats` can compute a dialect aggregate the ANSI set
+# can't. Closures compose the SQL — the injection twin of `pg-ops`.
+def "pg-aggs" []: nothing -> list {
+  sql ansi-aggs
+  | append {flag: "string_agg", fieldless: false, render: {|col| $"string_agg\(($col), ','\)" }}
+}
+
+# Map the `stats` aggregate flags (typed values in the verb, completion-time strings in
+# the result-column completer) to the ordered `sql build-aggs` request list. Centralizes
+# the flag→request translation so the verb body and the `--sort-by`/`--having` completers
+# never drift; this order IS the SELECT output order.
+def "pg-agg-requests" [count: bool, sum: string, avg: string, min: string, max: string, count_distinct: string, string_agg: string]: nothing -> list {
+  [
+    (if $count { [{fn: "count"}] } else { [] })
+    (if ($sum | is-not-empty) { [{fn: "sum", cols: $sum}] } else { [] })
+    (if ($avg | is-not-empty) { [{fn: "avg", cols: $avg}] } else { [] })
+    (if ($min | is-not-empty) { [{fn: "min", cols: $min}] } else { [] })
+    (if ($max | is-not-empty) { [{fn: "max", cols: $max}] } else { [] })
+    (if ($count_distinct | is-not-empty) { [{fn: "count-distinct", cols: $count_distinct}] } else { [] })
+    (if ($string_agg | is-not-empty) { [{fn: "string_agg", cols: $string_agg}] } else { [] })
+  ] | flatten
+}
+
 # Statements that warrant a confirmation prompt before running.
 def pg-dangerous []: nothing -> string {
   '(?i)\b(delete|drop|truncate|update|insert|copy|create|alter|rename|grant|revoke|lock|analyze|vacuum|reindex|cluster|commit|rollback|savepoint|release|attach|detach|prepare|deallocate|execute|notify|listen)\b'
@@ -224,13 +265,17 @@ def "psql-column" [context: string]: nothing -> list<string> {
   sql complete-columns (psql-catalog $context) $tbl
 }
 
-# Comma-list variant of `psql-column` for the multi-value `--group-by`/`--distinct-on`/
-# `--returning` flags: re-prepend the already-typed columns so accepting a candidate
-# extends the list (Nushell can't complete inside a `[...]` list literal).
+# Comma-list variant of `psql-column` for the multi-value column flags (`--distinct-on`,
+# `--returning`, and `stats`' `--by`/`--sum`/`--avg`/…): re-prepend the already-typed
+# columns so accepting a candidate extends the list (Nushell can't complete inside a
+# `[...]` list literal).
 def "psql-columns-csv" [context: string]: nothing -> list<string> {
   let prefix = (complete token $context | str replace --regex '[^,]*$' '')
   psql-column $context | each {|c| $"($prefix)($c)" }
 }
+
+# `select`'s `--sort-by` completer: the source columns as `col[:desc]` sort tokens.
+def "psql-sort" [context: string]: nothing -> list<string> { complete sort-csv $context (psql-column $context) }
 
 # Completion-only bounded/quiet distinct-value probe: a read-only SELECT run with a
 # short connect + statement timeout and no password prompt (`-w`), returning the `v`
@@ -250,30 +295,50 @@ def pg-probe [conf: record, sql: string]: nothing -> list<string> {
   $r.stdout | from csv --no-infer | get -o v | default []
 }
 
-# Completer for the rest slot that holds BOTH projections and `col<op>value`
-# predicate tokens (`select`'s ...columns, `delete`'s ...predicates). A BARE token
-# completes column names (like `psql-column`). An `=`/`!=` token runs a LIVE,
-# bounded `SELECT DISTINCT <col>` — scoped to the sibling predicates and `--from`
-# table already on the line — and offers `col<op>value` for each distinct value
-# (best-effort: unreachable/slow/errored → no candidates). Comparison/LIKE/`in:`
-# tokens complete nothing; a distinct value with spaces/quotes may need manual
-# quoting when accepted.
-def "psql-arg" [context: string]: nothing -> list<string> {
-  let p = (sql predicate-token (complete token $context))
-  if ($p == null) { return (psql-column $context) }
+# `--where` completer: the dialect predicate completer, csv-aware (like `psql-having`).
+# `--where` holds a comma-list of `col<op>value` tokens; this completes the LAST segment
+# and re-prepends the earlier ones. Three stages: a partial segment completes column
+# NAMES; a COMPLETE column completes into the dialect OPERATORS (`col=`, `col~*`, … via
+# `op-completions` — so you never type `=` by hand); an `=`/`!=` segment then runs a
+# LIVE, bounded `SELECT DISTINCT <col>` — scoped to the sibling predicates already
+# committed in the flag and the `--from`/leading table — offering `col<op>value` for each
+# distinct value (best-effort: unreachable/slow/errored → nothing). Comparison/LIKE/`in:`
+# complete nothing further; a bare segment right after an open `in:` list also completes
+# nothing (so typing more in-list values isn't drowned in column names).
+def "psql-where" [context: string]: nothing -> list<any> {
+  let ops = (pg-ops)
+  let tok = (complete token $context)
+  let prefix = ($tok | str replace --regex '[^,]*$' '')       # everything up to & incl the last comma
+  let seg = ($tok | split row "," | last | default "")         # the segment being typed
+  let committed = ($prefix | str trim --char ",")
+  let pref_preds = (sql parse-where $committed --ops $ops)      # sibling predicates (null if the committed part is raw)
+  let p = (sql predicate-token $seg --ops $ops)
+  # mid open-in:-list — a bare segment after an in:-valued predicate ⇒ don't offer columns
+  if ($p == null) and ($pref_preds != null) and ($pref_preds | is-not-empty) and (($pref_preds | last | get value) | str starts-with "in:") {
+    return []
+  }
+  if ($p == null) {
+    let cols = (psql-column $context)
+    if ($seg in $cols) {
+      # exact column → the dialect operators (+ any longer columns sharing the prefix)
+      let longer = ($cols | where {|c| $c != $seg and ($c | str starts-with $seg) } | each {|c| {value: ($prefix + $c), description: "column"} })
+      return (((sql op-completions $seg $ops) | each {|r| {value: ($prefix + $r.value), description: $r.description} }) ++ $longer)
+    }
+    return ($cols | each {|c| $prefix + $c })
+  }
   if ($p.op not-in ["=" "!="]) or ($p.value | str starts-with "in:") { return [] }
   let table = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
   let conf = (complete conn-ctx $context "psql")
   if ($table | is-empty) or ($conf | is-empty) { return [] }
-  let siblings = (sql split-args (complete positionals $context) | get predicates | where col != $p.col)
   # The probe SELECT frame (incl. LIMIT) is the driver's — mole-sql only composes the WHERE.
-  let where = (sql build-where $siblings --dialect $PG_DIALECT)
+  let siblings = (if ($pref_preds == null) { [] } else { $pref_preds | where col != $p.col })
+  let where = (sql render-where $siblings --dialect $PG_DIALECT --ops $ops)
   let q = (sql assemble [
     $"SELECT DISTINCT ($p.col) AS v FROM ($table)"
     (if ($where | is-not-empty) { $"WHERE ($where)" })
     "LIMIT 50"
   ])
-  (try { pg-probe $conf $q } catch { [] }) | each {|v| $p.col + $p.op + $v }
+  (try { pg-probe $conf $q } catch { [] }) | each {|v| $prefix + $p.col + $p.op + $v }
 }
 
 def "psql-lock" [context: string]: nothing -> list<string> { ["update" "share" "no key update" "key share"] }
@@ -291,33 +356,6 @@ def pg-projection [columns: list<string>, distinct: bool, distinct_on: list<stri
     ""
   }
   $"SELECT ($quant)($cols)"
-}
-
-# One ORDER BY term: "<expr> [ASC|DESC] [NULLS FIRST|LAST]" (expr verbatim).
-def pg-order-term [term: string]: nothing -> string {
-  let toks = ($term | str trim | split row --regex '\s+')
-  if ($toks | is-empty) or (($toks | first) == "") { return "" }
-  mut rest = $toks
-  mut nulls = ""
-  let n = ($rest | length)
-  if $n >= 2 and (($rest | get ($n - 2) | str lowercase) == "nulls") and (($rest | last | str lowercase) in [first last]) {
-    $nulls = $" NULLS (($rest | last) | str uppercase)"
-    $rest = ($rest | first ($n - 2))
-  }
-  mut dir = ""
-  let m = ($rest | length)
-  if $m >= 1 and (($rest | last | str lowercase) in [asc desc]) {
-    $dir = $" (($rest | last) | str uppercase)"
-    $rest = ($rest | first ($m - 1))
-  }
-  $"($rest | str join ' ')($dir)($nulls)"
-}
-
-# ORDER BY from a comma-separated --sort-by string, or null when empty.
-def pg-order [sort_by: any]: nothing -> any {
-  if ($sort_by | is-empty) { return null }
-  let terms = ($sort_by | split row "," | each {|t| pg-order-term $t } | where {|t| $t | is-not-empty })
-  sql join-list $terms --prefix "ORDER BY "
 }
 
 # Locking tail: `FOR <MODE> [OF t, ...] [SKIP LOCKED|NOWAIT]`, or null.
@@ -370,22 +408,20 @@ export def "raw-query" [
 
 # Compose and run a single-table PostgreSQL SELECT, returning DB-typed rows.
 #
-# Every clause body — the projected columns, `--where`, `--having`, `--group-by`
-# keys, `--sort-by` terms — is passed to psql VERBATIM, so expressions like
-# `count(*)`, `lower(x)`, `x::int` all work; you quote reserved identifiers
-# yourself. There is NO join support: the query always reads the single `--from`
-# table.
+# Single-table ROW retrieval — projection, filter, order, paging, DISTINCT, and locks.
+# NO aggregation (reach for `stats`) and NO joins (reach for `raw-query`). The projected
+# columns are the rest slot (`id email`, `lower(x)`, `x::int`; commas optional, default
+# `*`), passed to psql VERBATIM — you quote reserved identifiers yourself.
 #
-# A positional token shaped `col<op>value` (`status=active`, `age>=30`,
-# `name~%acme%`, `role=in:admin,ops`, `deleted=null`) is composed into the WHERE
-# clause — AND-joined, and AND-combined with any raw `--where` — with its column
-# name tab-completing. Operators are `= != > >= < <=`, `~`/`!~` (LIKE / NOT LIKE),
-# and the `=null` / `=in:` forms; the value is quoted by shape (numbers/bools bare,
-# else a string literal). Bare tokens stay projected columns. Anything the grammar
-# can't express (an expression RHS like `now()`, `OR`, a sub-select) goes in
-# `--where`. Flags render the postgres-specific frame around the clause bodies:
-# `--distinct-on`, per-term `NULLS FIRST|LAST` in `--sort-by`, and the
-# `FOR UPDATE|SHARE|NO KEY UPDATE|KEY SHARE [OF ...] [SKIP LOCKED|NOWAIT]` locks.
+# The WHERE clause is `--where`, DUAL-MODE: a comma-separated `col<op>value` token-list
+# (`status=active,age>=30`, `name~%acme%`, `role=in:admin,ops`, `deleted=null`) whose
+# columns AND operators tab-complete; or — when it doesn't parse as tokens — raw SQL
+# passed through verbatim (an `OR`, a sub-select, `now()`, spaced operators). Token
+# operators are `= != > >= < <=`, `~`/`!~` (LIKE / NOT LIKE), and the `=null` / `=in:`
+# forms; the value is quoted by shape (numbers/bools bare, else a string literal).
+# `--sort-by` orders by `col[:desc]` tokens (a bare column is ASC); `NULLS FIRST|LAST`
+# and expression ordering are a `raw-query`. Postgres-specific frame: `--distinct-on`
+# and the `FOR UPDATE|SHARE|NO KEY UPDATE|KEY SHARE [OF ...] [SKIP LOCKED|NOWAIT]` locks.
 #
 # Only the `--from` table's cached columns are DB-typed (bool/int/numeric/date/
 # json → real nu values); computed and aliased columns stay strings, but
@@ -400,20 +436,14 @@ export def "raw-query" [
   mole-psql select --from users --dry-run | get query
 } --result "SELECT * FROM users"
 @example "project, filter, order and limit" {
-  mole-psql select id email --from users --where "age > 30" --sort-by "age desc" --limit 5 --dry-run | get query
+  mole-psql select id email --from users --where "age > 30" --sort-by age:desc --limit 5 --dry-run | get query
 } --result "SELECT id, email FROM users WHERE age > 30 ORDER BY age DESC LIMIT 5"
 @example "DISTINCT" {
   mole-psql select status --distinct --from orders --dry-run | get query
 } --result "SELECT DISTINCT status FROM orders"
 @example "DISTINCT ON (postgres-specific) — first row per user" {
-  mole-psql select user_id status --distinct-on user_id --from orders --sort-by "user_id, id desc" --dry-run | get query
+  mole-psql select user_id status --distinct-on user_id --from orders --sort-by user_id,id:desc --dry-run | get query
 } --result "SELECT DISTINCT ON (user_id) user_id, status FROM orders ORDER BY user_id, id DESC"
-@example "aggregate with GROUP BY and HAVING" {
-  mole-psql select user_id "count(*) AS n" --from orders --group-by user_id --having "count(*) > 1" --sort-by "n desc" --dry-run | get query
-} --result "SELECT user_id, count(*) AS n FROM orders GROUP BY user_id HAVING count(*) > 1 ORDER BY n DESC"
-@example "ORDER BY ... NULLS LAST (postgres-specific)" {
-  mole-psql select name salary --from employees --sort-by "salary desc nulls last" --dry-run | get query
-} --result "SELECT name, salary FROM employees ORDER BY salary DESC NULLS LAST"
 @example "pagination with LIMIT + OFFSET" {
   mole-psql select --from users --sort-by id --limit 2 --offset 2 --dry-run | get query
 } --result "SELECT * FROM users ORDER BY id LIMIT 2 OFFSET 2"
@@ -423,25 +453,23 @@ export def "raw-query" [
 @example "a window function passes through verbatim" {
   mole-psql select email "row_number() over (order by balance desc) AS rk" --from users --dry-run | get query
 } --result "SELECT email, row_number() over (order by balance desc) AS rk FROM users"
-@example "predicate tokens compose the WHERE clause (columns complete)" {
-  mole-psql select id email --from users status=active age>=30 --dry-run | get query
+@example "a --where token-list composes the WHERE clause (columns + operators complete)" {
+  mole-psql select id email --from users --where status=active,age>=30 --dry-run | get query
 } --result "SELECT id, email FROM users WHERE status = 'active' AND age >= 30"
-@example "predicate tokens AND-combine with a raw --where" {
-  mole-psql select --from orders status=active --where "total > 0" --dry-run | get query
-} --result "SELECT * FROM orders WHERE status = 'active' AND (total > 0)"
-@example "IN, LIKE and NULL predicate forms" {
-  mole-psql select --from users role=in:admin,ops name~%acme% deleted=null --dry-run | get query
+@example "--where falls back to raw SQL when it isn't a token-list" {
+  mole-psql select --from orders --where "total > 0 AND status <> 'void'" --dry-run | get query
+} --result "SELECT * FROM orders WHERE total > 0 AND status <> 'void'"
+@example "IN, LIKE and NULL predicate forms in one --where token-list" {
+  mole-psql select --from users --where role=in:admin,ops,name~%acme%,deleted=null --dry-run | get query
 } --result "SELECT * FROM users WHERE role IN ('admin', 'ops') AND name LIKE '%acme%' AND deleted IS NULL"
 @example "run for real — base-table columns come back DB-typed" {
   mole-psql select email is_active balance --from users --sort-by id -c postgres-local-dev
 }
 export def "select" [
-  ...columns: string@"psql-arg"                    # projected columns, or `col<op>value` predicate tokens (default: *)
+  ...columns: string@"psql-column"                 # projected columns (default: *); commas are optional and trimmed
   --from(-F): string@"psql-table"                  # source table, single table only (an alias is allowed: "users u")
-  --where(-w): string                              # raw WHERE predicate, AND-combined with any col<op>value tokens
-  --group-by(-g): string@"psql-columns-csv"        # GROUP BY keys, comma-separated
-  --having: string                                 # HAVING predicate (without the keyword)
-  --sort-by(-s): string                            # ORDER BY terms, comma-separated: "col [asc|desc] [nulls first|last]"
+  --where(-w): string@"psql-where"                 # WHERE: col<op>value token-list (comma-sep, completable) OR raw SQL
+  --sort-by(-s): string@"psql-sort"                # ORDER BY terms: col[:desc], comma-separated
   --limit(-l): int                                 # LIMIT N
   --offset(-o): int                                # OFFSET N
   --distinct                                       # SELECT DISTINCT
@@ -463,7 +491,6 @@ export def "select" [
 ] {
   # Multi-value flags arrive as ONE comma-joined string (Nushell can't complete inside a
   # `[...]` literal); decode to the list the clause renderers want, shadowing the params.
-  let group_by = (sql csv-split $group_by)
   let distinct_on = (sql csv-split $distinct_on)
   let lock_of = (sql csv-split $lock_of)
   if $distinct and ($distinct_on | is-not-empty) {
@@ -476,17 +503,15 @@ export def "select" [
     error make {msg: "select: --lock-of/--skip-locked/--nowait require --lock"}
   }
   if ($from | is-empty) { error make {msg: "select: --from <table> is required"} }
-  # Split the rest slot: bare tokens are projections, `col<op>value` tokens are WHERE
-  # predicates, AND-combined with the raw --where.
-  let parts = (sql split-args $columns)
-  let where_sql = (sql build-where $parts.predicates --raw ($where | default "") --dialect $PG_DIALECT)
+  # The rest slot is projection-only now (commas optional); WHERE lives in --where,
+  # dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse as tokens.
+  let cols = ($columns | each {|c| $c | str trim --char "," } | where {|c| $c | is-not-empty })
+  let where_sql = (sql build-where ($where | default "") --dialect $PG_DIALECT --ops (pg-ops))
   let text = (sql assemble [
-    (pg-projection $parts.projections $distinct ($distinct_on | default []))
+    (pg-projection $cols $distinct ($distinct_on | default []))
     $"FROM ($from)"
     (if ($where_sql | is-not-empty) { $"WHERE ($where_sql)" })
-    (sql join-list ($group_by | default []) --prefix "GROUP BY ")
-    (if ($having | is-not-empty) { $"HAVING ($having)" })
-    (pg-order $sort_by)
+    (sql build-order (sql csv-split $sort_by))
     (if $limit != null { $"LIMIT ($limit)" })
     (if $offset != null { $"OFFSET ($offset)" })
     (pg-lock $lock ($lock_of | default []) $skip_locked $nowait)
@@ -505,6 +530,126 @@ export def "select" [
   | sql apply-types (sql columns-for (pg-schema-load $conf) (sql base-table $from)) {|c| pg-type $c }
 }
 
+# ---- stats completers (result-column pool) ------------------------------------
+# The RESULT columns of a `stats` line: the `--by` keys ++ the aggregate auto-names,
+# reconstructed from the flags on the line via the SAME `sql build-aggs` the verb body
+# uses (so completion and the generated SQL never drift — the `vl-stat-cols` pattern).
+# No I/O: the aggregate names come from the flags, not the schema, so this completes
+# even without a reachable database.
+def "psql-result-cols" [context: string]: nothing -> list<string> {
+  let by = (complete csv (complete flag $context [--by -g]))
+  let requests = (pg-agg-requests
+    ($context =~ '(?:--count|-C)(?:\s|$)')
+    (complete flag $context [--sum] | default "")
+    (complete flag $context [--avg] | default "")
+    (complete flag $context [--min] | default "")
+    (complete flag $context [--max] | default "")
+    (complete flag $context [--count-distinct] | default "")
+    (complete flag $context [--string-agg] | default ""))
+  $by ++ ((sql build-aggs $requests (pg-aggs)) | get name)
+}
+
+# `--having` completer: partial two-stage — complete the RESULT-column name; once an
+# operator is typed the user fills the value (like mongo's `--having`). Comma-list aware.
+def "psql-having" [context: string]: nothing -> list<string> {
+  let tok = (complete token $context)
+  let seg = ($tok | split row "," | last)
+  if (sql predicate-token $seg --ops (pg-ops)) != null { return [] }
+  let prefix = ($tok | str replace --regex '[^,]*$' '')
+  psql-result-cols $context | each {|c| $"($prefix)($c)" }
+}
+
+# `--sort-by` completer over RESULT columns (`col[:desc]`), via the shared sort helper.
+def "psql-rsort" [context: string]: nothing -> list<string> { complete sort-csv $context (psql-result-cols $context) }
+
+# Compose and run a single-table PostgreSQL aggregation (GROUP BY), returning typed rows.
+#
+# The analytics twin of `select`: `stats` groups by `--by` keys and computes the
+# per-function aggregate flags (`--count`, `--sum`, `--avg`, `--min`, `--max`,
+# `--count-distinct`), each auto-named SQL-style (`count`, `sum_<col>`, `avg_<col>`,
+# `count_distinct_<col>`). `--where` is the PRE-aggregation filter — the same dual-mode
+# `col<op>value` token-list-or-raw-SQL as `select`. `--having`
+# filters the grouped rows with the same token grammar but over the RESULT columns
+# (`count>=10`, `sum_amount>1000`) — the alias is expanded back to its aggregate
+# expression, so it is portable across dialects; `count` is always available. `--sort-by`
+# orders the RESULT columns (`col[:desc]`), and `--limit`/`--offset` page them.
+#
+# No `--by` yields a grand total (one row); no aggregate flag defaults to `count(*)`.
+# Group keys come back DB-typed from the schema; `count`/`count_distinct` are ints and
+# `avg`/`sum` floats (`min`/`max` keep the source string unless you `--raw`). `--dry-run`
+# returns `{connection, query}`. Aggregations only READ, so there is no prompt.
+# Anything past this subset — joins, expression aggregates, GROUPING SETS, windows,
+# percentiles — is a `raw-query`. Connection overridable as in `raw-query`.
+@category mole-psql
+@example "count and sum per group, ordered, top-N" {
+  mole-psql stats --from orders --by region --count --sum amount --sort-by sum_amount:desc --limit 10 --dry-run | get query
+} --result "SELECT region, count(*) AS count, sum(amount) AS sum_amount FROM orders GROUP BY region ORDER BY sum_amount DESC LIMIT 10"
+@example "pre-filter + HAVING over result columns (alias expands to the expression)" {
+  mole-psql stats --from orders --by region,tier --count --avg amount --where status=active --having count>=10 --sort-by avg_amount:desc --dry-run | get query
+} --result "SELECT region, tier, count(*) AS count, avg(amount) AS avg_amount FROM orders WHERE status = 'active' GROUP BY region, tier HAVING count(*) >= 10 ORDER BY avg_amount DESC"
+@example "grand total — no --by" {
+  mole-psql stats --from orders --count --sum amount --dry-run | get query
+} --result "SELECT count(*) AS count, sum(amount) AS sum_amount FROM orders"
+@example "distinct customers per region" {
+  mole-psql stats --from orders --by region --count-distinct customer_id --dry-run | get query
+} --result "SELECT region, count(distinct customer_id) AS count_distinct_customer_id FROM orders GROUP BY region"
+@example "a Postgres dialect aggregate — comma-joined names per region" {
+  mole-psql stats --from users --by region --string-agg name --dry-run | get query
+} --result "SELECT region, string_agg(name, ',') AS string_agg_name FROM users GROUP BY region"
+@example "run for real — grouped rows come back DB-typed" {
+  mole-psql stats --from orders --by region --count --avg amount -c postgres-local-dev
+}
+export def "stats" [
+  --from(-F): string@"psql-table"                  # source table, single table only (an alias is allowed: "users u")
+  --where(-w): string@"psql-where"                 # WHERE: col<op>value token-list (comma-sep, completable) OR raw SQL (pre-aggregation)
+  --by(-g): string@"psql-columns-csv"              # GROUP BY keys, comma-separated
+  --count(-C)                                      # count(*) → `count`
+  --sum: string@"psql-columns-csv"                 # sum(col) → `sum_<col>`, comma-separated columns
+  --avg: string@"psql-columns-csv"                 # avg(col) → `avg_<col>`
+  --min: string@"psql-columns-csv"                 # min(col) → `min_<col>`
+  --max: string@"psql-columns-csv"                 # max(col) → `max_<col>`
+  --count-distinct: string@"psql-columns-csv"      # count(distinct col) → `count_distinct_<col>`
+  --string-agg: string@"psql-columns-csv"          # string_agg(col, ',') → `string_agg_<col>` (Postgres dialect aggregate)
+  --having: string@"psql-having"                   # post-aggregation filter tokens over RESULT columns (AND-joined)
+  --sort-by(-s): string@"psql-rsort"               # ORDER BY over RESULT columns: col[:desc], comma-separated
+  --limit(-l): int                                 # LIMIT N
+  --offset(-o): int                                # OFFSET N
+  --connection(-c): string@complete-connection   # named connection (default: current)
+  --host(-h): string
+  --port(-p): int
+  --user(-u): string
+  --password(-P): string
+  --database(-d): string
+  --set: record = {}
+  --raw(-R)                                         # raw driver output: no typing, no null-normalization
+  --dry-run(-n)                                    # return a {connection, query} record instead of running
+] {
+  if ($from | is-empty) { error make {msg: "stats: --from <table> is required"} }
+  let by = (sql csv-split $by)
+  let aggs = (sql build-aggs (pg-agg-requests $count ($sum | default "") ($avg | default "") ($min | default "") ($max | default "") ($count_distinct | default "") ($string_agg | default "")) (pg-aggs))
+  # --where is dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse.
+  let where_sql = (sql build-where ($where | default "") --dialect $PG_DIALECT --ops (pg-ops))
+  let proj = (($by ++ ($aggs | each {|a| $a.expr + " AS " + $a.name })) | str join ", ")
+  let text = (sql assemble [
+    $"SELECT ($proj)"
+    $"FROM ($from)"
+    (if ($where_sql | is-not-empty) { $"WHERE ($where_sql)" })
+    (sql join-list $by --prefix "GROUP BY ")
+    (sql build-having (sql csv-split $having) $aggs --dialect $PG_DIALECT --ops (pg-ops))
+    (sql build-order (sql csv-split $sort_by))
+    (if $limit != null { $"LIMIT ($limit)" })
+    (if $offset != null { $"OFFSET ($offset)" })
+  ])
+  let conf = (pg-conf $connection $host $port $user $password $database $set)
+  if $dry_run { return {connection: ($conf | conn redact), query: $text} }
+  let rows = (pg-rows $conf $text)
+  if $raw { return $rows }
+  $rows
+  | sql normalize-nulls $PG_NULLS
+  | sql apply-types (sql columns-for (pg-schema-load $conf) (sql base-table $from)) {|c| pg-type $c }
+  | sql apply-agg-types $aggs
+}
+
 # Compose and run a single-table PostgreSQL UPDATE.
 #
 # Reads like the statement: `update <table> <assignment>...`. The table is the
@@ -512,7 +657,8 @@ export def "select" [
 # positionals — each a verbatim `"col = expr"`, so expressions (`hits = hits + 1`,
 # `updated_at = now()`) all work; you quote identifiers and string literals
 # yourself, and their column names complete against the table. `--where` is the
-# same verbatim predicate as `select`; `--returning` names columns to hand back for
+# same dual-mode `col<op>value` token-list-or-raw-SQL predicate as `select`;
+# `--returning` names columns to hand back for
 # the changed rows (Postgres RETURNING), typed exactly like a `select` result.
 # There is NO join support — the target is the single table; reach for `raw-query`
 # for `UPDATE ... FROM`.
@@ -541,7 +687,7 @@ export def "select" [
 export def "update" [
   table: string@"psql-table"                       # target table (UPDATE <table>); single table, an alias is allowed: "users u"
   ...assignments: string@"psql-column"             # SET assignments, verbatim "col = expr" (at least one required)
-  --where(-w): string                              # WHERE predicate (without the keyword)
+  --where(-w): string@"psql-where"                 # WHERE: col<op>value token-list (comma-sep, completable) OR raw SQL
   --returning: string@"psql-columns-csv"           # RETURNING columns, comma-separated (typed like a select result)
   --all                                            # allow an unfiltered UPDATE (every row) when --where is omitted
   --connection(-c): string@complete-connection   # named connection (default: current)
@@ -560,7 +706,9 @@ export def "update" [
     error make {msg: "update: refusing to update every row without --where (pass --all to override)"}
   }
   let returning = (sql csv-split $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
-  let text = (sql build-update --table $table --set $assignments --where ($where | default "") --returning ($returning | default []))
+  # --where is dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse.
+  let where_sql = (sql build-where ($where | default "") --dialect $PG_DIALECT --ops (pg-ops))
+  let text = (sql build-update --table $table --set $assignments --where ($where_sql | default "") --returning ($returning | default []))
   let conf = (pg-conf $connection $host $port $user $password $database $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This UPDATE will modify rows. Run it?" --yes=$yes)) { return }
@@ -573,12 +721,11 @@ export def "update" [
 
 # Compose and run a single-table PostgreSQL DELETE.
 #
-# Reads like the statement: `delete <table> <predicate>...`. The table is the
-# leading positional (completing table names); the `col<op>value` predicate tokens
-# (`user_id=7`, `status=inactive`, `role=in:a,b`, `deleted=null`) are AND-joined
-# into the WHERE clause, their column names completing — the same grammar as
-# `select`. `--where` is the raw escape (for an expression RHS like `now()`, `OR`,
-# a sub-select), AND-combined with the tokens. `--returning` names columns to hand
+# Reads like the statement: `delete <table> --where <predicate>`. The table is the
+# leading positional (completing table names); `--where` is DUAL-MODE — a comma-
+# separated `col<op>value` token-list (`user_id=7`, `status=inactive`, `role=in:a,b`,
+# `deleted=null`) whose columns and operators complete, or raw SQL (an `OR`, `now()`,
+# a sub-select) when it doesn't parse — the same grammar as `select`. `--returning` names columns to hand
 # back for the deleted rows (Postgres RETURNING), typed exactly like a `select`
 # result. There is NO join support — deletes from the single table; reach for
 # `raw-query` for `DELETE ... USING`.
@@ -588,8 +735,8 @@ export def "update" [
 # `{connection, query}` record without running. Connection overridable as in
 # `raw-query`.
 @category mole-psql
-@example "predicate tokens build the filter (columns complete)" {
-  mole-psql delete sessions user_id=7 --dry-run | get query
+@example "a --where token-list builds the filter (columns + operators complete)" {
+  mole-psql delete sessions --where user_id=7 --dry-run | get query
 } --result "DELETE FROM sessions WHERE user_id = 7"
 @example "an expression filter uses the raw --where" {
   mole-psql delete sessions --where "expires_at < now()" --dry-run | get query
@@ -605,10 +752,9 @@ export def "update" [
 }
 export def "delete" [
   table: string@"psql-table"                       # target table (DELETE FROM <table>); single table, an alias is allowed: "users u"
-  ...predicates: string@"psql-arg"                 # `col<op>value` filter tokens (AND-joined): user_id=7  status=inactive  role=in:a,b
-  --where(-w): string                              # raw WHERE predicate, AND-combined with any predicate tokens
+  --where(-w): string@"psql-where"                 # WHERE: col<op>value token-list (comma-sep, completable) OR raw SQL
   --returning: string@"psql-columns-csv"           # RETURNING columns, comma-separated (typed like a select result)
-  --all                                            # allow an unfiltered DELETE (every row) when no filter is given
+  --all                                            # allow an unfiltered DELETE (every row) when --where is omitted
   --connection(-c): string@complete-connection   # named connection (default: current)
   --host(-h): string
   --port(-p): int
@@ -620,13 +766,10 @@ export def "delete" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  let parts = (sql split-args $predicates)
-  if ($parts.projections | is-not-empty) {
-    error make {msg: ("delete: incomplete predicate(s): " + ($parts.projections | str join ", ") + " — use col=value, col>=value, col~pattern, col=in:a,b or col=null")}
-  }
-  let where_sql = (sql build-where $parts.predicates --raw ($where | default "") --dialect $PG_DIALECT)
+  # --where is dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse.
+  let where_sql = (sql build-where ($where | default "") --dialect $PG_DIALECT --ops (pg-ops))
   if ($where_sql | is-empty) and (not $all) {
-    error make {msg: "delete: refusing to delete every row without a filter (pass --all to override)"}
+    error make {msg: "delete: refusing to delete every row without --where (pass --all to override)"}
   }
   let returning = (sql csv-split $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
   let text = (sql build-delete --table $table --where ($where_sql | default "") --returning ($returning | default []))

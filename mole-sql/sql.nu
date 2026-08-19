@@ -187,30 +187,111 @@ export def "build-delete" [
 # and lives here; the plugins dispatch the rest slot, frame their own SELECT, and
 # wire the completer.
 #
-# The composed WHERE uses only the ANSI-COMMON vocabulary (`<>`, `LIKE`, `IS NULL`,
-# `IN`, `AND`, `''`-doubled quotes) — the same register as `build-update`/
-# `build-delete`. The ONE thing that genuinely varies across the supported dialects
-# is STRING-LITERAL BACKSLASH escaping: MySQL/MariaDB treat `\` as an escape char (a
-# value like `\'` would break out of the quotes), while Postgres/Trino/DuckDB take it
-# literally. That is INJECTED as a `dialect` record `{backslash_escapes: bool}` —
-# never hardcoded — exactly as the NULL placeholder is injected as `nulls`. Pagination
-# (`LIMIT`) and the rest of the SELECT frame are NOT built here: the plugins render
-# their own, as they already do for `select`. Anything the grammar can't express (an
-# expression RHS, `OR`, a sub-select) is a job for the raw `--where`.
+# The operator VOCABULARY is DIALECT-INJECTED (see `ansi-ops` above): a driver passes
+# its own `ops` table into `predicate-token`/`parse-where`/`build-where`, so `~*`→ILIKE
+# (Postgres/DuckDB), `<=>`→null-safe equals (MySQL) etc. sit beside the ANSI base
+# (`<>`, `LIKE`, `IS NULL`, `IN`, `AND`, `''`-doubled quotes). String-literal BACKSLASH
+# escaping is likewise injected as a `dialect` record `{backslash_escapes: bool}` —
+# MySQL/MariaDB treat `\` as an escape char (a value like `\'` would break out of the
+# quotes), Postgres/Trino/DuckDB take it literally. Pagination (`LIMIT`) and the rest of
+# the SELECT frame are NOT built here: the plugins render their own, as they already do
+# for `select`. Anything the grammar can't express (an expression RHS, `OR`, a
+# sub-select) falls through `build-where`'s dual-mode to raw SQL.
+
+# ---- operator table (the injected WHERE-predicate vocabulary) ------------------
+# The set of comparison operators a `col<op>value` token may use is DIALECT-INJECTED:
+# `mole-sql` ships the ANSI base (`ansi-ops`) plus the render primitives, and a driver
+# passes its own `ops` table (base ++ its extras, e.g. `~*`→ILIKE, `<=>`) into
+# `predicate-token`/`parse-where`/`render-predicate`/`build-where`. Each operator is a
+# record `{token, desc, render}` whose `render` closure `{|col, value, lit|}` returns
+# the SQL term (`lit` = the pre-bound, dialect-escaping value quoter).
+
+# Escape regex metacharacters in a literal so an operator token can be embedded in the
+# `predicate-token` alternation (e.g. `~*` → `~\*`). Only `*` occurs in today's set;
+# kept general so future operators (`@>`, `?`, …) stay safe.
+@category mole-sql
+@example "a star is escaped" { sql regex-escape "~*" } --result '~\*'
+export def "regex-escape" [s: string]: nothing -> string {
+  $s | str replace --all --regex '([\\.^$*+?()\[\]{}|])' '\${1}'
+}
+
+# Render primitives, reused by every operator's `render` closure (and by drivers that
+# add their own operators). `render-eq` carries the universal `=`/`!=` value-forms: a
+# `null` value → `IS [NOT] NULL`, an `in:a,b` value → `[NOT] IN (...)`, else a plain
+# `= `/`<> ` comparison. `render-cmp`/`render-like` are the bare `<col> <op> <lit>` and
+# `<col> <kw> <lit>` shapes. `lit` is the injected value→literal quoter.
+@category mole-sql
+export def "render-eq" [neg: bool, col: string, value: string, lit: closure]: nothing -> string {
+  if (($value | str lowercase) == "null") { return ($col + (if $neg { " IS NOT NULL" } else { " IS NULL" })) }
+  if ($value | str starts-with "in:") {
+    let items = ($value | str replace --regex '^in:' '' | split row "," | where {|x| $x | is-not-empty } | each {|x| do $lit ($x | str trim) })
+    return ($col + (if $neg { " NOT IN (" } else { " IN (" }) + ($items | str join ", ") + ")")
+  }
+  $col + (if $neg { " <> " } else { " = " }) + (do $lit $value)
+}
+@category mole-sql
+export def "render-cmp" [op: string, col: string, value: string, lit: closure]: nothing -> string { $col + " " + $op + " " + (do $lit $value) }
+@category mole-sql
+export def "render-like" [kw: string, col: string, value: string, lit: closure]: nothing -> string { $col + " " + $kw + " " + (do $lit $value) }
+
+# Null-safe equality: `col <op> value`, but a `null` value renders the bare NULL keyword
+# (`col <op> NULL`) — the whole point of the operator. `op` is the dialect's null-safe
+# comparator: MySQL's `<=>` symbol, or the `IS NOT DISTINCT FROM` keyword everywhere else.
+@category mole-sql
+export def "render-nullsafe" [op: string, col: string, value: string, lit: closure]: nothing -> string {
+  if (($value | str lowercase) == "null") { $col + " " + $op + " NULL" } else { $col + " " + $op + " " + (do $lit $value) }
+}
+
+# Function-call form: `fn(col, value)` — for dialects whose match operator is a function,
+# not a symbol (Trino `regexp_like`, DuckDB `regexp_matches`). Negate by prefixing `NOT `.
+@category mole-sql
+export def "render-func" [fn: string, col: string, value: string, lit: closure]: nothing -> string { $fn + "(" + $col + ", " + (do $lit $value) + ")" }
+
+# The ANSI base operator vocabulary shared by every SQL dialect — the table a driver
+# starts from and appends its dialect extras to. `=`/`!=` carry the null/in: forms (via
+# `render-eq`); `~`/`!~` are the portable LIKE shortcut.
+@category mole-sql
+@example "the base tokens" { sql ansi-ops | get token } --result ["=" "!=" ">=" "<=" ">" "<" "~" "!~"]
+export def "ansi-ops" []: nothing -> list {
+  [
+    {token: "=",  desc: "equals",           render: {|c, v, lit| render-eq   false $c $v $lit }}
+    {token: "!=", desc: "not equals",       render: {|c, v, lit| render-eq   true  $c $v $lit }}
+    {token: ">=", desc: "greater or equal", render: {|c, v, lit| render-cmp  ">="  $c $v $lit }}
+    {token: "<=", desc: "less or equal",    render: {|c, v, lit| render-cmp  "<="  $c $v $lit }}
+    {token: ">",  desc: "greater than",     render: {|c, v, lit| render-cmp  ">"   $c $v $lit }}
+    {token: "<",  desc: "less than",        render: {|c, v, lit| render-cmp  "<"   $c $v $lit }}
+    {token: "~",  desc: "LIKE (pattern)",   render: {|c, v, lit| render-like "LIKE"     $c $v $lit }}
+    {token: "!~", desc: "NOT LIKE",         render: {|c, v, lit| render-like "NOT LIKE" $c $v $lit }}
+  ]
+}
+
+# Completion payload for the operator stage: given a (complete) column and the dialect
+# `ops`, offer `col<op>` for each operator with its description — so a bare column
+# completes straight into the available operators instead of the user typing `=` by
+# hand. Returns Nushell completion records {value, description}.
+@category mole-sql
+@example "columns complete into operators" { sql op-completions "status" (sql ansi-ops) | first } --result {value: "status=", description: equals}
+export def "op-completions" [col: string, ops: list]: nothing -> list {
+  $ops | each {|o| {value: ($col + $o.token), description: $o.desc} }
+}
 
 # Split a token into {col, op, value} when it carries a comparison operator; null
 # otherwise (⇒ the token is a projection, not a predicate). The operator is anchored
-# right after the column identifier and the alternation is longest-first, so `>=`
-# wins over `>` and an operator INSIDE the value is never mis-detected. `col` may be
-# dotted (`t.col`). This is the token form `select`/`delete` dispatch on.
+# right after the column identifier; the alternation is built from the injected `ops`
+# table sorted LONGEST-token-first (Rust regex alternation is leftmost-first, not
+# longest-match, so a proper-prefix op must follow its extension — `~*` before `~`,
+# `<=>` before `<=`). `col` may be dotted (`t.col`). `--ops` defaults to `ansi-ops`.
 @category mole-sql
 @example "an equality token" { sql predicate-token "status=active" } --result {col: status, op: "=", value: active}
 @example "a comparison keeps a longest-first operator" { sql predicate-token "age>=30" } --result {col: age, op: ">=", value: "30"}
 @example "a projection carries no operator" { sql predicate-token "count(*) AS n" } --result null
 export def "predicate-token" [
-  token: string   # a rest-positional token, e.g. "status=active", "age>=30"
+  token: string          # a rest-positional token, e.g. "status=active", "age>=30"
+  --ops: list = []       # injected operator table; default → ansi-ops
 ]: nothing -> any {
-  let m = ($token | parse --regex '^(?P<col>[a-zA-Z_][a-zA-Z0-9_.]*)(?P<op>!=|>=|<=|!~|=|>|<|~)(?P<value>.*)$')
+  let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
+  let alt = ($ops | get token | each {|t| {t: $t, n: ($t | str length)} } | sort-by n --reverse | get t | each {|t| regex-escape $t } | str join "|")
+  let m = ($token | parse --regex ('^(?P<col>[a-zA-Z_][a-zA-Z0-9_.]*)(?P<op>' + $alt + ')(?P<value>.*)$'))
   if ($m | is-empty) { null } else { $m | first }
 }
 
@@ -241,11 +322,14 @@ export def "sql-literal" [
   "'" + $esc + "'"
 }
 
-# Render one parsed predicate ({col, op, value}) as a SQL WHERE term. `=`/`!=` with
-# a `null` value become `IS [NOT] NULL`; with an `in:a,b` value become `[NOT] IN
-# (...)`; `~`/`!~` become `[NOT] LIKE`; every other operator is a direct comparison
-# (`!=` rendered as the portable `<>`). Values are quoted by `sql-literal`, to which
-# the injected `dialect` record (its string-escaping rules) is forwarded.
+# Render one parsed predicate ({col, op, value}) as a SQL WHERE term by looking its
+# operator up in the injected `ops` table and running that operator's `render` closure
+# — so the operator VOCABULARY and its SQL are per-dialect (a driver adds `~*`→ILIKE,
+# `<=>`→null-safe equals, …). The closure is handed `col`, `value`, and a pre-bound
+# `lit` quoter (`{|v| sql-literal v dialect}`) that already carries the dialect's
+# string-escaping, so operators never re-implement quoting. `--ops` defaults to
+# `ansi-ops` (`= != >= <= > < ~ !~`, with the `=null`→IS NULL and `=in:`→IN forms).
+# `dialect` stays the 2nd positional for back-compat.
 @category mole-sql
 @example "an equality becomes a quoted comparison" { sql render-predicate {col: status, op: "=", value: active} } --result "status = 'active'"
 @example "a numeric comparison stays bare" { sql render-predicate {col: age, op: ">=", value: "30"} } --result "age >= 30"
@@ -254,66 +338,233 @@ export def "sql-literal" [
 @example "a tilde becomes LIKE" { sql render-predicate {col: name, op: "~", value: "%acme%"} } --result "name LIKE '%acme%'"
 export def "render-predicate" [
   pred: record
-  dialect: record = {}   # {backslash_escapes: bool}, forwarded to `sql-literal`
+  dialect: record = {}   # {backslash_escapes: bool}, bound into the `lit` value-quoter
+  --ops: list = []       # injected operator table [{token, desc, render}]; default → ansi-ops
 ]: nothing -> string {
-  let col = $pred.col
-  let op = $pred.op
-  let value = ($pred.value | into string)
-  if (($value | str lowercase) == "null") and ($op in ["=" "!="]) {
-    return ($col + (if $op == "=" { " IS NULL" } else { " IS NOT NULL" }))
-  }
-  if ($value | str starts-with "in:") and ($op in ["=" "!="]) {
-    let items = ($value | str replace --regex '^in:' '' | split row "," | where {|x| $x | is-not-empty } | each {|x| sql-literal ($x | str trim) $dialect })
-    let kw = (if $op == "=" { "IN" } else { "NOT IN" })
-    return ($col + " " + $kw + " (" + ($items | str join ", ") + ")")
-  }
-  if $op == "~" { return ($col + " LIKE " + (sql-literal $value $dialect)) }
-  if $op == "!~" { return ($col + " NOT LIKE " + (sql-literal $value $dialect)) }
-  let sqlop = (if $op == "!=" { "<>" } else { $op })
-  $col + " " + $sqlop + " " + (sql-literal $value $dialect)
+  let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
+  let lit = {|v| sql-literal $v $dialect }
+  let spec = ($ops | where token == $pred.op | first)
+  do $spec.render $pred.col ($pred.value | into string) $lit
 }
 
-# Partition a rest-positional list into {projections, predicates}: operator-free
-# tokens are projections (kept verbatim), operator-bearing tokens are parsed
-# predicate records. `select` uses both halves; `delete` treats any leftover
-# projection as an incomplete predicate (its rest is filters-only).
-@category mole-sql
-@example "projections and predicates split by operator" {
-  sql split-args ["id" "status=active" "count(*) AS n"]
-} --result {projections: [id, "count(*) AS n"], predicates: [{col: status, op: "=", value: active}]}
-export def "split-args" [tokens: list<string>]: nothing -> record {
-  let tagged = ($tokens | each {|t| {tok: $t, pred: (predicate-token $t)} })
-  {
-    projections: ($tagged | where pred == null | get tok)
-    predicates: ($tagged | where pred != null | get pred)
+# ---- WHERE clause: parse / render / dual-mode build --------------------------
+# The `--where` flag is the single home for predicates on select/stats/update/delete.
+# Its value is EITHER a completable `col<op>value` token-list OR raw SQL, decided by
+# whether it parses (below). A token-list is comma-separated; an `in:` list keeps its
+# own commas, so `split row ","` alone would shatter `role=in:admin,ops` — `coalesce-
+# preds` folds an operator-LESS item back onto the preceding predicate to heal that.
+
+# Fold a comma-split back into predicate strings: an item that begins a `col<op>…`
+# token starts a new predicate; an operator-less item is an in:-list continuation and
+# re-joins (with its comma) to the previous one. A LEADING operator-less item ⇒ null
+# (the value isn't a token-list — it's raw SQL).
+def "coalesce-preds" [items: list<string>, ops: list]: nothing -> any {
+  mut out = []
+  for it in $items {
+    if ((predicate-token $it --ops $ops) != null) {
+      $out = ($out | append $it)
+    } else if ($out | is-empty) {
+      return null
+    } else {
+      # in:-list continuation: re-join to the predicate being built
+      $out = (($out | drop 1) | append (($out | last) + "," + $it))
+    }
   }
+  $out
 }
 
-# AND-join rendered predicates with an optional raw `--where` body (parenthesized,
-# so its precedence is preserved) into one WHERE clause body — null when both are
-# empty, so the caller's `WHERE (...)` slot drops. This is what `select`/`delete`
-# hand to `assemble` in place of the old raw `--where`.
+# Dual-mode discriminator: parse a `--where` VALUE as a comma-list of col<op>value
+# tokens (folding in:-list continuations). Returns the parsed predicate records when
+# EVERY item parses, `[]` when empty, or null when it is NOT a clean token-list (⇒ the
+# caller renders it as raw SQL). Because `predicate-token` anchors the operator right
+# after the column, idiomatic raw SQL (spaced operators, parens, functions) fails here
+# and falls through to raw — while tight tokens (`status=active,age>=30`) parse.
 @category mole-sql
-@example "predicates AND-join with a raw where" {
-  sql build-where [{col: status, op: "=", value: active}] --raw "total > 0"
-} --result "status = 'active' AND (total > 0)"
-@example "no predicates and no raw where is null" {
-  sql build-where []
+@example "a token-list parses to predicate records" {
+  sql parse-where "status=active,age>=30"
+} --result [{col: status, op: "=", value: active}, {col: age, op: ">=", value: "30"}]
+@example "an in: list survives the comma-split as one predicate" {
+  sql parse-where "role=in:admin,ops"
+} --result [{col: role, op: "=", value: "in:admin,ops"}]
+@example "raw SQL (spaced operator) is not a token-list" {
+  sql parse-where "status = 'active' AND age > 5"
 } --result null
-export def "build-where" [
-  predicates: list<any>   # parsed predicate records (from `split-args` / `predicate-token`)
-  --raw: string = ""      # a raw `--where` body to AND-in, or ""
-  --dialect: record = {}  # {backslash_escapes: bool}, forwarded to `render-predicate` → `sql-literal`
+export def "parse-where" [value: string, --ops: list = []]: nothing -> any {
+  let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
+  if ($value | str trim | is-empty) { return [] }
+  let coalesced = (coalesce-preds ($value | split row ",") $ops)
+  if ($coalesced == null) { return null }
+  let parsed = ($coalesced | each {|it| predicate-token $it --ops $ops })
+  if ($parsed | any {|p| $p == null }) { null } else { $parsed }
+}
+
+# AND-join rendered predicate records into a WHERE body (null when empty) — the render
+# half of the dual-mode builder. The `--where` completer reuses it to scope its live
+# distinct-probe to the sibling predicates already committed on the line.
+@category mole-sql
+@example "predicates AND-join into a WHERE body" {
+  sql render-where [{col: status, op: "=", value: active}, {col: age, op: ">=", value: "30"}]
+} --result "status = 'active' AND age >= 30"
+export def "render-where" [
+  predicates: list<any>   # parsed predicate records (from `parse-where` / `predicate-token`)
+  --dialect: record = {}  # {backslash_escapes: bool}, forwarded to `render-predicate`
+  --ops: list = []        # injected operator table; default → ansi-ops
 ]: nothing -> any {
-  let composed = ($predicates | each {|p| render-predicate $p $dialect })
-  # No tokens ⇒ the raw --where stands alone, VERBATIM (unchanged legacy behavior);
-  # only when mixing tokens with a raw --where is the raw part parenthesized, so its
-  # own precedence (an `OR`, say) can't leak across the AND-joins.
-  if ($composed | is-empty) {
-    return (if ($raw | is-empty) { null } else { $raw })
-  }
-  let raw_part = (if ($raw | is-not-empty) { [("(" + $raw + ")")] } else { [] })
-  ($composed ++ $raw_part) | str join " AND "
+  let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
+  let composed = ($predicates | each {|p| render-predicate $p $dialect --ops $ops })
+  if ($composed | is-empty) { null } else { $composed | str join " AND " }
+}
+
+# Build a WHERE body from a `--where` flag VALUE (dual-mode): when it parses as a
+# col<op>value token-list, render it per-dialect (structured); otherwise return it
+# VERBATIM (raw SQL fallback). Null when empty. The caller wraps `WHERE (<body>)`.
+@category mole-sql
+@example "a structured token-list renders per-dialect" {
+  sql build-where "status=active,age>=30"
+} --result "status = 'active' AND age >= 30"
+@example "an in: list renders as IN" {
+  sql build-where "role=in:admin,ops"
+} --result "role IN ('admin', 'ops')"
+@example "raw SQL falls through verbatim" {
+  sql build-where "created_at > now() - interval '1 day'"
+} --result "created_at > now() - interval '1 day'"
+export def "build-where" [
+  value: string
+  --dialect: record = {}  # {backslash_escapes: bool}, forwarded to `render-predicate` → `sql-literal`
+  --ops: list = []        # injected operator table; default → ansi-ops
+]: nothing -> any {
+  let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
+  if ($value | str trim | is-empty) { return null }
+  let preds = (parse-where $value --ops $ops)
+  if ($preds == null) { return $value }   # not a token-list ⇒ raw SQL, verbatim
+  render-where $preds --dialect $dialect --ops $ops
+}
+
+# ---- ORDER BY tokens (col[:asc|:desc]) ----------------------------------------
+
+# Parse one `col[:asc|:desc]` sort token into {col, dir}. A bare `col` sorts ASC
+# (dir ""); `col:desc`/`col:asc` set the direction explicitly. The no-space grammar
+# keeps the flag a single completable bareword (Nushell can't complete across a
+# space), so a PER-COLUMN direction survives while `--sort-by` still tab-completes.
+# Null when the column part is empty. An unrecognized suffix is treated as implicit
+# ASC (the direction word is dropped).
+@category mole-sql
+@example "a bare column sorts ascending" { sql sort-token "created_at" } --result {col: created_at, dir: ""}
+@example "a :desc suffix sets the direction" { sql sort-token "amount:desc" } --result {col: amount, dir: DESC}
+export def "sort-token" [tok: string]: nothing -> any {
+  let t = ($tok | str trim)
+  if ($t | is-empty) { return null }
+  let parts = ($t | split row ":")
+  let col = ($parts | first)
+  if ($col | is-empty) { return null }
+  let dir = (match ($parts | get -o 1 | default "" | str lowercase) {
+    "desc" => "DESC"
+    "asc" => "ASC"
+    _ => ""
+  })
+  {col: $col, dir: $dir}
+}
+
+# Build an `ORDER BY` clause from `col[:asc|:desc]` sort tokens, or null when none.
+# Bare columns render without a direction (SQL's implicit ASC); `:desc`/`:asc` add
+# the keyword. Identifiers render verbatim — in `select` they are projected/source
+# columns, in `stats` the group keys and aggregate result aliases (both valid in
+# ORDER BY on every dialect). `NULLS FIRST/LAST` and expression ordering are outside
+# this grammar — reach for `raw-query`.
+@category mole-sql
+@example "mixed directions" { sql build-order ["region" "amount:desc"] } --result "ORDER BY region, amount DESC"
+@example "no tokens drops the clause" { sql build-order [] } --result null
+export def "build-order" [tokens: list<string>]: nothing -> any {
+  let terms = ($tokens | each {|t| sort-token $t } | where {|s| $s != null } | each {|s|
+    if ($s.dir | is-empty) { $s.col } else { $s.col + " " + $s.dir }
+  })
+  if ($terms | is-empty) { null } else { "ORDER BY " + ($terms | str join ", ") }
+}
+
+# ---- aggregation (stats) ------------------------------------------------------
+
+# Sanitize a column reference into a valid, stable SQL result-column identifier:
+# every non-word character (dots in `a.b`, spaces, parens) becomes `_`. Used to
+# auto-name aggregate result columns (`sum(order.total)` → `sum_order_total`).
+@category mole-sql
+@example "dotted names flatten" { sql sanitize-name "order.total" } --result order_total
+export def "sanitize-name" [s: string]: nothing -> string {
+  $s | str replace --all --regex '[^\w]' '_'
+}
+
+# The ANSI base aggregate vocabulary shared by every SQL dialect — count/sum/avg/min/max
+# and count(distinct). Like the operator table, the aggregates `stats` can compute are
+# DIALECT-INJECTED: `mole-sql` ships this base and a driver passes its own `aggs` table
+# (base ++ extras, e.g. `string_agg`/`group_concat`/`median`) into `build-aggs`. Each
+# entry is `{flag, fieldless, render}` whose `render` closure `{|col|}` returns the SQL
+# aggregate expression; `count` is fieldless (`count(*)`), the rest take one column.
+@category mole-sql
+@example "the base flags" { sql ansi-aggs | get flag } --result ["count" "sum" "avg" "min" "max" "count-distinct"]
+export def "ansi-aggs" []: nothing -> list {
+  [
+    {flag: "count",          fieldless: true,  render: {|col| "count(*)" }}
+    {flag: "sum",            fieldless: false, render: {|col| $"sum\(($col)\)" }}
+    {flag: "avg",            fieldless: false, render: {|col| $"avg\(($col)\)" }}
+    {flag: "min",            fieldless: false, render: {|col| $"min\(($col)\)" }}
+    {flag: "max",            fieldless: false, render: {|col| $"max\(($col)\)" }}
+    {flag: "count-distinct", fieldless: false, render: {|col| $"count\(distinct ($col)\)" }}
+  ]
+}
+
+# Build the ordered aggregate specs `[{expr, name}]` from a list of REQUESTS and the
+# injected aggregate table. Each request is `{fn, cols?}`: a fieldless aggregate
+# (`{fn: "count"}`) yields one spec named after the fn; a field-list aggregate
+# (`{fn: "sum", cols: "a,b"}`) expands to one spec per field, auto-named `<fn>_<field>`
+# (fn and field sanitized, so `count-distinct`→`count_distinct_<field>`). The SQL comes
+# from the matched entry's `render` closure in `aggs` (default → `ansi-aggs`), so a
+# driver adds dialect aggregates by extending that table. Requests are emitted in order;
+# empty requests default to a single `count(*)` — so `stats --by x` counts rows per group.
+@category mole-sql
+@example "a fieldless count and a per-column sum" {
+  sql build-aggs [{fn: "count"} {fn: "sum", cols: "amount"}]
+} --result [{expr: "count(*)", name: count}, {expr: "sum(amount)", name: sum_amount}]
+@example "empty request defaults to count(*)" {
+  sql build-aggs []
+} --result [{expr: "count(*)", name: count}]
+export def "build-aggs" [
+  requests: list = []      # [{fn, cols?}] gathered from the driver's stats flags, in output order
+  aggs: list = []          # injected [{flag, fieldless, render}]; default → ansi-aggs
+]: nothing -> list {
+  let aggs = (if ($aggs | is-empty) { ansi-aggs } else { $aggs })
+  let specs = ($requests | each {|req|
+    let spec = ($aggs | where flag == $req.fn | first)
+    if $spec.fieldless {
+      [{expr: (do $spec.render ""), name: (sanitize-name $spec.flag)}]
+    } else {
+      csv-split ($req.cols? | default "") | each {|c| {expr: (do $spec.render $c), name: ((sanitize-name $spec.flag) + "_" + (sanitize-name $c))} }
+    }
+  } | flatten)
+  if ($specs | is-empty) { [{expr: "count(*)", name: "count"}] } else { $specs }
+}
+
+# AND-join HAVING predicate tokens over the RESULT columns of a `stats` query. Each
+# token is a `col<op>value` predicate (the same grammar as `where`) whose column is
+# a group key or an aggregate result alias; an alias is expanded back to its
+# aggregate EXPRESSION (via the `{name: expr}` map derived from `aggs`) so the HAVING
+# is portable — standard SQL and Postgres reject output aliases in HAVING, MySQL
+# allows them. `count` always resolves to `count(*)` even without `--count`. Null
+# when no tokens. Reuses `predicate-token` + `render-predicate`.
+@category mole-sql
+@example "a threshold on an aggregate alias expands to its expression" {
+  sql build-having ["sum_amount>=1000"] [{expr: "sum(amount)", name: sum_amount}]
+} --result "HAVING sum(amount) >= 1000"
+export def "build-having" [
+  tokens: list<string>
+  aggs: list = []          # [{expr, name}] from `build-aggs`; aliases expand to exprs
+  --dialect: record = {}
+  --ops: list = []         # injected operator table; default → ansi-ops (so HAVING speaks the dialect's operators too)
+]: nothing -> any {
+  let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
+  let aggmap = ($aggs | reduce --fold {count: "count(*)"} {|a, acc| $acc | upsert $a.name $a.expr })
+  let terms = ($tokens | each {|t| predicate-token $t --ops $ops } | where {|p| $p != null } | each {|p|
+    render-predicate {col: ($aggmap | get -o $p.col | default $p.col), op: $p.op, value: $p.value} $dialect --ops $ops
+  })
+  if ($terms | is-empty) { null } else { "HAVING " + ($terms | str join " AND ") }
 }
 
 # ---- result typing ------------------------------------------------------------
@@ -340,6 +591,29 @@ export def "null-or" [
   convert: closure   # coercion to run on non-null cells, reading the cell via `$in`
 ]: nothing -> closure {
   {|| if $in == null { null } else { do $convert $in } }
+}
+
+# Coerce the well-known numeric aggregate result columns of a `stats` result to real
+# numbers: `count`/`count_distinct_*` → int, `avg_*`/`sum_*` → float. `min_*`/`max_*`
+# mirror an arbitrary source column, so they are LEFT untouched here (the driver types
+# them from the schema like any other column, or `--raw` keeps them raw); group-key
+# columns are likewise typed upstream by the driver's schema `apply-types`. A null cell
+# stays null. Reads the rows via `$in`; uses the same `core-update` + `null-or` idiom as
+# `apply-types`.
+@category mole-sql
+@example "count comes back int, avg float" {
+  [{count: "3", avg_amount: "4.5"}] | sql apply-agg-types [{expr: "count(*)", name: count}, {expr: "avg(amount)", name: avg_amount}]
+} --result [{count: 3, avg_amount: 4.5}]
+export def "apply-agg-types" [aggs: list]: table -> table {
+  let rows = $in   # capture BEFORE piping aggs into reduce (else `$in` becomes `$aggs`)
+  $aggs | reduce --fold $rows {|a, acc|
+    let conv = if ($a.name == "count") or ($a.name | str starts-with "count_distinct_") {
+      (null-or {|x| $x | into int })
+    } else if ($a.name | str starts-with "avg_") or ($a.name | str starts-with "sum_") {
+      (null-or {|x| $x | into float })
+    } else { null }
+    if $conv == null { $acc } else { $acc | core-update $a.name $conv }
+  }
 }
 
 # Pull the cached column records for one table out of a schema-cache record.

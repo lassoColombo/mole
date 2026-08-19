@@ -42,6 +42,22 @@ export def "nulls" []: nothing -> list<string> { ["NULL"] }
 @example "the MySQL-family escaping spec" { myql dialect } --result {backslash_escapes: true}
 export def "dialect" []: nothing -> record { {backslash_escapes: true} }
 
+# The dialect's WHERE-operator vocabulary: the ANSI base (`= != >= <= > < ~ !~`, where
+# `~`/`!~` are the universal LIKE shortcut, plus the `=null`→IS NULL / `=in:`→IN forms)
+# EXTENDED with the MySQL family's own operators, each rendered natively with a per-dialect
+# completion note: `=~`/`!=~`→regex via the `REGEXP` keyword, `<=>`→null-safe equality (its
+# native symbol; `<=>null` renders the bare `<=> NULL`, via `render-nullsafe`). Injected
+# into every `sql predicate-token` / `parse-where` / `build-where` call so the operators the
+# grammar accepts AND completes (with their notes) are the MySQL family's.
+@category mole-myql
+@example "adds the null-safe operator" { myql ops | get token | last } --result "<=>"
+export def "ops" []: nothing -> list {
+  sql ansi-ops
+  | append {token: "=~",  desc: "regex match (REGEXP)",   render: {|c, v, lit| sql render-like "REGEXP" $c $v $lit }}
+  | append {token: "!=~", desc: "not regex (NOT REGEXP)", render: {|c, v, lit| sql render-like "NOT REGEXP" $c $v $lit }}
+  | append {token: "<=>", desc: "null-safe = (<=>)",      render: {|c, v, lit| sql render-nullsafe "<=>" $c $v $lit }}
+}
+
 # Statements that warrant a confirmation prompt before running (writes, DDL,
 # grants, admin). A superset guard, identical across MySQL and MariaDB.
 @category mole-myql

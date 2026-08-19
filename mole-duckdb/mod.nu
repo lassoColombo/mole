@@ -41,6 +41,21 @@ const DUCK_NULLS = ["NULL"]
 # backslash escaping — only the universal `''` quote-doubling.
 const DUCK_DIALECT = {backslash_escapes: false}
 
+# The dialect's WHERE-operator vocabulary: the ANSI base (`~`/`!~` = universal LIKE)
+# EXTENDED with DuckDB's own operators, each rendered natively with a per-dialect note:
+# `~*`/`!~*`→ILIKE, `=~`/`!=~`→regex via the `regexp_matches()` function (partial match,
+# for parity with the other dialects — DuckDB's `~` operator is full-match, which would
+# surprise), `<=>`→null-safe equality (`IS NOT DISTINCT FROM`). Injected into every
+# predicate-token / parse-where / build-where call.
+def "duck-ops" []: nothing -> list {
+  sql ansi-ops
+  | append {token: "~*",  desc: "case-insensitive LIKE (ILIKE)",     render: {|c, v, lit| sql render-like "ILIKE" $c $v $lit }}
+  | append {token: "!~*", desc: "case-insensitive NOT LIKE (NOT ILIKE)", render: {|c, v, lit| sql render-like "NOT ILIKE" $c $v $lit }}
+  | append {token: "=~",  desc: "regex match (regexp_matches, partial)", render: {|c, v, lit| sql render-func "regexp_matches" $c $v $lit }}
+  | append {token: "!=~", desc: "not regex (NOT regexp_matches)",        render: {|c, v, lit| "NOT " + (sql render-func "regexp_matches" $c $v $lit) }}
+  | append {token: "<=>", desc: "null-safe = (IS NOT DISTINCT FROM)",    render: {|c, v, lit| sql render-nullsafe "IS NOT DISTINCT FROM" $c $v $lit }}
+}
+
 # Statements that warrant a confirmation prompt before running.
 def duck-dangerous []: nothing -> string {
   '(?i)\b(delete|drop|truncate|update|insert|copy|create|alter|rename|grant|revoke|analyze|vacuum|reindex|checkpoint|commit|rollback|begin|start|attach|detach|prepare|deallocate|execute|call|export|import|install|load|set|reset|pragma|use)\b'
@@ -233,13 +248,16 @@ def "duckdb-column" [context: string]: nothing -> list<string> {
   sql complete-columns (duckdb-catalog $context) $tbl
 }
 
-# Comma-list variant of `duckdb-column` for the multi-value `--group-by`/`--distinct-on`/
-# `--returning` flags: re-prepend the already-typed columns so accepting a candidate
-# extends the list (Nushell can't complete inside a `[...]` list literal).
+# Comma-list variant of `duckdb-column` for the multi-value `--distinct-on`/
+# `--returning`/stats `--by`/agg flags: re-prepend the already-typed columns so
+# accepting a candidate extends the list (Nushell can't complete inside a `[...]` list literal).
 def "duckdb-columns-csv" [context: string]: nothing -> list<string> {
   let prefix = (complete token $context | str replace --regex '[^,]*$' '')
   duckdb-column $context | each {|c| $"($prefix)($c)" }
 }
+
+# `select`'s `--sort-by` completer: the source columns as `col[:desc]` sort tokens.
+def "duckdb-sort" [context: string]: nothing -> list<string> { complete sort-csv $context (duckdb-column $context) }
 
 # Completion-only distinct-value probe: a read-only SELECT (opened `--readonly` so it
 # never collides with a dev session holding the file; the LIMIT bounds it — DuckDB is
@@ -252,30 +270,46 @@ def duck-probe [conf: record, sql: string]: nothing -> list<string> {
   $r.stdout | from csv --no-infer | get -o v | default []
 }
 
-# Completer for the rest slot that holds BOTH projections and `col<op>value`
-# predicate tokens (`select`'s ...columns, `delete`'s ...predicates). A BARE token
-# completes column names (like `duckdb-column`). An `=`/`!=` token runs a LIVE,
-# bounded `SELECT DISTINCT <col>` — scoped to the sibling predicates and `--from`
-# table already on the line — and offers `col<op>value` for each distinct value
-# (best-effort: unreachable/slow/errored → no candidates). Comparison/LIKE/`in:`
-# tokens complete nothing; a distinct value with spaces/quotes may need manual
-# quoting when accepted.
-def "duckdb-arg" [context: string]: nothing -> list<string> {
-  let p = (sql predicate-token (complete token $context))
-  if ($p == null) { return (duckdb-column $context) }
+# `--where` completer, csv-aware: `--where` holds a comma-list of `col<op>value` tokens;
+# this completes the LAST segment and re-prepends the earlier ones. Three stages: a
+# partial segment → column NAMES; a COMPLETE column → the dialect OPERATORS (`col=`,
+# … via `op-completions`, so you never type `=` by hand); an `=`/`!=` segment → a LIVE,
+# bounded `SELECT DISTINCT <col>` scoped to the committed sibling predicates + the
+# `--from`/leading table, offering `col<op>value` per distinct value (best-effort). A
+# comparison/LIKE/`in:` segment, or a bare segment right after an open `in:` list,
+# completes nothing further.
+def "duckdb-where" [context: string]: nothing -> list<any> {
+  let ops = (duck-ops)
+  let tok = (complete token $context)
+  let prefix = ($tok | str replace --regex '[^,]*$' '')       # everything up to & incl the last comma
+  let seg = ($tok | split row "," | last | default "")         # the segment being typed
+  let committed = ($prefix | str trim --char ",")
+  let pref_preds = (sql parse-where $committed --ops $ops)
+  let p = (sql predicate-token $seg --ops $ops)
+  # mid open-in:-list — a bare segment after an in:-valued predicate ⇒ don't offer columns
+  if ($p == null) and ($pref_preds != null) and ($pref_preds | is-not-empty) and (($pref_preds | last | get value) | str starts-with "in:") {
+    return []
+  }
+  if ($p == null) {
+    let cols = (duckdb-column $context)
+    if ($seg in $cols) {
+      let longer = ($cols | where {|c| $c != $seg and ($c | str starts-with $seg) } | each {|c| {value: ($prefix + $c), description: "column"} })
+      return (((sql op-completions $seg $ops) | each {|r| {value: ($prefix + $r.value), description: $r.description} }) ++ $longer)
+    }
+    return ($cols | each {|c| $prefix + $c })
+  }
   if ($p.op not-in ["=" "!="]) or ($p.value | str starts-with "in:") { return [] }
   let table = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
   let conf = (complete conn-ctx $context "duckdb")
   if ($table | is-empty) or ($conf | is-empty) { return [] }
-  let siblings = (sql split-args (complete positionals $context) | get predicates | where col != $p.col)
-  # The probe SELECT frame (incl. LIMIT) is the driver's — mole-sql only composes the WHERE.
-  let where = (sql build-where $siblings --dialect $DUCK_DIALECT)
+  let siblings = (if ($pref_preds == null) { [] } else { $pref_preds | where col != $p.col })
+  let where = (sql render-where $siblings --dialect $DUCK_DIALECT --ops $ops)
   let q = (sql assemble [
     $"SELECT DISTINCT ($p.col) AS v FROM ($table)"
     (if ($where | is-not-empty) { $"WHERE ($where)" })
     "LIMIT 50"
   ])
-  (try { duck-probe $conf $q } catch { [] }) | each {|v| $p.col + $p.op + $v }
+  (try { duck-probe $conf $q } catch { [] }) | each {|v| $prefix + $p.col + $p.op + $v }
 }
 
 # ---- SELECT clause renderers (duckdb-specific) --------------------------------
@@ -292,33 +326,6 @@ def duck-projection [columns: list<string>, distinct: bool, distinct_on: list<st
     ""
   }
   $"SELECT ($quant)($cols)"
-}
-
-# One ORDER BY term: "<expr> [ASC|DESC] [NULLS FIRST|LAST]" (expr verbatim).
-def duck-order-term [term: string]: nothing -> string {
-  let toks = ($term | str trim | split row --regex '\s+')
-  if ($toks | is-empty) or (($toks | first) == "") { return "" }
-  mut rest = $toks
-  mut nulls = ""
-  let n = ($rest | length)
-  if $n >= 2 and (($rest | get ($n - 2) | str lowercase) == "nulls") and (($rest | last | str lowercase) in [first last]) {
-    $nulls = $" NULLS (($rest | last) | str uppercase)"
-    $rest = ($rest | first ($n - 2))
-  }
-  mut dir = ""
-  let m = ($rest | length)
-  if $m >= 1 and (($rest | last | str lowercase) in [asc desc]) {
-    $dir = $" (($rest | last) | str uppercase)"
-    $rest = ($rest | first ($m - 1))
-  }
-  $"($rest | str join ' ')($dir)($nulls)"
-}
-
-# ORDER BY from a comma-separated --sort-by string, or null when empty.
-def duck-order [sort_by: any]: nothing -> any {
-  if ($sort_by | is-empty) { return null }
-  let terms = ($sort_by | split row "," | each {|t| duck-order-term $t } | where {|t| $t | is-not-empty })
-  sql join-list $terms --prefix "ORDER BY "
 }
 
 # ---- user verbs ---------------------------------------------------------------
@@ -362,18 +369,19 @@ export def "raw-query" [
 
 # Compose and run a single-table DuckDB SELECT, returning DB-typed rows.
 #
-# Clause bodies (columns, --where, --having, --sort-by terms) are passed to
-# duckdb VERBATIM — expressions like `count(*)`, `lower(x)` work; quote reserved
-# identifiers yourself. There is NO join support: the query always reads the
-# single `--from` table.
+# Single-table ROW retrieval — projection, filter, order, paging, DISTINCT. NO
+# aggregation (reach for `stats`) and NO joins (reach for `raw-query`). The projected
+# columns are the rest slot (`id email`, `lower(x)`; commas optional, default `*`),
+# passed to duckdb VERBATIM — you quote reserved identifiers yourself.
 #
-# A positional token shaped `col<op>value` (`status=active`, `age>=30`,
-# `name~%acme%`, `role=in:admin,ops`, `deleted=null`) is composed into the WHERE
-# clause — AND-joined, and AND-combined with any raw `--where` — with its column
-# name tab-completing. Operators are `= != > >= < <=`, `~`/`!~` (LIKE / NOT LIKE),
-# and the `=null` / `=in:` forms; the value is quoted by shape (numbers/bools bare,
-# else a string literal). Bare tokens stay projected columns. Anything the grammar
-# can't express (an expression RHS, `OR`, a sub-select) goes in `--where`.
+# The WHERE clause is `--where`, DUAL-MODE: a comma-separated `col<op>value` token-list
+# (`status=active,age>=30`, `name~%acme%`, `role=in:admin,ops`, `deleted=null`) whose
+# columns AND operators tab-complete; or — when it doesn't parse as tokens — raw SQL
+# passed through verbatim (an `OR`, a sub-select, `now()`, spaced operators). Token
+# operators are `= != > >= < <=`, `~`/`!~` (LIKE / NOT LIKE), and the `=null` / `=in:`
+# forms; the value is quoted by shape (numbers/bools bare, else a string literal).
+# `--sort-by` orders by `col[:desc]` tokens (a bare column is ASC); `NULLS FIRST|LAST`
+# and expression ordering are a `raw-query`.
 #
 # Only the `--from` table's cached columns are DB-typed;
 # computed/aliased columns come back as lossless strings (use --raw to skip
@@ -385,39 +393,34 @@ export def "raw-query" [
   mole-duckdb select --from users --dry-run | get query
 } --result "SELECT * FROM users"
 @example "project, filter, order and limit" {
-  mole-duckdb select id email --from users --where "age > 30" --sort-by "age desc" --limit 5 --dry-run | get query
+  mole-duckdb select id email --from users --where "age > 30" --sort-by age:desc --limit 5 --dry-run | get query
 } --result "SELECT id, email FROM users WHERE age > 30 ORDER BY age DESC LIMIT 5"
 @example "DISTINCT" {
   mole-duckdb select status --distinct --from orders --dry-run | get query
 } --result "SELECT DISTINCT status FROM orders"
 @example "DISTINCT ON — first row per user" {
-  mole-duckdb select user_id status --distinct-on user_id --from orders --sort-by "user_id, id desc" --dry-run | get query
+  mole-duckdb select user_id status --distinct-on user_id --from orders --sort-by user_id,id:desc --dry-run | get query
 } --result "SELECT DISTINCT ON (user_id) user_id, status FROM orders ORDER BY user_id, id DESC"
-@example "aggregate with GROUP BY and HAVING" {
-  mole-duckdb select user_id "count(*) AS n" --from orders --group-by user_id --having "count(*) > 1" --sort-by "n desc" --dry-run | get query
-} --result "SELECT user_id, count(*) AS n FROM orders GROUP BY user_id HAVING count(*) > 1 ORDER BY n DESC"
-@example "ORDER BY ... NULLS LAST" {
-  mole-duckdb select email age --from users --sort-by "age desc nulls last" --dry-run | get query
-} --result "SELECT email, age FROM users ORDER BY age DESC NULLS LAST"
 @example "pagination with LIMIT + OFFSET" {
   mole-duckdb select --from users --sort-by id --limit 2 --offset 2 --dry-run | get query
 } --result "SELECT * FROM users ORDER BY id LIMIT 2 OFFSET 2"
-@example "predicate tokens compose the WHERE clause (columns complete)" {
-  mole-duckdb select id email --from users status=active age>=30 --dry-run | get query
+@example "a --where token-list composes the WHERE clause (columns + operators complete)" {
+  mole-duckdb select id email --from users --where status=active,age>=30 --dry-run | get query
 } --result "SELECT id, email FROM users WHERE status = 'active' AND age >= 30"
-@example "IN, LIKE and NULL predicate forms, AND-combined with a raw --where" {
-  mole-duckdb select --from users role=in:admin,ops name~%acme% deleted=null --where "score > 0" --dry-run | get query
-} --result "SELECT * FROM users WHERE role IN ('admin', 'ops') AND name LIKE '%acme%' AND deleted IS NULL AND (score > 0)"
+@example "--where falls back to raw SQL when it isn't a token-list" {
+  mole-duckdb select --from orders --where "total > 0 AND status <> 'void'" --dry-run | get query
+} --result "SELECT * FROM orders WHERE total > 0 AND status <> 'void'"
+@example "IN, LIKE and NULL predicate forms in one --where token-list" {
+  mole-duckdb select --from users --where role=in:admin,ops,name~%acme%,deleted=null --dry-run | get query
+} --result "SELECT * FROM users WHERE role IN ('admin', 'ops') AND name LIKE '%acme%' AND deleted IS NULL"
 @example "run for real — base-table columns come back DB-typed" {
   mole-duckdb select email is_active balance --from users --sort-by id -c duckdb-local-dev
 }
 export def "select" [
-  ...columns: string@"duckdb-arg"                  # projected columns, or `col<op>value` predicate tokens (default: *)
+  ...columns: string@"duckdb-column"               # projected columns (default: *); commas are optional and trimmed
   --from(-F): string@"duckdb-table"                # source table, single table only (an alias is allowed: "users u")
-  --where(-w): string                              # raw WHERE predicate, AND-combined with any col<op>value tokens
-  --group-by(-g): string@"duckdb-columns-csv"      # GROUP BY keys, comma-separated
-  --having: string                                 # HAVING predicate (without the keyword)
-  --sort-by(-s): string                            # ORDER BY terms, comma-separated: "col [asc|desc] [nulls first|last]"
+  --where(-w): string@"duckdb-where"               # WHERE: col<op>value token-list (comma-sep, completable) OR raw SQL
+  --sort-by(-s): string@"duckdb-sort"    # ORDER BY terms: col[:desc], comma-separated
   --limit(-l): int                                 # LIMIT N
   --offset(-o): int                                # OFFSET N
   --distinct                                       # SELECT DISTINCT
@@ -432,23 +435,20 @@ export def "select" [
 ] {
   # Multi-value flags arrive as ONE comma-joined string (Nushell can't complete inside a
   # `[...]` literal); decode to the list the clause renderers want, shadowing the params.
-  let group_by = (sql csv-split $group_by)
   let distinct_on = (sql csv-split $distinct_on)
   if $distinct and ($distinct_on | is-not-empty) {
     error make {msg: "select: --distinct and --distinct-on are mutually exclusive"}
   }
   if ($from | is-empty) { error make {msg: "select: --from <table> is required"} }
-  # Split the rest slot: bare tokens are projections, `col<op>value` tokens are WHERE
-  # predicates, AND-combined with the raw --where.
-  let parts = (sql split-args $columns)
-  let where_sql = (sql build-where $parts.predicates --raw ($where | default "") --dialect $DUCK_DIALECT)
+  # The rest slot is projection-only now (commas optional); WHERE lives in --where,
+  # dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse as tokens.
+  let cols = ($columns | each {|c| $c | str trim --char "," } | where {|c| $c | is-not-empty })
+  let where_sql = (sql build-where ($where | default "") --dialect $DUCK_DIALECT --ops (duck-ops))
   let text = (sql assemble [
-    (duck-projection $parts.projections $distinct ($distinct_on | default []))
+    (duck-projection $cols $distinct ($distinct_on | default []))
     $"FROM ($from)"
     (if ($where_sql | is-not-empty) { $"WHERE ($where_sql)" })
-    (sql join-list ($group_by | default []) --prefix "GROUP BY ")
-    (if ($having | is-not-empty) { $"HAVING ($having)" })
-    (duck-order $sort_by)
+    (sql build-order (sql csv-split $sort_by))
     (if $limit != null { $"LIMIT ($limit)" })
     (if $offset != null { $"OFFSET ($offset)" })
   ])
@@ -470,10 +470,11 @@ export def "select" [
 # leading positional (completing table names); the SET assignments follow as
 # positionals — each a verbatim `"col = expr"`, so expressions (`hits = hits + 1`)
 # all work; you quote identifiers and string literals yourself, and their column
-# names complete against the table. `--where` is the same verbatim predicate as
-# `select`; `--returning` names columns to hand back for the changed rows (DuckDB
-# RETURNING), typed exactly like a `select` result. There is NO join support — the
-# target is the single table; reach for `raw-query` for `UPDATE ... FROM`.
+# names complete against the table. `--where` is the same dual-mode `col<op>value`
+# token-list-or-raw-SQL predicate as `select`; `--returning` names columns to hand
+# back for the changed rows (DuckDB RETURNING), typed exactly like a `select` result.
+# There is NO join support — the target is the single table; reach for `raw-query`
+# for `UPDATE ... FROM`.
 #
 # UPDATE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to touch every row unless you pass `--all`. `--dry-run` returns a
@@ -492,7 +493,7 @@ export def "select" [
 export def "update" [
   table: string@"duckdb-table"                     # target table (UPDATE <table>); single table, an alias is allowed: "users u"
   ...assignments: string@"duckdb-column"           # SET assignments, verbatim "col = expr" (at least one required)
-  --where(-w): string                              # WHERE predicate (without the keyword)
+  --where(-w): string@"duckdb-where"               # WHERE: col<op>value token-list (comma-sep, completable) OR raw SQL
   --returning: string@"duckdb-columns-csv"         # RETURNING columns, comma-separated (typed like a select result)
   --all                                            # allow an unfiltered UPDATE (every row) when --where is omitted
   --connection(-c): string@complete-connection   # named connection (default: current)
@@ -508,7 +509,9 @@ export def "update" [
     error make {msg: "update: refusing to update every row without --where (pass --all to override)"}
   }
   let returning = (sql csv-split $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
-  let text = (sql build-update --table $table --set $assignments --where ($where | default "") --returning ($returning | default []))
+  # --where is dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse.
+  let where_sql = (sql build-where ($where | default "") --dialect $DUCK_DIALECT --ops (duck-ops))
+  let text = (sql build-update --table $table --set $assignments --where ($where_sql | default "") --returning ($returning | default []))
   let conf = (duck-conf $connection $path $database $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This UPDATE will modify rows. Run it?" --yes=$yes)) { return }
@@ -521,23 +524,22 @@ export def "update" [
 
 # Compose and run a single-table DuckDB DELETE.
 #
-# Reads like the statement: `delete <table> <predicate>...`. The table is the
-# leading positional (completing table names); the `col<op>value` predicate tokens
-# (`user_id=7`, `status=inactive`, `role=in:a,b`) are AND-joined into the WHERE
-# clause, their column names completing — the same grammar as `select`. `--where`
-# is the raw escape (for an expression RHS like `now()`, `OR`, a sub-select),
-# AND-combined with the tokens. `--returning` names columns to hand back for the
-# deleted rows (DuckDB RETURNING), typed exactly like a `select` result. There is
-# NO join support — deletes from the single table; reach for `raw-query` for
-# `DELETE ... USING`.
+# Reads like the statement: `delete <table> --where <predicate>`. The table is the
+# leading positional (completing table names); `--where` is DUAL-MODE — a comma-
+# separated `col<op>value` token-list (`user_id=7`, `status=inactive`, `role=in:a,b`,
+# `deleted=null`) whose columns and operators complete, or raw SQL (an `OR`, `now()`,
+# a sub-select) when it doesn't parse — the same grammar as `select`. `--returning`
+# names columns to hand back for the deleted rows (DuckDB RETURNING), typed exactly
+# like a `select` result. There is NO join support — deletes from the single table;
+# reach for `raw-query` for `DELETE ... USING`.
 #
 # DELETE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to delete every row unless you pass `--all`. `--dry-run` returns a
 # `{connection, query}` record without running. Connection/target overridable as
 # in `update`.
 @category mole-duckdb
-@example "predicate tokens build the filter (columns complete)" {
-  mole-duckdb delete sessions user_id=7 --dry-run | get query
+@example "a --where token-list builds the filter (columns + operators complete)" {
+  mole-duckdb delete sessions --where user_id=7 --dry-run | get query
 } --result "DELETE FROM sessions WHERE user_id = 7"
 @example "an expression filter uses the raw --where" {
   mole-duckdb delete sessions --where "expires_at < now()" --dry-run | get query
@@ -550,10 +552,9 @@ export def "update" [
 } --result "DELETE FROM staging_rows"
 export def "delete" [
   table: string@"duckdb-table"                     # target table (DELETE FROM <table>); single table, an alias is allowed: "users u"
-  ...predicates: string@"duckdb-arg"               # `col<op>value` filter tokens (AND-joined): user_id=7  status=inactive  role=in:a,b
-  --where(-w): string                              # raw WHERE predicate, AND-combined with any predicate tokens
+  --where(-w): string@"duckdb-where"               # WHERE: col<op>value token-list (comma-sep, completable) OR raw SQL
   --returning: string@"duckdb-columns-csv"         # RETURNING columns, comma-separated (typed like a select result)
-  --all                                            # allow an unfiltered DELETE (every row) when no filter is given
+  --all                                            # allow an unfiltered DELETE (every row) when --where is omitted
   --connection(-c): string@complete-connection   # named connection (default: current)
   --path(-p): string                               # database file path (or :memory:)
   --database(-d): string                           # database file path (alias of --path)
@@ -562,13 +563,10 @@ export def "delete" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  let parts = (sql split-args $predicates)
-  if ($parts.projections | is-not-empty) {
-    error make {msg: ("delete: incomplete predicate(s): " + ($parts.projections | str join ", ") + " — use col=value, col>=value, col~pattern, col=in:a,b or col=null")}
-  }
-  let where_sql = (sql build-where $parts.predicates --raw ($where | default "") --dialect $DUCK_DIALECT)
+  # --where is dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse.
+  let where_sql = (sql build-where ($where | default "") --dialect $DUCK_DIALECT --ops (duck-ops))
   if ($where_sql | is-empty) and (not $all) {
-    error make {msg: "delete: refusing to delete every row without a filter (pass --all to override)"}
+    error make {msg: "delete: refusing to delete every row without --where (pass --all to override)"}
   }
   let returning = (sql csv-split $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
   let text = (sql build-delete --table $table --where ($where_sql | default "") --returning ($returning | default []))

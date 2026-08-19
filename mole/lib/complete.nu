@@ -75,6 +75,28 @@ export def "csv" [v: any]: nothing -> list<string> {
   $v | default "" | into string | split row "," | str trim | where {|x| $x | is-not-empty }
 }
 
+# Complete a comma-separated list of `col[:asc|:desc]` sort tokens. At a fresh segment
+# the `cols` pool is offered; once a `:` is typed, `col:asc`/`col:desc`. The
+# already-typed prefix is re-prepended so accepting a candidate EXTENDS the list. The
+# no-space grammar keeps `--sort-by` one completable bareword (Nushell can't complete
+# across a space, which is why the SQL family drops per-term direction into a `:suffix`
+# rather than a `col desc` string). `cols` is the pool: source columns for `select`,
+# reconstructed result columns for `stats`.
+@category mole-lib
+@example "a fresh segment offers the column pool" { sort-csv "select --from t --sort-by " [id name] } --result [id name]
+@example "after a colon, offer the directions" { sort-csv "select --sort-by amount:" [id amount] } --result ["amount:asc" "amount:desc"]
+export def "sort-csv" [context: string, cols: list<string>]: nothing -> list<string> {
+  let tok = (token $context)
+  let prefix = ($tok | str replace --regex '[^,]*$' '')
+  let seg = ($tok | split row "," | last)
+  if ($seg | str contains ":") {
+    let col = ($seg | split row ":" | first)
+    ["asc" "desc"] | each {|d| $"($prefix)($col):($d)" }
+  } else {
+    $cols | each {|c| $"($prefix)($c)" }
+  }
+}
+
 # The value a value-flag already carries on the line, quote-aware. `names` are the
 # spellings to try (long + short); `--from "users u"` yields `users u` as ONE token
 # (a regex split would stop at the space). `--flag=value` is handled; the last

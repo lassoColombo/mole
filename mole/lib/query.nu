@@ -52,13 +52,13 @@ export def "confirm" [
   if $yes { return true }
   # `input` throws an I/O error when there is no TTY (scripts, `nu -c`, pipelines).
   # Degrade to "no" with a clear note instead of failing the whole command.
-  let ans = try {
+  let reply = try {
     input $"(ansi yellow)($message) [y/N](ansi reset) " --numchar 1 --default 'n'
   } catch {
     print -e $"(ansi yellow)($message)(ansi reset) [no input available — assuming No; pass --yes to run]"
     'n'
   }
-  ($ans | str lowercase) == 'y'
+  ($reply | str lowercase) == 'y'
 }
 
 # Unwrap a `complete` record: raise on failure, else return stdout.

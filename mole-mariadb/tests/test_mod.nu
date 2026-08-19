@@ -29,19 +29,13 @@ def "dry-run plain select stars all columns" [] {
 @test
 def "dry-run projects filters orders and limits" [] {
   fixture
-  assert equal (mole-mariadb select id email --from users --where "age > 30" --sort-by "age desc" --limit 5 -c mariadb-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE age > 30 ORDER BY age DESC LIMIT 5"
+  assert equal (mole-mariadb select id email --from users --where "age > 30" --sort-by age:desc --limit 5 -c mariadb-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE age > 30 ORDER BY age DESC LIMIT 5"
 }
 
 @test
 def "dry-run distinct projection" [] {
   fixture
   assert equal (mole-mariadb select status --distinct --from orders -c mariadb-local-dev --dry-run | get query) "SELECT DISTINCT status FROM orders"
-}
-
-@test
-def "dry-run group-by with rollup and having" [] {
-  fixture
-  assert equal (mole-mariadb select dept "count(*) AS n" --from employees --group-by dept --rollup --having "count(*) > 1" -c mariadb-local-dev --dry-run | get query) "SELECT dept, count(*) AS n FROM employees GROUP BY dept WITH ROLLUP HAVING count(*) > 1"
 }
 
 @test
@@ -96,12 +90,6 @@ def "set-connection rejects a non-mariadb connection" [] {
 def "offset without limit errors" [] {
   fixture
   assert error { mole-mariadb select --from users --offset 2 -c mariadb-local-dev --dry-run }
-}
-
-@test
-def "rollup without group-by errors" [] {
-  fixture
-  assert error { mole-mariadb select --from users --rollup -c mariadb-local-dev --dry-run }
 }
 
 @test
