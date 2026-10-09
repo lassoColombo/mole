@@ -59,13 +59,19 @@ def "dry-run pagination with limit and offset" [] {
 @test
 def "dry-run predicate tokens compose the WHERE clause" [] {
   fixture
-  assert equal (mole-mariadb select id email --from users status=active age>=30 -c mariadb-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE status = 'active' AND age >= 30"
+  assert equal (mole-mariadb select id email --from users --where status=active,age>=30 -c mariadb-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE status = 'active' AND age >= 30"
 }
 
 @test
-def "dry-run predicate tokens AND-combine with a raw --where; IN, LIKE, NULL forms" [] {
+def "dry-run IN LIKE and NULL predicate forms in one where token-list" [] {
   fixture
-  assert equal (mole-mariadb select --from users role=in:admin,ops name~%acme% deleted=null --where "score > 0" -c mariadb-local-dev --dry-run | get query) "SELECT * FROM users WHERE role IN ('admin', 'ops') AND name LIKE '%acme%' AND deleted IS NULL AND (score > 0)"
+  assert equal (mole-mariadb select --from users --where role=in:admin,ops,name~%acme%,deleted=null -c mariadb-local-dev --dry-run | get query) "SELECT * FROM users WHERE role IN ('admin', 'ops') AND name LIKE '%acme%' AND deleted IS NULL"
+}
+
+@test
+def "dry-run where falls back to raw SQL when it is not a token-list" [] {
+  fixture
+  assert equal (mole-mariadb select --from orders --where "total > 0 AND status <> 'void'" -c mariadb-local-dev --dry-run | get query) "SELECT * FROM orders WHERE total > 0 AND status <> 'void'"
 }
 
 # ---- connection handling ------------------------------------------------------
@@ -127,7 +133,7 @@ def "dry-run update joins several assignments" [] {
 @test
 def "dry-run update with order-by and limit" [] {
   fixture
-  assert equal (mole-mariadb update jobs "priority = priority + 1" --where "queued = 1" --sort-by "created_at asc" --limit 100 -c mariadb-local-dev --dry-run | get query) "UPDATE jobs SET priority = priority + 1 WHERE queued = 1 ORDER BY created_at ASC LIMIT 100"
+  assert equal (mole-mariadb update jobs "priority = priority + 1" --where "queued = 1" --sort-by created_at:asc --limit 100 -c mariadb-local-dev --dry-run | get query) "UPDATE jobs SET priority = priority + 1 WHERE queued = 1 ORDER BY created_at ASC LIMIT 100"
 }
 
 @test
@@ -147,20 +153,15 @@ def "dry-run delete filtered" [] {
 @test
 def "dry-run delete with order-by and limit" [] {
   fixture
-  assert equal (mole-mariadb delete logs --where "level = 'debug'" --sort-by "ts asc" --limit 1000 -c mariadb-local-dev --dry-run | get query) "DELETE FROM logs WHERE level = 'debug' ORDER BY ts ASC LIMIT 1000"
+  assert equal (mole-mariadb delete logs --where "level = 'debug'" --sort-by ts:asc --limit 1000 -c mariadb-local-dev --dry-run | get query) "DELETE FROM logs WHERE level = 'debug' ORDER BY ts ASC LIMIT 1000"
 }
 
 @test
 def "dry-run delete builds the filter from predicate tokens" [] {
   fixture
-  assert equal (mole-mariadb delete sessions user_id=7 status=expired -c mariadb-local-dev --dry-run | get query) "DELETE FROM sessions WHERE user_id = 7 AND status = 'expired'"
+  assert equal (mole-mariadb delete sessions --where user_id=7,status=expired -c mariadb-local-dev --dry-run | get query) "DELETE FROM sessions WHERE user_id = 7 AND status = 'expired'"
 }
 
-@test
-def "delete rejects an incomplete (operator-less) predicate token" [] {
-  fixture
-  assert error { mole-mariadb delete sessions foo -c mariadb-local-dev --dry-run }
-}
 
 # ---- write verbs: connection handling + safety guards -------------------------
 

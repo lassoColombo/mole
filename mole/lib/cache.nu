@@ -1,6 +1,6 @@
 # mole/lib/cache — cache storage plumbing (storage only; each driver decides
 # what/when to cache). Import individually: `use mole/lib/cache` →
-# `cache path`, `cache read`, `cache write`, `cache stale`, `cache clear`.
+# `cache path`, `cache read`, `cache write`, `cache stale`, `cache fetch`, `cache clear`.
 # Convention: a cached file is a record with a `meta.refreshed_at` datetime.
 
 # The mole cache directory, honoring $env.XDG_CACHE_HOME.
@@ -69,6 +69,32 @@ export def "stale" [
   let when = $data | get -o meta | get -o refreshed_at
   if ($when | is-empty) { return true }
   ((date now) - $when) > $ttl
+}
+
+# Serve a cached record, or (re)build it — the one memoize primitive behind every
+# driver's catalog/schema loader.
+#
+# Returns `read $file` when the file is fresh (younger than `ttl`) and `--refresh`
+# is not given. Otherwise runs `build`, stamps `meta.refreshed_at` with the current
+# time (the convention `stale` keys off — any other `meta` fields `build` set are
+# kept), writes the result to `file`, and returns it. A failing `build` propagates
+# (nothing is written).
+@category mole-lib
+@example "serve for a day, rebuilding from the closure when stale or on --refresh" {
+  fetch (path "sql" "prod:users") 1day {|| {meta: {connection: "prod"}, tables: []} }
+}
+export def "fetch" [
+  file: string      # Absolute path to the cache file (typically from `cache path`)
+  ttl: duration     # Maximum age before the cache is rebuilt
+  build: closure    # {|| -> record} produces the value to cache
+  --refresh         # Rebuild even when the cache is fresh
+]: nothing -> any {
+  if (not $refresh) and (not (stale $file $ttl)) { return (read $file) }
+  let built = (do $build)
+  let meta = ($built | get -o meta | default {} | upsert refreshed_at (date now))
+  let data = ($built | upsert meta $meta)
+  $data | write $file
+  $data
 }
 
 # Delete a cache file if it exists (no-op otherwise).

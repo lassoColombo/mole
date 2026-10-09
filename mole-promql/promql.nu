@@ -315,55 +315,7 @@ export def "windows" []: nothing -> list<string> { [30s 1m 5m 10m 15m 30m 1h 3h 
 
 # ---- pure completion / context parsing ----------------------------------------
 
-# Extract a flag's value from a raw completion-context command line.
-#
-# Tries each spelling in `names` (long and short), accepts `--flag value` or
-# `--flag=value`, and when the flag appears more than once takes the last
-# occurrence. Returns `null` when no spelling is present. A plugin completer uses
-# this to recover the `--connection` a user has already typed.
-@category mole-promql
-@example "read a flag the user already typed" {
-  promql parse-flag "query up -c prod" ["--connection" "-c"]
-} --result prod
-@example "null when the flag is absent" {
-  promql parse-flag "query up" ["--connection" "-c"]
-} --result null
-export def "parse-flag" [
-  ctx: string           # the completion context (the partial command line)
-  names: list<string>   # flag spellings to try, e.g. ["--connection" "-c"]
-]: nothing -> any {
-  let m = ($ctx | parse --regex ('(?:' + ($names | str join "|") + ')[\s=]+(?P<v>[^\s]+)'))
-  if ($m | is-empty) { null } else { $m | last | get v }
-}
 
-# The metric positional already typed on a `select` line — used to scope label and
-# value completion to that metric. Walks the tokens after `select`, skipping a
-# value-flag and its argument (switches don't consume the next token); returns the
-# first bare token (or null). The switch set is the select-builder's own
-# (`--raw`/`--full`/`--dry-run`), shared by every dialect's `select`.
-@category mole-promql
-@example "the metric typed before the flags" {
-  promql metric-arg "select http_requests_total --eq [job=api]"
-} --result http_requests_total
-@example "no metric yet yields null" { promql metric-arg "select --eq " } --result null
-export def "metric-arg" [context: string]: nothing -> any {
-  let toks = ($context | str trim | split row --regex '\s+')
-  let sel = ($toks | enumerate | where item == "select" | get -o 0.index)
-  let after = if ($sel == null) { $toks } else { $toks | skip ($sel + 1) }
-  let switches = ["--raw" "-R" "--full" "-F" "--dry-run" "-n"]
-  mut skip = false
-  mut found = ""
-  for t in $after {
-    if $skip { $skip = false; continue }
-    if ($t | str starts-with "-") {
-      if ($t not-in $switches) and (not ($t | str contains "=")) { $skip = true }
-      continue
-    }
-    $found = $t
-    break
-  }
-  if ($found | is-empty) { null } else { $found }
-}
 
 # ---- time range (clock injected, so the library stays pure) -------------------
 

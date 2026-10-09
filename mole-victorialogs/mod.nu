@@ -70,15 +70,13 @@ def vl-range [last: any, start: any, end: any]: nothing -> record {
 # calls are short-timeout and only power tab-completion. `fields` unions the log
 # field names and the stream field names present over all time.
 def vl-catalog-load [conf: record, --refresh]: nothing -> record {
-  let file = (cache path "victorialogs" ($conf | get -o name | default "_"))
-  if (not $refresh) and (not (cache stale $file 1day)) { return (cache read $file) }
-  let fields = (
-    (client field-names $conf "*" | logsql values $in | get -o value | default [])
-    ++ (client stream-field-names $conf "*" | logsql values $in | get -o value | default [])
-  ) | uniq | sort
-  let data = {meta: {connection: ($conf | get -o name), driver: "victorialogs", refreshed_at: (date now)}, fields: $fields}
-  $data | cache write $file
-  $data
+  cache fetch (cache path "victorialogs" ($conf | get -o name | default "_")) 1day --refresh=$refresh {||
+    let fields = (
+      (client field-names $conf "*" | logsql values $in | get -o value | default [])
+      ++ (client stream-field-names $conf "*" | logsql values $in | get -o value | default [])
+    ) | uniq | sort
+    {meta: {connection: ($conf | get -o name), driver: "victorialogs"}, fields: $fields}
+  }
 }
 
 # Warm the catalog after a successful query, but only when it is cold (missing).
@@ -90,31 +88,13 @@ def vl-warm [conf: record]: nothing -> nothing {
   try { vl-catalog-load $conf | ignore } catch { }
 }
 
-# Read a flag's value out of a completion-context command line (last wins).
-def vl-flag [ctx: string, names: list<string>]: nothing -> any {
-  let m = ($ctx | parse --regex ('(?:' + ($names | str join "|") + ')[\s=]+(?P<v>[^\s]+)'))
-  if ($m | is-empty) { null } else { $m | last | get v }
-}
-
 # The explicit `field:…` filter tokens already on the line, AND-joined into a LogsQL
-# scoping filter for contextual lookups (empty → `*`). The parser (`ast`) does the
-# flag/positional split, so flag values (`--select a,b`, `--url http://h:8428`,
-# `--start <datetime>`) are excluded without a hand-kept switch list, and quoted tokens
-# stay whole; only structured `field:value` positionals scope (bare terms are ignored).
-# The token under the cursor is dropped first (it is the one being completed). `ast` is
-# a debug builtin whose JSON is not a stable contract, so a parse mismatch is caught and
-# scoping simply falls back to `*` (global) — it never breaks completion.
+# scoping filter for contextual lookups (empty → `*`). `complete positionals` does the
+# parser-based flag/positional split (flag values like `--select a,b` are excluded, quoted
+# tokens stay whole, the cursor token is dropped, a parse failure degrades to `[]`); only
+# structured `field:value` positionals scope — bare terms are ignored.
 def vl-filters-ctx [context: string]: nothing -> string {
-  let prior = ($context | split row " " | drop 1 | str join " ")
-  let f = (try {
-    ast $prior --json | get block | from json
-    | get pipelines.0.elements.0.expr.expr.Call.arguments
-    | where {|a| "Positional" in ($a | columns) }
-    | each {|a| $a.Positional.expr | get -o String }
-    | compact
-    | where {|t| $t | str contains ":" }
-    | str join " "
-  } catch { "" })
+  let f = (complete positionals $context | where {|t| $t | str contains ":" } | str join " ")
   if ($f | is-empty) { "*" } else { $f }
 }
 
@@ -122,9 +102,9 @@ def vl-filters-ctx [context: string]: nothing -> string {
 # line, best-effort (absent/unparseable → unbounded). Lets contextual lookups honor
 # the time window the user has typed.
 def vl-range-ctx [context: string]: nothing -> record {
-  let lastRaw = (vl-flag $context ["--last" "-L"])
-  let startRaw = (vl-flag $context ["--start" "-a"])
-  let endRaw = (vl-flag $context ["--end" "-b"])
+  let lastRaw = (complete flag $context ["--last" "-L"])
+  let startRaw = (complete flag $context ["--start" "-a"])
+  let endRaw = (complete flag $context ["--end" "-b"])
   let last = (if ($lastRaw | is-empty) { null } else { try { $lastRaw | into duration } catch { null } })
   let start = (if ($startRaw | is-empty) { null } else { try { $startRaw | into datetime } catch { null } })
   let end = (if ($endRaw | is-empty) { null } else { try { $endRaw | into datetime } catch { null } })
@@ -140,28 +120,27 @@ def vl-catalog-ctx [context: string]: nothing -> record {
 
 # Field-name suggestions, scoped to the filters + window already on the line: a LIVE
 # `field_names` ∪ `stream_field_names` (short timeout) reflecting what actually exists
-# in the current query, falling back to the cached global catalog on empty/error.
-# Opt-in contextual completion — this hits the network per tab (the cache is only the
-# fallback), unlike the instant cache-only catalog it draws that fallback from.
+# in the current query. This hits the network per tab. An UNSCOPED line (`*`, no
+# window) has nothing to narrow by, so the cached global catalog stands in when the
+# live call is empty or fails; a SCOPED lookup is authoritative — empty or errored →
+# [] rather than the global catalog, which would offer fields the scope does not have.
 def "vl-field" [context: string]: nothing -> list<string> {
   let cached = (vl-catalog-ctx $context | get -o fields | default [])
-  try {
-    let conf = (vl-conf (vl-flag $context ["--connection" "-c"]) null null {})
-    let filter = (vl-filters-ctx $context)
-    let r = (vl-range-ctx $context)
+  let conf = (complete conn-ctx $context victorialogs)
+  if ($conf | is-empty) { return $cached }
+  let filter = (vl-filters-ctx $context)
+  let r = (vl-range-ctx $context)
+  let scoped = ($filter != "*") or ($r.start != null) or ($r.end != null)
+  let live = (try {
     let s = (logsql vl-time $r.start)
     let e = (logsql vl-time $r.end)
-    let live = (
+    (
       (client field-names $conf $filter --start $s --end $e --timeout 3sec | logsql values $in | get -o value | default [])
       ++ (client stream-field-names $conf $filter --start $s --end $e --timeout 3sec | logsql values $in | get -o value | default [])
     ) | uniq | sort
-    if ($live | is-empty) { $cached } else { $live }
-  } catch { $cached }
+  } catch { null })
+  if $scoped { $live | default [] } else if ($live | is-empty) { $cached } else { $live }
 }
-
-# The token under the cursor: the last whitespace-delimited chunk of a completion
-# context. Both list-style completers below reason about it.
-def vl-token [context: string]: nothing -> string { $context | split row " " | last }
 
 # Completer for the `--output` verbosity flag (see `logsql shape`).
 def "vl-output" []: nothing -> list<string> { ["compact" "wide" "full"] }
@@ -175,13 +154,14 @@ def "vl-output" []: nothing -> list<string> { ["compact" "wide" "full"] }
 # Nushell keeps `:` inside the word, so a `field:value` candidate replaces the whole
 # token and is prefix-filtered for us.
 def "vl-filter" [context: string]: nothing -> list<string> {
-  let tok = (vl-token $context)
+  let tok = (complete token $context)
   if not ($tok | str contains ":") {
     vl-field $context | each {|f| $"($f):" }
   } else {
     try {
       let field = ($tok | split row ":" | first)
-      let conf = (vl-conf (vl-flag $context ["--connection" "-c"]) null null {})
+      let conf = (complete conn-ctx $context victorialogs)
+      if ($conf | is-empty) { return [] }
       let r = (vl-range-ctx $context)
       client field-values $conf (vl-filters-ctx $context) $field --start (logsql vl-time $r.start) --end (logsql vl-time $r.end) --limit 50 --timeout 3sec
       | logsql values $in | get -o value | default []
@@ -196,18 +176,15 @@ def "vl-filter" [context: string]: nothing -> list<string> {
 # (`_time,ho⇥` → `_time,host`). The prefix is the token with its partial last
 # segment stripped.
 def "vl-fields-csv" [context: string]: nothing -> list<string> {
-  let prefix = (vl-token $context | str replace --regex '[^,]*$' '')
-  vl-field $context | each {|f| $"($prefix)($f)" }
+  complete csv-extend $context (vl-field $context)
 }
 
 # Completer for `select`'s `--sort-by` / `--drop`: the `--select` projection when one
 # is on the line (you can only sort or drop within the columns you kept), else the
 # full contextual field list. Comma-list aware, like `vl-fields-csv`.
 def "vl-proj-csv" [context: string]: nothing -> list<string> {
-  let prefix = (vl-token $context | str replace --regex '[^,]*$' '')
-  let proj = (complete csv (vl-flag $context ["--select" "-S"]))
-  let fields = (if ($proj | is-not-empty) { $proj } else { vl-field $context })
-  $fields | each {|f| $"($prefix)($f)" }
+  let proj = (complete csv (complete flag $context ["--select" "-S"]))
+  complete csv-extend $context (if ($proj | is-not-empty) { $proj } else { vl-field $context })
 }
 
 # Build the ordered [{expr, name}] stats aggregations from the metric flags. Each
@@ -245,17 +222,16 @@ def vl-aggs [
 # Completer for the post-stats `--sort-by`: the RESULT columns, not log fields —
 # the `--by` group fields plus the aggregation columns implied by the metric flags
 # already on the command line (`--count`→`count`, `--avg lat`→`avg_lat`).
-# Reconstructed from the context (like `vl-flag`) so server-side top-N completes.
+# Reconstructed from the context (`complete flag`) so server-side top-N completes.
 # Comma-list aware, mirroring `vl-fields-csv`.
 def "vl-stat-cols" [context: string]: nothing -> list<string> {
-  let prefix = (vl-token $context | str replace --regex '[^,]*$' '')
-  let by = (complete csv (vl-flag $context ["--by" "-g"]))
+  let by = (complete csv (complete flag $context ["--by" "-g"]))
   let aggs = (vl-aggs
     ($context =~ '(?:--count|-C)(?:\s|$)')
-    (vl-flag $context ["--count-uniq"]) (vl-flag $context ["--sum"]) (vl-flag $context ["--avg"])
-    (vl-flag $context ["--min"]) (vl-flag $context ["--max"]) (vl-flag $context ["--median"])
-    (vl-flag $context ["--p90"]) (vl-flag $context ["--p95"]) (vl-flag $context ["--p99"]))
-  ($by ++ ($aggs | get name)) | each {|c| $"($prefix)($c)" }
+    (complete flag $context ["--count-uniq"]) (complete flag $context ["--sum"]) (complete flag $context ["--avg"])
+    (complete flag $context ["--min"]) (complete flag $context ["--max"]) (complete flag $context ["--median"])
+    (complete flag $context ["--p90"]) (complete flag $context ["--p95"]) (complete flag $context ["--p99"]))
+  complete csv-extend $context ($by ++ ($aggs | get name))
 }
 
 # ---- execution ----------------------------------------------------------------

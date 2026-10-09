@@ -158,21 +158,6 @@ def "vocab lists are non-empty and a superset extends via ++" [] {
 
 # ---- pure completion / context parsing ----------------------------------------
 
-@test
-def "parse-flag reads the last occurrence of a flag" [] {
-    assert equal (promql parse-flag "query up -c prod" ["--connection" "-c"]) "prod"
-    assert equal (promql parse-flag "query up --connection=stage -c prod" ["--connection" "-c"]) "prod"
-    assert equal (promql parse-flag "query up" ["--connection" "-c"]) null
-}
-
-@test
-def "metric-arg finds the metric positional, skipping value flags" [] {
-    assert equal (promql metric-arg "select http_requests_total --eq [job=api]") "http_requests_total"
-    assert equal (promql metric-arg "select up --dry-run") "up"                  # switch does not consume the metric
-    assert equal (promql metric-arg "select -c prod up") "up"                    # value flag + arg are skipped
-    assert equal (promql metric-arg "select --eq ") null                         # nothing typed yet
-}
-
 # ---- time range (clock injected) ----------------------------------------------
 
 @test

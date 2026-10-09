@@ -75,6 +75,22 @@ export def "csv" [v: any]: nothing -> list<string> {
   $v | default "" | into string | split row "," | str trim | where {|x| $x | is-not-empty }
 }
 
+# Re-prepend the comma-list prefix already typed in the cursor token to each
+# candidate, so accepting one EXTENDS the list (`--by job,me⇥` → `job,method`). The
+# multi-value flags are ONE comma string (see `csv`); this is the completion half of
+# that convention, shared by every driver's `*-csv` completers. Nushell prefix-filters
+# the result by the typed token, so unfiltered candidates are fine.
+@category mole-lib
+@example "extend a partial comma list" { csv-extend "stats --by job," [method host] } --result ["job,method" "job,host"]
+@example "a fresh token gets the bare candidates" { csv-extend "stats --by " [job host] } --result [job host]
+export def "csv-extend" [
+  context: string
+  candidates: list<string>   # the values to offer for the segment being typed
+]: nothing -> list<string> {
+  let prefix = (token $context | str replace --regex '[^,]*$' '')
+  $candidates | each {|c| $prefix + $c }
+}
+
 # Complete a comma-separated list of `col[:asc|:desc]` sort tokens. At a fresh segment
 # the `cols` pool is offered; once a `:` is typed, `col:asc`/`col:desc`. The
 # already-typed prefix is re-prepended so accepting a candidate EXTENDS the list. The
@@ -183,7 +199,8 @@ export def "catalog-ctx" [
 # wrapped in `try` — a shape change degrades to global (unscoped) suggestions.
 #
 # A driver projects what it needs off this: the metric is `positionals.0`, the
-# matcher siblings are the operator-bearing tokens, etc.
+# matcher siblings are the operator-bearing tokens, etc. `lead-arg` below is the
+# verb-anchored projection the SQL write verbs need.
 @category mole-lib
 @example "the positionals a select line carries" { positionals "mydriver select up job=api inst" }
 export def "positionals" [context: string]: nothing -> list<string> {
@@ -193,4 +210,23 @@ export def "positionals" [context: string]: nothing -> list<string> {
     | get pipelines.0.elements.0.expr.expr.Call.arguments
     | each {|a| $a.Positional?.span?.span_source? } | compact
   } catch { [] }
+}
+
+# The first positional after one of `verbs` — the target table of `update <table> …`
+# / `delete <table> …` — unquoted; null when the command on the line is not one of
+# `verbs` (a `select` line, whose first positional is a projected column), or when
+# that slot is empty or still under the cursor. Parser-based via `positionals`, so a
+# quoted `update "users u"` survives as `users u`. Never throws. Lets one column
+# completer serve `select` (table from `--from`) and the write verbs (table here).
+@category mole-lib
+@example "the table right after the verb" { lead-arg 'mole-psql update users "a = 1" --where ' [update delete] } --result "users"
+@example "null on a select line" { lead-arg "mole-psql select id --from users " [update delete] } --result null
+export def "lead-arg" [
+  context: string
+  verbs: list<string>   # verb leaf names to anchor after, e.g. [update delete]
+]: nothing -> any {
+  let head = (tokens $context | where shape == "shape_internalcall" | get -o 0.content | default "" | into string | split row " " | last | default "")
+  if ($head not-in $verbs) { return null }
+  let first = (positionals $context | get -o 0)
+  if ($first | is-empty) { null } else { unquote ($first | into string) }
 }

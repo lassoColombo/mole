@@ -43,11 +43,15 @@ export-env {
 # Run one SQL statement, returning a `complete` record. Query on stdin (batch
 # mode → tab-separated output); password via MYSQL_PWD. The `mariadb` client is a
 # drop-in for `mysql` — identical flags and env.
-def ma-exec [conf: record, sql: string]: nothing -> record {
+def ma-exec [conf: record, sql: string, --probe]: nothing -> record {
   let db = ($conf | get -o database)
   let db_args = if ($db | is-not-empty) { ["-D" $db] } else { [] }
+  # `--probe`: completion-time bounds — a short connect timeout and MariaDB's per-statement
+  # `SET STATEMENT max_statement_time` (seconds).
+  let text = (if $probe { "SET STATEMENT max_statement_time=3 FOR " + $sql } else { $sql })
+  let pflags = (if $probe { ["--connect-timeout=3"] } else { [] })
   with-env { MYSQL_PWD: ($conf | get -o password | default "") } {
-    $sql | ^mariadb -u $conf.user -h $conf.host -P ($conf | get -o port | default 3306) ...$db_args | complete
+    $text | ^mariadb ...$pflags -u $conf.user -h $conf.host -P ($conf | get -o port | default 3306) ...$db_args | complete
   }
 }
 
@@ -68,7 +72,7 @@ def ma-type [col: record]: nothing -> any { myql cell-type $col }
 def ma-schema-load [conf: record, --refresh]: nothing -> record {
   let db = ($conf | get -o database | default "_")
   let file = (cache path "mariadb" $"($conf.name)__($db)")
-  if $refresh or (cache stale $file 1day) {
+  cache fetch $file 1day --refresh=$refresh {||
     let secs = [
         {k: "tables"      q: (myql tables-sql)}
         {k: "columns"     q: (myql columns-sql)}
@@ -77,11 +81,8 @@ def ma-schema-load [conf: record, --refresh]: nothing -> record {
       | par-each {|s| {key: $s.k, rows: (ma-rows $conf $s.q)} }
       | reduce --fold {} {|it, acc| $acc | upsert $it.key $it.rows }
     let body = (sql schema-body $secs.tables $secs.columns $secs.constraints {|c| myql display-type $c } (myql nulls))
-    let data = ({meta: {connection: $conf.name, database: $db, driver: "mariadb", refreshed_at: (date now)}} | merge $body)
-    $data | cache write $file
-    return $data
+    {meta: {connection: $conf.name, database: $db, driver: "mariadb"}} | merge $body
   }
-  cache read $file
 }
 
 # The standard override record: named flags win over the resolved connection,
@@ -108,86 +109,49 @@ def "mariadb-table" [context: string]: nothing -> list<string> {
   sql complete-tables (mariadb-catalog $context)
 }
 
-# Comma-list variant for the `schema --include/--exclude` filters: re-prepend the
-# already-typed tables so accepting a candidate extends the list.
+# Comma-list variant for `schema --include/--exclude` (see `complete csv-extend`).
 def "mariadb-tables-csv" [context: string]: nothing -> list<string> {
-  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
-  sql complete-tables (mariadb-catalog $context) | each {|t| $"($prefix)($t)" }
+  complete csv-extend $context (mariadb-table $context)
+}
+
+# The table a line targets: `--from` (select/stats), else the leading positional of the
+# write verbs (`update <table>` / `delete <table>`); null when neither is typed yet.
+def mariadb-ctx-table [context: string]: nothing -> any {
+  complete flag $context [--from -F] | default (complete lead-arg $context [update delete])
 }
 
 def "mariadb-column" [context: string]: nothing -> list<string> {
-  # `select` names its table with --from; `update`/`delete` take it as the leading
-  # positional — fall back to that so column completion works for the write verbs too.
-  let tbl = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
-  sql complete-columns (mariadb-catalog $context) $tbl
+  sql complete-columns (mariadb-catalog $context) (mariadb-ctx-table $context)
 }
 
 # Comma-list variant of `mariadb-column` for the multi-value column flags (`stats`'
 # `--by`/`--sum`/`--avg`/…): re-prepend the already-typed columns so accepting a
 # candidate extends the list (Nushell can't complete inside a `[...]` list literal).
 def "mariadb-columns-csv" [context: string]: nothing -> list<string> {
-  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
-  mariadb-column $context | each {|c| $"($prefix)($c)" }
+  complete csv-extend $context (mariadb-column $context)
 }
 
 # `select`'s `--sort-by` completer: the source columns as `col[:desc]` sort tokens.
 def "mariadb-sort" [context: string]: nothing -> list<string> { complete sort-csv $context (mariadb-column $context) }
 
-# Completion-only bounded/quiet distinct-value probe: a read-only SELECT run with a
-# short connect timeout and MariaDB's per-statement `SET STATEMENT max_statement_time`
-# (seconds), returning the `v` column's values (empty on any non-zero exit). Separate
-# from `ma-exec` so the verbs are untouched; the caller wraps it in `try`.
+# Completion-only distinct-value probe: `ma-exec --probe` (bounded); `[]` on any
+# non-zero exit. The caller wraps it in `try` for parse errors.
 def ma-probe [conf: record, sql: string]: nothing -> list<string> {
-  let db = ($conf | get -o database)
-  let db_args = if ($db | is-not-empty) { ["-D" $db] } else { [] }
-  let bounded = ("SET STATEMENT max_statement_time=3 FOR " + $sql)
-  let r = (with-env { MYSQL_PWD: ($conf | get -o password | default "") } {
-    $bounded | ^mariadb --connect-timeout=3 -u ($conf | get -o user) -h ($conf | get -o host) -P ($conf | get -o port | default 3306) ...$db_args | complete
-  })
+  let r = (ma-exec $conf $sql --probe)
   if ($r.exit_code != 0) { return [] }
   $r.stdout | from tsv --no-infer | get -o v | default []
 }
 
-# `--where` completer, csv-aware: `--where` holds a comma-list of `col<op>value` tokens;
-# this completes the LAST segment and re-prepends the earlier ones. Three stages: a
-# partial segment → column NAMES; a COMPLETE column → the dialect OPERATORS (`col=`,
-# … via `op-completions`, so you never type `=` by hand); an `=`/`!=` segment → a LIVE,
-# bounded `SELECT DISTINCT <col>` scoped to the committed sibling predicates + the
-# `--from`/leading table, offering `col<op>value` per distinct value (best-effort). A
-# comparison/LIKE/`in:` segment, or a bare segment right after an open `in:` list,
-# completes nothing further.
+# `--where` completer. The three stages — columns → the dialect operators → live
+# distinct values scoped to the sibling predicates — are planned by the pure
+# `sql where-plan`; this only runs the bounded probe (best-effort: unreachable /
+# slow / errored → nothing).
 def "mariadb-where" [context: string]: nothing -> list<any> {
-  let ops = (myql ops)
-  let tok = (complete token $context)
-  let prefix = ($tok | str replace --regex '[^,]*$' '')       # everything up to & incl the last comma
-  let seg = ($tok | split row "," | last | default "")         # the segment being typed
-  let committed = ($prefix | str trim --char ",")
-  let pref_preds = (sql parse-where $committed --ops $ops)
-  let p = (sql predicate-token $seg --ops $ops)
-  # mid open-in:-list — a bare segment after an in:-valued predicate ⇒ don't offer columns
-  if ($p == null) and ($pref_preds != null) and ($pref_preds | is-not-empty) and (($pref_preds | last | get value) | str starts-with "in:") {
-    return []
-  }
-  if ($p == null) {
-    let cols = (mariadb-column $context)
-    if ($seg in $cols) {
-      let longer = ($cols | where {|c| $c != $seg and ($c | str starts-with $seg) } | each {|c| {value: ($prefix + $c), description: "column"} })
-      return (((sql op-completions $seg $ops) | each {|r| {value: ($prefix + $r.value), description: $r.description} }) ++ $longer)
-    }
-    return ($cols | each {|c| $prefix + $c })
-  }
-  if ($p.op not-in ["=" "!="]) or ($p.value | str starts-with "in:") { return [] }
-  let table = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
+  let plan = (sql where-plan (complete token $context) (mariadb-column $context) --ops (myql ops) --dialect (myql dialect) --table (mariadb-ctx-table $context))
+  if ($plan.probe? == null) { return $plan.candidates }
   let conf = (complete conn-ctx $context "mariadb")
-  if ($table | is-empty) or ($conf | is-empty) { return [] }
-  let siblings = (if ($pref_preds == null) { [] } else { $pref_preds | where col != $p.col })
-  let where = (sql render-where $siblings --dialect (myql dialect) --ops $ops)
-  let q = (sql assemble [
-    $"SELECT DISTINCT ($p.col) AS v FROM ($table)"
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
-    "LIMIT 50"
-  ])
-  (try { ma-probe $conf $q } catch { [] }) | each {|v| $prefix + $p.col + $p.op + $v }
+  if ($conf | is-empty) { return [] }
+  (try { ma-probe $conf $plan.probe.sql } catch { [] }) | each {|v| $plan.probe.prefix + $v }
 }
 
 def "mariadb-lock" [context: string]: nothing -> list<string> { myql lock-modes }
@@ -326,7 +290,7 @@ export def "select" [
 ] {
   # Multi-value flags arrive as ONE comma-joined string (Nushell can't complete inside a
   # `[...]` literal); decode to the list the clause renderers want, shadowing the params.
-  let lock_of = (sql csv-split $lock_of)
+  let lock_of = (complete csv $lock_of)
   if $skip_locked and $nowait {
     error make {msg: "select: --skip-locked and --nowait are mutually exclusive"}
   }
@@ -343,12 +307,11 @@ export def "select" [
   # The rest slot is projection-only now (commas optional); WHERE lives in --where,
   # dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse as tokens.
   let cols = ($columns | each {|c| $c | str trim --char "," } | where {|c| $c | is-not-empty })
-  let where_sql = (sql build-where ($where | default "") --dialect (myql dialect) --ops (myql ops))
   let text = (sql assemble [
     (myql projection $cols $distinct)
     $"FROM ($from)"
-    (if ($where_sql | is-not-empty) { $"WHERE ($where_sql)" })
-    (sql build-order (sql csv-split $sort_by))
+    (sql where-clause $where --dialect (myql dialect) --ops (myql ops))
+    (sql build-order (complete csv $sort_by))
     (if $limit != null { $"LIMIT ($limit)" })
     (if $offset != null { $"OFFSET ($offset)" })
     (myql lock $lock ($lock_of | default []) $skip_locked $nowait)
@@ -362,9 +325,7 @@ export def "select" [
   }
   let rows = (ma-rows $conf $text)
   if $raw { return $rows }
-  $rows
-  | sql normalize-nulls (myql nulls)
-  | sql apply-types (sql columns-for (ma-schema-load $conf) (sql base-table $from)) {|c| ma-type $c }
+  $rows | sql type-rows (ma-schema-load $conf) $from (myql nulls) {|c| ma-type $c }
 }
 
 # Compose and run a single-table MariaDB UPDATE.
@@ -393,7 +354,7 @@ export def "select" [
   mole-mariadb update users "status = 'active'" "verified = 1" --where "email = 'a@b.c'" --dry-run | get query
 } --result "UPDATE users SET status = 'active', verified = 1 WHERE email = 'a@b.c'"
 @example "bounded rewrite: ORDER BY ... LIMIT" {
-  mole-mariadb update jobs "priority = priority + 1" --where "queued = 1" --sort-by "created_at asc" --limit 100 --dry-run | get query
+  mole-mariadb update jobs "priority = priority + 1" --where "queued = 1" --sort-by created_at:asc --limit 100 --dry-run | get query
 } --result "UPDATE jobs SET priority = priority + 1 WHERE queued = 1 ORDER BY created_at ASC LIMIT 100"
 @example "guard: an unfiltered UPDATE needs --all" {
   mole-mariadb update users "archived = 1" --all --dry-run | get query
@@ -402,7 +363,7 @@ export def "update" [
   table: string@"mariadb-table"                    # target table (UPDATE <table>); single table, an alias is allowed: "users u"
   ...assignments: string@"mariadb-column"          # SET assignments, verbatim "col = expr" (at least one required)
   --where(-w): string@"mariadb-where"              # WHERE: col<op>value token-list (comma-sep, completable) OR raw SQL
-  --sort-by(-s): string                            # ORDER BY terms, comma-separated: "col [asc|desc]" (with --limit)
+  --sort-by(-s): string@"mariadb-sort"               # ORDER BY terms: col[:desc], comma-separated (with --limit)
   --limit(-l): int                                 # LIMIT N — cap the rows changed
   --all                                            # allow an unfiltered UPDATE (every row) when --where is omitted
   --connection(-c): string@complete-connection   # named connection (default: current)
@@ -423,7 +384,7 @@ export def "update" [
   let where_sql = (sql build-where ($where | default "") --dialect (myql dialect) --ops (myql ops))
   let text = (sql assemble [
     (sql build-update --table $table --set $assignments --where ($where_sql | default ""))
-    (myql order $sort_by)
+    (sql build-order (complete csv $sort_by))
     (if $limit != null { $"LIMIT ($limit)" })
   ])
   let conf = (ma-conf $connection $host $port $user $password $database $set)
@@ -456,7 +417,7 @@ export def "update" [
   mole-mariadb delete sessions --where "expires_at < now()" --dry-run | get query
 } --result "DELETE FROM sessions WHERE expires_at < now()"
 @example "delete the oldest N (ORDER BY ... LIMIT)" {
-  mole-mariadb delete logs --where "level = 'debug'" --sort-by "ts asc" --limit 1000 --dry-run | get query
+  mole-mariadb delete logs --where "level = 'debug'" --sort-by ts:asc --limit 1000 --dry-run | get query
 } --result "DELETE FROM logs WHERE level = 'debug' ORDER BY ts ASC LIMIT 1000"
 @example "guard: an unfiltered DELETE needs --all" {
   mole-mariadb delete staging_rows --all --dry-run | get query
@@ -464,7 +425,7 @@ export def "update" [
 export def "delete" [
   table: string@"mariadb-table"                    # target table (DELETE FROM <table>); single table, an alias is allowed: "users u"
   --where(-w): string@"mariadb-where"              # WHERE: col<op>value token-list (comma-sep, completable) OR raw SQL
-  --sort-by(-s): string                            # ORDER BY terms, comma-separated: "col [asc|desc]" (with --limit)
+  --sort-by(-s): string@"mariadb-sort"               # ORDER BY terms: col[:desc], comma-separated (with --limit)
   --limit(-l): int                                 # LIMIT N — cap the rows removed
   --all                                            # allow an unfiltered DELETE (every row) when --where is omitted
   --connection(-c): string@complete-connection   # named connection (default: current)
@@ -484,7 +445,7 @@ export def "delete" [
   }
   let text = (sql assemble [
     (sql build-delete --table $table --where ($where_sql | default ""))
-    (myql order $sort_by)
+    (sql build-order (complete csv $sort_by))
     (if $limit != null { $"LIMIT ($limit)" })
   ])
   let conf = (ma-conf $connection $host $port $user $password $database $set)
@@ -547,15 +508,8 @@ export def "schema" [
     error make {msg: "schema: --include and --exclude are mutually exclusive"}
   }
   let conf = (ma-conf $connection $host $port $user $password $database $set)
-  let data = (sql schema-filter (ma-schema-load $conf --refresh=$refresh) --include (sql csv-split $include) --exclude (sql csv-split $exclude))
-  if $full { return $data }
-  if ($find | is-not-empty) {
-    sql schema-find $data $find
-  } else if ($table | is-not-empty) {
-    sql schema-detail $data $table
-  } else {
-    sql schema-tables $data
-  }
+  let data = (sql schema-filter (ma-schema-load $conf --refresh=$refresh) --include (complete csv $include) --exclude (complete csv $exclude))
+  sql schema-view $data --table ($table | default "") --find ($find | default "") --full=$full
 }
 
 # Make a mariadb connection the current one for this driver.

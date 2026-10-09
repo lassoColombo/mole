@@ -1,74 +1,69 @@
 # mole
 
-A nushell framework to manage and query eterogeneous data-sources.
+A Nushell framework to manage and query heterogeneous data sources.
 
 ---
 
 `mole` is the shared foundation for a family of small Nushell modules that wrap
 data-source CLIs/APIs behind typed, completion-aware verbs. It provides
-connection config, query/cache/exec plumbing, and shared completers.
+connection config, query/cache/editor plumbing, and the contextual completion
+toolkit every driver builds on.
 
-**One principle: submodules depend on mole, never the reverse.** mole never
-imports or enumerates submodules, so installing a submodule is only cloning a
-sibling repo — mole's source is never edited, and there is no umbrella or
-`sync`/codegen step. See [`DESIGN.md`](DESIGN.md).
-
-> Submodule management and the version/compatibility contract were removed for
-> now — mole core is currently connection-config + saved-query management plus the
-> shared `lib/` plumbing. Install a submodule by cloning it next to `mole/` and
-> adding a `use` line.
+**One principle: dependencies point one way.** Drivers depend on pure libraries
+and on mole core; core never imports or enumerates drivers, so installing one is
+cloning it next to `mole/` and adding a `use` line. See [`DESIGN.md`](DESIGN.md).
 
 ## Layout
 
 ```
-<workspace>/                  # any dir on $env.NU_LIB_DIRS (siblings shown, but layout is free)
-├── mole/                     # THIS repo — the core module
-│   ├── mod.nu                # composition + `mole query edit/show/dir`
-│   ├── cfg.nu                # `mole cfg show/file/dir/edit`
-│   └── lib/                  # plumbing, imported per concern (never user-visible)
-│       └── config.nu · conn.nu · cache.nu · query.nu · complete.nu
-├── mole-sql/                 # a driver submodule (stub): `use mole/lib/*.nu`
-│   ├── mod.nu
-└── mole-vlogs/               # a driver submodule (stub)
-    ├── mod.nu
+<workspace>/                  # the dir on $env.NU_LIB_DIRS
+├── mole/                     # core: `mole cfg …`, `mole query …`, lib/ plumbing
+│   ├── mod.nu · cfg.nu
+│   └── lib/                  # config · conn · cache · query · editor · complete
+├── mole-sql/sql.nu           # pure SQL library (assemble, predicate tokens, schema cache helpers, where-plan)
+├── mole-myql/myql.nu         # pure MySQL-dialect library (shared by mole-mysql / mole-mariadb)
+├── mole-promql/promql.nu     # pure PromQL library (shared by mole-prometheus / mole-victoriametrics)
+├── mole-psql/ mole-mysql/ mole-mariadb/ mole-trino/ mole-duckdb/     # SQL drivers
+├── mole-mongodb/ mole-victorialogs/ mole-prometheus/ mole-victoriametrics/
+├── mole-mermaid/ mole-sqls/ mole-zellij/                             # tools over core
+└── run-tests.nu              # every module's nutest suite
 ```
 
 ## How it fits together
 
-- **The user `use`s each module directly** (one `use` line each, always without
-  `*`): `use mole`, `use mole-sql`, … Commands are prefixed by the module name →
-  `mole cfg show`, `mole query dir`, `mole-sql select`.
-- **`use mole` exposes only management commands** (`mole cfg …`, `mole query …`);
-  the plumbing in `mole/lib/` is imported privately by `mod.nu` and never leaks.
-  Submodules import the lib concerns they need directly, e.g. `use
-  mole/lib/conn.nu` → `conn resolve` (a bare path resolved through
-  `$env.NU_LIB_DIRS`; file modules keep their `.nu` extension).
-- **Registry self-assembles.** Each submodule's `export-env` runs on `use`,
-  calling `conn register "<driver>"` to announce its driver name into
-  `$env.MOLE_REGISTRY`; loading several accumulates them. No manifest file — just
-  the name. Its one consumer today is driver-scoped `--driver` completion.
-- **Install by hand.** Clone a submodule anywhere on `$env.NU_LIB_DIRS` (a shared
-  modules dir, or beside `mole/`), then add a `use mole-<tool>` line. Update or pin
-  with plain `git`. mole does not wrap this for now.
+- **The user `use`s each module directly** (one `use` line each, never `*`):
+  `use mole`, `use mole-psql`, … Commands are prefixed by the module name →
+  `mole cfg show`, `mole-psql select`.
+- **`use mole` exposes only management commands**; the plumbing in `mole/lib/` is
+  imported privately by `mod.nu` and never leaks. Drivers import the lib concerns
+  they need directly (`use mole/lib/conn.nu` → `conn resolve`).
+- **Registry self-assembles.** Each driver's `export-env` calls
+  `conn register "<driver>"`; loading several accumulates them. No manifest.
+- **Pure libraries stay pure.** `mole-sql` and friends do no I/O; dialect specifics
+  are injected, and where a driver would copy orchestration the library returns a
+  *plan* the driver executes (`sql where-plan`).
 
 ## Try it
 
 ```nushell
-$env.NU_LIB_DIRS ++= ["/abs/path/to/workspace"]   # the dir CONTAINING mole/, mole-sql/, …
+$env.NU_LIB_DIRS ++= ["/abs/path/to/workspace"]   # the dir CONTAINING mole/, mole-psql/, …
 
 use mole
-use mole-sql
-use mole-vlogs
+use mole-psql
 
-mole cfg show                # configured connections (secrets masked), by driver
-mole-sql set-connection prod-pg
-mole-sql select id email --from users --where active --sort-by id --limit 5
+mole cfg show                                   # configured connections (secrets masked), by driver
+mole-psql set-connection prod-pg
+mole-psql select id email --from users --where status=active,age>=30 --sort-by id --limit 5
+mole-psql select --from users --where "created_at > now() - interval '1 day'" --dry-run
+mole-psql schema --table users
 ```
 
 Config lives at `~/.config/mole/connections.yaml` (a map **keyed by driver**;
-honors `$XDG_CONFIG_HOME`). A legacy flat `connections:` list is rejected at read —
-group connections into driver-keyed sections.
+honors `$XDG_CONFIG_HOME`). Connection names are unique across drivers.
 
-`mole-sql` and `mole-vlogs` here are **stubs** proving the integration
-skeleton — real execution/typing lands later. `mole_old/` (a workspace sibling)
-holds the original monolith for reference.
+## Tests
+
+```nushell
+nu run-tests.nu                 # all suites (needs the workspace + nutest's parent on NU_LIB_DIRS)
+nu run-tests.nu --path mole-sql
+```

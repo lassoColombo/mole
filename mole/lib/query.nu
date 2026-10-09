@@ -5,6 +5,7 @@
 
 use ./config.nu
 use ./complete.nu
+use ./editor.nu
 
 # Resolve query text from the first available source, in precedence order:
 # inline `text`, a saved `--file`, piped stdin, then an interactive `$EDITOR`
@@ -33,7 +34,7 @@ export def "resolve" [
   }
   if ($piped | is-not-empty) { return ($piped | into string) }
   let tmp = mktemp --suffix $suffix
-  nu -c $"($env.EDITOR) ($tmp)"
+  editor launch $tmp
   open -r $tmp
 }
 

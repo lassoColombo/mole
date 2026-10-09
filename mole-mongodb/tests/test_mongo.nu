@@ -97,14 +97,6 @@ def "build-find composes clauses" [] {
 
 # ---- completion helper ---------------------------------------------------------
 
-@test
-def "parse-flag reads flags from a context line" [] {
-    assert equal (mongo parse-flag "find -C orders --limit 5" ["--collection" "-C"]) "orders"
-    assert equal (mongo parse-flag "find --collection=orders" ["--collection" "-C"]) "orders"
-    assert equal (mongo parse-flag "find -C a -C b" ["--collection" "-C"]) "b"   # last wins
-    assert equal (mongo parse-flag "find" ["--collection" "-C"]) null
-}
-
 # ---- safety --------------------------------------------------------------------
 
 @test

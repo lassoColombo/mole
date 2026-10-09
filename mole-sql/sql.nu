@@ -1,6 +1,6 @@
 # mole-sql — generic SQL LIBRARY (dialect-agnostic). Not a plugin/driver: it
 # exposes shared helpers that dialect plugins (mole-psql, mole-mysql) import via
-# `use mole-sql/sql.nu` (→ `sql build-select`, …). No export-env, no driver
+# `use mole-sql/sql.nu` (→ `sql assemble`, `sql build-where`, …). No export-env, no driver
 # registration, no manifest — a pure library discovered via `NU_LIB_DIRS`.
 #
 # LAYERING: this file is a PURE library — it `use`s NOTHING (not mole core, not
@@ -83,39 +83,6 @@ export def "join-list" [
 @example "strip a table alias" { sql base-table "users u" } --result "users"
 export def "base-table" [ref: string]: nothing -> string {
   $ref | str trim | split row " " | first
-}
-
-# Build an ANSI `SELECT` statement from its parts, dialect-agnostic.
-#
-# Clauses are emitted in fixed order (SELECT/FROM/WHERE/ORDER BY/LIMIT) and empty
-# ones are dropped, so the result is always valid standard SQL. `--from` is the
-# only required part; omitting `--columns` projects `*`. Dialects that need
-# non-standard syntax can post-process this string or build their own.
-@category mole-sql
-@example "just a table projects every column" {
-  sql build-select --from "users"
-} --result "SELECT * FROM users"
-@example "explicit columns are comma-joined" {
-  sql build-select --columns [id name] --from "users"
-} --result "SELECT id, name FROM users"
-@example "all clauses compose in order" {
-  sql build-select --columns [id] --from users --where "age > 18" --sort-by name --limit 10
-} --result "SELECT id FROM users WHERE age > 18 ORDER BY name LIMIT 10"
-export def "build-select" [
-  --columns: list<string> = []   # projected columns (default: *)
-  --from: string                 # source table (required)
-  --where: string                # WHERE clause, without the keyword
-  --sort-by: string              # ORDER BY clause, without the keyword
-  --limit: int                   # LIMIT N
-]: nothing -> string {
-  if ($from | is-empty) { error make {msg: "sql build-select: --from <table> is required"} }
-  let cols = if ($columns | is-empty) { "*" } else { $columns | str join ", " }
-  assemble [
-    $"SELECT ($cols) FROM ($from)"
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
-    (if ($sort_by | is-not-empty) { $"ORDER BY ($sort_by)" })
-    (if $limit != null { $"LIMIT ($limit)" })
-  ]
 }
 
 # Build an ANSI `UPDATE` statement from its parts, dialect-agnostic.
@@ -440,6 +407,82 @@ export def "build-where" [
   render-where $preds --dialect $dialect --ops $ops
 }
 
+# The full `WHERE …` clause for a `--where` flag value (dual-mode, see `build-where`),
+# or null when the value is empty/absent — so a verb drops it straight into `assemble`.
+@category mole-sql
+@example "a token-list renders as a WHERE clause" { sql where-clause "status=active" } --result "WHERE status = 'active'"
+@example "raw SQL passes through" { sql where-clause "a > 1 OR b" } --result "WHERE a > 1 OR b"
+@example "empty drops the clause" { sql where-clause null } --result null
+export def "where-clause" [
+  value: any              # the `--where` flag value (null/"" → no clause)
+  --dialect: record = {}  # {backslash_escapes: bool}
+  --ops: list = []        # injected operator table; default → ansi-ops
+]: nothing -> any {
+  let body = (build-where ($value | default "") --dialect $dialect --ops $ops)
+  if ($body | is-empty) { null } else { "WHERE " + $body }
+}
+
+# ---- `--where` completion plan (pure; the driver runs the probe) ---------------
+# The three-stage `--where` completer every SQL driver wires is the SAME logic; only
+# the operator table, the string-escaping dialect, the column pool and the live
+# distinct-value probe differ — all injected. This returns a PLAN and does no I/O:
+#   {candidates: [...]}      → offer these (strings, or {value, description} records)
+#   {probe: {sql, prefix}}   → run `sql` (a bounded `SELECT DISTINCT <col> AS v`) and
+#                              offer `prefix + v` for each value it returns
+# Stages on the SEGMENT being typed (the last comma item of the cursor token; the
+# earlier, committed items are re-prepended so accepting a candidate extends the list):
+#   1. a partial segment      → column NAMES;
+#   2. a COMPLETE column name → the dialect OPERATORS (`col=`, `col~*`, … with their
+#                               notes, via `op-completions`) plus any longer columns
+#                               sharing the prefix;
+#   3. an `=`/`!=` segment    → the probe, scoped to the sibling predicates already
+#                               committed on the flag (`status=active,role=⇥` probes
+#                               `WHERE status = 'active'`).
+# A comparison/LIKE/`in:` segment, a bare segment right after an open `in:` list, and
+# a missing `--table` all complete nothing.
+@category mole-sql
+@example "a partial segment offers columns, keeping the committed prefix" {
+  sql where-plan "status=active,na" [id name status]
+} --result {candidates: ["status=active,id" "status=active,name" "status=active,status"]}
+@example "a complete column offers the operators" {
+  sql where-plan "status" [status] | get candidates | first
+} --result {value: "status=", description: equals}
+@example "an equality segment becomes a probe scoped to its siblings" {
+  sql where-plan "status=active,role=" [role status] --table users
+} --result {probe: {sql: "SELECT DISTINCT role AS v FROM users WHERE status = 'active' LIMIT 50", prefix: "status=active,role="}}
+export def "where-plan" [
+  tok: string               # the cursor token: the `--where` value typed so far
+  cols: list<string>        # the column pool (the target table's, or every table's)
+  --ops: list = []          # injected operator table; default → ansi-ops
+  --dialect: record = {}    # {backslash_escapes: bool}, for the probe's sibling WHERE
+  --table: string           # the table to probe; none → stage 3 completes nothing
+]: nothing -> record {
+  let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
+  let prefix = ($tok | str replace --regex '[^,]*$' '')      # up to & incl. the last comma
+  let seg = ($tok | split row "," | last | default "")
+  let siblings = (parse-where ($prefix | str trim --char ",") --ops $ops)   # null ⇒ committed part is raw SQL
+  let p = (predicate-token $seg --ops $ops)
+  if ($p == null) {
+    # mid open-in:-list: a bare segment after an in:-valued predicate is a list item, not a column
+    if ($siblings != null) and ($siblings | is-not-empty) and (($siblings | last | get value) | str starts-with "in:") {
+      return {candidates: []}
+    }
+    if ($seg in $cols) {
+      let operators = (op-completions $seg $ops | each {|r| {value: ($prefix + $r.value), description: $r.description} })
+      let longer = ($cols | where {|c| $c != $seg and ($c | str starts-with $seg) } | each {|c| {value: ($prefix + $c), description: "column"} })
+      return {candidates: ($operators ++ $longer)}
+    }
+    return {candidates: ($cols | each {|c| $prefix + $c })}
+  }
+  if ($p.op not-in ["=" "!="]) or ($p.value | str starts-with "in:") or ($table | is-empty) { return {candidates: []} }
+  let scope = (if ($siblings == null) { [] } else { $siblings | where col != $p.col })
+  let scoped = (render-where $scope --dialect $dialect --ops $ops)
+  {probe: {
+    sql: (assemble [$"SELECT DISTINCT ($p.col) AS v FROM ($table)" (if ($scoped | is-not-empty) { $"WHERE ($scoped)" }) "LIMIT 50"])
+    prefix: ($prefix + $p.col + $p.op)
+  }}
+}
+
 # ---- ORDER BY tokens (col[:asc|:desc]) ----------------------------------------
 
 # Parse one `col[:asc|:desc]` sort token into {col, dir}. A bare `col` sorts ASC
@@ -511,17 +554,42 @@ export def "ansi-aggs" []: nothing -> list {
   ]
 }
 
+# Translate a driver's aggregate FLAGS into the ordered `build-aggs` request list by
+# walking the injected `aggs` table: a fieldless aggregate contributes `{fn}` when
+# `flags.<flag>` is true; a field aggregate contributes `{fn, cols}` when it holds a
+# non-empty list. Output order is table order — which IS the SELECT output order. The
+# verb and its result-column completer both call this, so they can't drift. The driver
+# builds `flags` keyed by the aggs' `flag` names: `{count: $count, sum: (complete csv $sum), …}`.
+@category mole-sql
+@example "flags to ordered requests" {
+  sql agg-requests {count: true, sum: [amount], avg: []}
+} --result [{fn: count}, {fn: sum, cols: [amount]}]
+export def "agg-requests" [
+  flags: record     # {<flag>: bool | list<string>}, keyed by the aggs' flag names
+  aggs: list = []   # injected [{flag, fieldless, render}]; default → ansi-aggs
+]: nothing -> list {
+  let aggs = (if ($aggs | is-empty) { ansi-aggs } else { $aggs })
+  $aggs | each {|a|
+    let v = ($flags | get -o $a.flag)
+    if $a.fieldless {
+      if $v == true { [{fn: $a.flag}] } else { [] }
+    } else if (($v | describe) | str starts-with "list") and ($v | is-not-empty) {
+      [{fn: $a.flag, cols: $v}]
+    } else { [] }
+  } | flatten
+}
+
 # Build the ordered aggregate specs `[{expr, name}]` from a list of REQUESTS and the
 # injected aggregate table. Each request is `{fn, cols?}`: a fieldless aggregate
 # (`{fn: "count"}`) yields one spec named after the fn; a field-list aggregate
-# (`{fn: "sum", cols: "a,b"}`) expands to one spec per field, auto-named `<fn>_<field>`
+# (`{fn: "sum", cols: [a b]}`) expands to one spec per field, auto-named `<fn>_<field>`
 # (fn and field sanitized, so `count-distinct`→`count_distinct_<field>`). The SQL comes
 # from the matched entry's `render` closure in `aggs` (default → `ansi-aggs`), so a
 # driver adds dialect aggregates by extending that table. Requests are emitted in order;
 # empty requests default to a single `count(*)` — so `stats --by x` counts rows per group.
 @category mole-sql
 @example "a fieldless count and a per-column sum" {
-  sql build-aggs [{fn: "count"} {fn: "sum", cols: "amount"}]
+  sql build-aggs [{fn: "count"} {fn: "sum", cols: [amount]}]
 } --result [{expr: "count(*)", name: count}, {expr: "sum(amount)", name: sum_amount}]
 @example "empty request defaults to count(*)" {
   sql build-aggs []
@@ -536,7 +604,7 @@ export def "build-aggs" [
     if $spec.fieldless {
       [{expr: (do $spec.render ""), name: (sanitize-name $spec.flag)}]
     } else {
-      csv-split ($req.cols? | default "") | each {|c| {expr: (do $spec.render $c), name: ((sanitize-name $spec.flag) + "_" + (sanitize-name $c))} }
+      ($req.cols? | default []) | each {|c| {expr: (do $spec.render $c), name: ((sanitize-name $spec.flag) + "_" + (sanitize-name $c))} }
     }
   } | flatten)
   if ($specs | is-empty) { [{expr: "count(*)", name: "count"}] } else { $specs }
@@ -696,6 +764,28 @@ export def "normalize-nulls" [
   $cols | reduce --fold $rows {|c, acc| $acc | core-update $c {|| nullify-val $in $nulls } }
 }
 
+# The typed-rows tail every composing verb shares: the dialect's NULL placeholder(s)
+# become real nulls, then the `table`'s cached columns are DB-typed through the injected
+# `typer` (`{|col| -> closure|null}`, as for `apply-types`). `table` may be aliased or
+# qualified (`base-table` strips the alias). Empty input — a write with no RETURNING
+# rows — passes through untouched.
+@category mole-sql
+@example "nulls normalized, id typed from the cache" {
+  let data = {columns: [{schema: public, table: users, name: id, data_type: integer}]}
+  let typer = {|c| if $c.data_type == "integer" { sql null-or {|x| $x | into int } } else { null } }
+  [{id: "1", note: "NULL"}] | sql type-rows $data "users u" ["NULL"] $typer
+} --result [{id: 1, note: null}]
+export def "type-rows" [
+  data: record            # the schema-cache record (needs `columns`)
+  table: string           # the verb's table ref; alias / schema qualification allowed
+  nulls: list<string>     # the dialect's NULL placeholder string(s)
+  typer: closure          # column record → cell converter (or null), as for `apply-types`
+]: any -> any {
+  let rows = $in
+  if ($rows | is-empty) { return $rows }
+  $rows | normalize-nulls $nulls | apply-types (columns-for $data (base-table $table)) $typer
+}
+
 # ---- schema normalization -----------------------------------------------------
 
 # A cell holding one of the dialect's NULL placeholders → real `null`. `nulls` is
@@ -829,21 +919,6 @@ export def "schema-body" [
 }
 
 # ---- schema filtering (prune a cached `data` record to a table subset) --------
-
-# Split a comma-separated flag value into a clean `list<string>` (trims, drops
-# blanks); `null`/"" → `[]`. The list-valued schema filters (`--include a,b`) reach a
-# verb as ONE comma-joined string — Nushell can't complete inside a `[...]` list
-# literal — so this normalizes that wire form to the list the pure helpers want.
-@category mole-sql
-@example "split a comma list, trimming blanks and empties" {
-  sql csv-split "users, public.orders ,"
-} --result [users, public.orders]
-@example "null or empty yields an empty list" {
-  sql csv-split null
-} --result []
-export def "csv-split" [v: any]: nothing -> list<string> {
-  $v | default "" | into string | split row "," | str trim | where {|x| $x | is-not-empty }
-}
 
 # Does `value` match `pattern`? Plain string equality, UNLESS the pattern carries a
 # `*` wildcard — then `*` matches any run of characters and every other character
@@ -1064,56 +1139,28 @@ export def "schema-find" [
   $table_hits ++ $column_hits
 }
 
+# The `schema` verb's views over a (possibly filtered) cache record: `--full` → the
+# record itself; `--find` → `schema-find`; `--table` → `schema-detail`; else the
+# per-table summary (`schema-tables`). Precedence: full, find, table.
+@category mole-sql
+@example "the default summary view" {
+  let data = {tables: [{schema: public, name: users, type: "BASE TABLE", comment: null, row_estimate: 5}], columns: [], constraints: []}
+  sql schema-view $data | get name
+} --result [users]
+@example "--full hands the record back" { sql schema-view {tables: [], columns: [], constraints: []} --full | columns } --result [tables, columns, constraints]
+export def "schema-view" [
+  data: record       # a schema-cache record ({tables, columns, constraints}, filtered or not)
+  --table: string    # detail view for one table (`name` or `schema.name`)
+  --find: string     # search table/column names and comments
+  --full             # return the record itself
+]: nothing -> any {
+  if $full { return $data }
+  if ($find | is-not-empty) { return (schema-find $data $find) }
+  if ($table | is-not-empty) { return (schema-detail $data $table) }
+  schema-tables $data
+}
+
 # ---- completion helpers (pure; plugin shims load the cache & pass it in) ------
-
-# Extract a flag's value from a raw completion-context command line.
-#
-# Tries each spelling in `names` (long and short), accepts `--flag value` or
-# `--flag=value`, and when the flag appears more than once takes the last
-# occurrence. Returns `null` when no spelling is present. Completers use this to
-# recover the `--connection` / `--from` a user has already typed.
-@category mole-sql
-@example "read a flag the user already typed" {
-  sql parse-flag "select --from public.users -c prod" ["--connection" "-c"]
-} --result prod
-@example "null when the flag is absent" {
-  sql parse-flag "select 1" ["--connection" "-c"]
-} --result null
-export def "parse-flag" [
-  ctx: string           # the completion context (the partial command line)
-  names: list<string>   # flag spellings to try, e.g. ["--connection" "-c"]
-]: nothing -> any {
-  let pat = '(?:' + ($names | str join "|") + ')[\s=]+(?P<v>[^\s]+)'
-  let m = ($ctx | parse --regex $pat)
-  if ($m | is-empty) { null } else { $m | last | get v }
-}
-
-# The leading positional (target table) of a write verb's completion context.
-#
-# `update`/`delete` take their table as the FIRST positional (`update <table> …`,
-# `delete <table> …`), not a `--from` flag, so their column completer recovers it
-# from here — the token immediately after the verb name. `verbs` lists the leaf
-# names to anchor on (so one completer can serve both). Returns null when that slot
-# is missing or is itself a flag, letting the caller fall back (to `--from`, then to
-# every table's columns) — which is exactly what a `select` context wants, since it
-# carries no `update`/`delete` token.
-@category mole-sql
-@example "the table right after the verb" {
-  sql lead-arg 'mole-psql update users "a = 1"' [update delete]
-} --result "users"
-@example "null when a flag takes the slot (caller falls back)" {
-  sql lead-arg "mole-psql update -c prod " [update delete]
-} --result null
-export def "lead-arg" [
-  ctx: string          # completion context (the partial command line up to the cursor)
-  verbs: list<string>  # verb leaf names to anchor after, e.g. [update delete]
-]: nothing -> any {
-  let toks = ($ctx | split row --regex '\s+' | where {|t| $t | is-not-empty })
-  let hits = ($toks | enumerate | where item in $verbs | get index)
-  if ($hits | is-empty) { return null }
-  let nxt = ($toks | get -o (($hits | first) + 1))
-  if ($nxt | is-empty) or ($nxt | str starts-with "-") { null } else { $nxt }
-}
 
 # Fully-qualified `schema.name` table names from a cache record, for completion.
 #

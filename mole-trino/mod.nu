@@ -67,13 +67,15 @@ def trino-dangerous []: nothing -> string {
 # address via --server host:port, identity via --user (the demo has no password),
 # default namespace via --catalog/--schema. CSV_HEADER emits a header row plus
 # quoted CSV, so `from csv` recovers the column names and parses losslessly.
-def trino-exec [conf: record, sql: string]: nothing -> record {
+def trino-exec [conf: record, sql: string, --probe]: nothing -> record {
   let server = $"($conf.host):($conf | get -o port | default 8080)"
+  let bounds = (if $probe { ["--client-request-timeout" "3s"] } else { [] })   # completion-time bound
   (^trino
     --server $server
     --user ($conf | get -o user | default "admin")
     --catalog $conf.catalog
     --schema $conf.schema
+    ...$bounds
     --output-format CSV_HEADER
     --execute $sql
   ) | complete
@@ -175,7 +177,7 @@ def trino-schema-load [conf: record, --refresh]: nothing -> record {
   let cat = ($conf | get -o catalog | default "_")
   let sch = ($conf | get -o schema | default "_")
   let file = (cache path "trino" $"($conf.name)__($cat).($sch)")
-  if $refresh or (cache stale $file 1day) {
+  cache fetch $file 1day --refresh=$refresh {||
     let secs = [
         {k: "tables"      q: (trino-tables-sql)}
         {k: "columns"     q: (trino-columns-sql)}
@@ -184,11 +186,8 @@ def trino-schema-load [conf: record, --refresh]: nothing -> record {
       | par-each {|s| {key: $s.k, rows: (trino-rows $conf $s.q)} }
       | reduce --fold {} {|it, acc| $acc | upsert $it.key $it.rows }
     let body = (sql schema-body $secs.tables $secs.columns $secs.constraints {|c| trino-display-type $c } $TRINO_NULLS)
-    let data = ({meta: {connection: $conf.name, catalog: $cat, schema: $sch, driver: "trino", refreshed_at: (date now)}} | merge $body)
-    $data | cache write $file
-    return $data
+    {meta: {connection: $conf.name, catalog: $cat, schema: $sch, driver: "trino"}} | merge $body
   }
-  cache read $file
 }
 
 # The standard override record: named flags win over the resolved connection, and
@@ -216,90 +215,49 @@ def "trino-table" [context: string]: nothing -> list<string> {
   sql complete-tables (trino-catalog $context)
 }
 
-# Comma-list variant for the `schema --include/--exclude` filters: re-prepend the
-# already-typed tables so accepting a candidate extends the list.
+# Comma-list variant for `schema --include/--exclude` (see `complete csv-extend`).
 def "trino-tables-csv" [context: string]: nothing -> list<string> {
-  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
-  sql complete-tables (trino-catalog $context) | each {|t| $"($prefix)($t)" }
+  complete csv-extend $context (trino-table $context)
+}
+
+# The table a line targets: `--from` (select/stats), else the leading positional of the
+# write verbs (`update <table>` / `delete <table>`); null when neither is typed yet.
+def trino-ctx-table [context: string]: nothing -> any {
+  complete flag $context [--from -F] | default (complete lead-arg $context [update delete])
 }
 
 def "trino-column" [context: string]: nothing -> list<string> {
-  # `select` names its table with --from; `update`/`delete` take it as the leading
-  # positional — fall back to that so column completion works for the write verbs too.
-  let tbl = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
-  sql complete-columns (trino-catalog $context) $tbl
+  sql complete-columns (trino-catalog $context) (trino-ctx-table $context)
 }
 
 # Comma-list variant of `trino-column` for the multi-value column flags (`stats`'
 # `--by`/`--sum`/`--avg`/…): re-prepend the already-typed columns so accepting a
 # candidate extends the list (Nushell can't complete inside a `[...]` list literal).
 def "trino-columns-csv" [context: string]: nothing -> list<string> {
-  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
-  trino-column $context | each {|c| $"($prefix)($c)" }
+  complete csv-extend $context (trino-column $context)
 }
 
 # `select`'s `--sort-by` completer: the source columns as `col[:desc]` sort tokens.
 def "trino-sort" [context: string]: nothing -> list<string> { complete sort-csv $context (trino-column $context) }
 
-# Completion-only bounded/quiet distinct-value probe: a read-only SELECT run with a
-# short `--client-request-timeout` (the LIMIT bounds the result), returning the `v`
-# column's values (empty on any non-zero exit). Separate from `trino-exec` so the
-# verbs are untouched; the caller wraps it in `try`.
+# Completion-only distinct-value probe: `trino-exec --probe` (bounded); `[]` on any
+# non-zero exit. The caller wraps it in `try` for parse errors.
 def trino-probe [conf: record, sql: string]: nothing -> list<string> {
-  let server = $"($conf.host):($conf | get -o port | default 8080)"
-  let r = (^trino
-    --server $server
-    --user ($conf | get -o user | default "admin")
-    --catalog ($conf | get -o catalog)
-    --schema ($conf | get -o schema)
-    --client-request-timeout 3s
-    --output-format CSV_HEADER
-    --execute $sql
-  | complete)
+  let r = (trino-exec $conf $sql --probe)
   if ($r.exit_code != 0) { return [] }
   $r.stdout | from csv --no-infer | get -o v | default []
 }
 
-# `--where` completer, csv-aware: `--where` holds a comma-list of `col<op>value` tokens;
-# this completes the LAST segment and re-prepends the earlier ones. Three stages: a
-# partial segment → column NAMES; a COMPLETE column → the dialect OPERATORS (`col=`,
-# … via `op-completions`, so you never type `=` by hand); an `=`/`!=` segment → a LIVE,
-# bounded `SELECT DISTINCT <col>` scoped to the committed sibling predicates + the
-# `--from`/leading table, offering `col<op>value` per distinct value (best-effort). A
-# comparison/LIKE/`in:` segment, or a bare segment right after an open `in:` list,
-# completes nothing further.
+# `--where` completer. The three stages — columns → the dialect operators → live
+# distinct values scoped to the sibling predicates — are planned by the pure
+# `sql where-plan`; this only runs the bounded probe (best-effort: unreachable /
+# slow / errored → nothing).
 def "trino-where" [context: string]: nothing -> list<any> {
-  let ops = (trino-ops)
-  let tok = (complete token $context)
-  let prefix = ($tok | str replace --regex '[^,]*$' '')       # everything up to & incl the last comma
-  let seg = ($tok | split row "," | last | default "")         # the segment being typed
-  let committed = ($prefix | str trim --char ",")
-  let pref_preds = (sql parse-where $committed --ops $ops)
-  let p = (sql predicate-token $seg --ops $ops)
-  # mid open-in:-list — a bare segment after an in:-valued predicate ⇒ don't offer columns
-  if ($p == null) and ($pref_preds != null) and ($pref_preds | is-not-empty) and (($pref_preds | last | get value) | str starts-with "in:") {
-    return []
-  }
-  if ($p == null) {
-    let cols = (trino-column $context)
-    if ($seg in $cols) {
-      let longer = ($cols | where {|c| $c != $seg and ($c | str starts-with $seg) } | each {|c| {value: ($prefix + $c), description: "column"} })
-      return (((sql op-completions $seg $ops) | each {|r| {value: ($prefix + $r.value), description: $r.description} }) ++ $longer)
-    }
-    return ($cols | each {|c| $prefix + $c })
-  }
-  if ($p.op not-in ["=" "!="]) or ($p.value | str starts-with "in:") { return [] }
-  let table = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
+  let plan = (sql where-plan (complete token $context) (trino-column $context) --ops (trino-ops) --dialect $TRINO_DIALECT --table (trino-ctx-table $context))
+  if ($plan.probe? == null) { return $plan.candidates }
   let conf = (complete conn-ctx $context "trino")
-  if ($table | is-empty) or ($conf | is-empty) { return [] }
-  let siblings = (if ($pref_preds == null) { [] } else { $pref_preds | where col != $p.col })
-  let where = (sql render-where $siblings --dialect $TRINO_DIALECT --ops $ops)
-  let q = (sql assemble [
-    $"SELECT DISTINCT ($p.col) AS v FROM ($table)"
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
-    "LIMIT 50"
-  ])
-  (try { trino-probe $conf $q } catch { [] }) | each {|v| $prefix + $p.col + $p.op + $v }
+  if ($conf | is-empty) { return [] }
+  (try { trino-probe $conf $plan.probe.sql } catch { [] }) | each {|v| $plan.probe.prefix + $v }
 }
 
 # ---- SELECT clause renderers (trino-specific) ---------------------------------
@@ -424,12 +382,11 @@ export def "select" [
   # The rest slot is projection-only now (commas optional); WHERE lives in --where,
   # dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse as tokens.
   let cols = ($columns | each {|c| $c | str trim --char "," } | where {|c| $c | is-not-empty })
-  let where_sql = (sql build-where ($where | default "") --dialect $TRINO_DIALECT --ops (trino-ops))
   let text = (sql assemble [
     (trino-projection $cols $distinct)
     $"FROM ($from)"
-    (if ($where_sql | is-not-empty) { $"WHERE ($where_sql)" })
-    (sql build-order (sql csv-split $sort_by))
+    (sql where-clause $where --dialect $TRINO_DIALECT --ops (trino-ops))
+    (sql build-order (complete csv $sort_by))
     (if $limit != null { $"LIMIT ($limit)" })
     (if $offset != null { $"OFFSET ($offset)" })
   ])
@@ -440,9 +397,7 @@ export def "select" [
   }
   let rows = (trino-rows $conf $text)
   if $raw { return $rows }
-  $rows
-  | sql normalize-nulls $TRINO_NULLS
-  | sql apply-types (sql columns-for (trino-schema-load $conf) (sql base-table $from)) {|c| trino-type $c }
+  $rows | sql type-rows (trino-schema-load $conf) $from $TRINO_NULLS {|c| trino-type $c }
 }
 
 # Compose and run a single-table Trino UPDATE.
@@ -598,15 +553,8 @@ export def "schema" [
     error make {msg: "schema: --include and --exclude are mutually exclusive"}
   }
   let conf = (trino-conf $connection $host $port $user $catalog $schema $set)
-  let data = (sql schema-filter (trino-schema-load $conf --refresh=$refresh) --include (sql csv-split $include) --exclude (sql csv-split $exclude))
-  if $full { return $data }
-  if ($find | is-not-empty) {
-    sql schema-find $data $find
-  } else if ($table | is-not-empty) {
-    sql schema-detail $data $table
-  } else {
-    sql schema-tables $data
-  }
+  let data = (sql schema-filter (trino-schema-load $conf --refresh=$refresh) --include (complete csv $include) --exclude (complete csv $exclude))
+  sql schema-view $data --table ($table | default "") --find ($find | default "") --full=$full
 }
 
 # Make a trino connection the current one for this driver.

@@ -77,16 +77,14 @@ def vm-insecure [conf: record]: nothing -> bool { $conf | get -o insecure | defa
 # for a day. `--refresh` rebuilds; otherwise a fresh cache is returned as-is. The
 # catalog calls are short-timeout and only power tab-completion.
 def vm-catalog-load [conf: record, --refresh]: nothing -> record {
-  let file = (cache path "victoriametrics" ($conf | get -o name | default "_"))
-  if (not $refresh) and (not (cache stale $file 1day)) { return (cache read $file) }
-  let base = (vm-base $conf)
-  let tok = (vm-token $conf)
-  let ins = (vm-insecure $conf)
-  let metrics = (client label-values get "__name__" --base-url $base --token $tok --insecure=$ins --max-time 10sec | get -o data | default [])
-  let labels = (client labels get --base-url $base --token $tok --insecure=$ins --max-time 10sec | get -o data | default [])
-  let data = {meta: {connection: ($conf | get -o name), driver: "victoriametrics", refreshed_at: (date now)}, metrics: $metrics, labels: $labels}
-  $data | cache write $file
-  $data
+  cache fetch (cache path "victoriametrics" ($conf | get -o name | default "_")) 1day --refresh=$refresh {||
+    let base = (vm-base $conf)
+    let tok = (vm-token $conf)
+    let ins = (vm-insecure $conf)
+    let metrics = (client label-values get "__name__" --base-url $base --token $tok --insecure=$ins --max-time 10sec | get -o data | default [])
+    let labels = (client labels get --base-url $base --token $tok --insecure=$ins --max-time 10sec | get -o data | default [])
+    {meta: {connection: ($conf | get -o name), driver: "victoriametrics"}, metrics: $metrics, labels: $labels}
+  }
 }
 
 # Warm the catalog after a successful query, but only when it is cold (missing).
@@ -229,8 +227,7 @@ def "vm-matcher" [context: string]: nothing -> list<string> {
 # re-prepending the already-typed comma items so accepting a candidate EXTENDS the
 # list (`job,me⇥` → `job,method`).
 def "vm-by" [context: string]: nothing -> list<string> {
-  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
-  (vm-mlabel $context) | each {|l| $"($prefix)($l)" }
+  complete csv-extend $context (vm-mlabel $context)
 }
 
 # Static MetricsQL function / aggregation / range-window completers (no server

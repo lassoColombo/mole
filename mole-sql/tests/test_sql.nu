@@ -2,29 +2,6 @@ use std/assert
 use std/testing *
 use ../sql.nu
 
-# ---- build-select -------------------------------------------------------------
-
-@test
-def "minimal select uses star and required from" [] {
-    assert equal (sql build-select --from "users") "SELECT * FROM users"
-}
-
-@test
-def "explicit columns are comma joined" [] {
-    assert equal (sql build-select --columns ["id" "name"] --from "users") "SELECT id, name FROM users"
-}
-
-@test
-def "full clause composition in order" [] {
-    let actual = sql build-select --columns ["id"] --from "users" --where "age > 18" --sort-by "name" --limit 10
-    assert equal $actual "SELECT id FROM users WHERE age > 18 ORDER BY name LIMIT 10"
-}
-
-@test
-def "missing from errors" [] {
-    assert error { sql build-select }
-}
-
 # ---- build-update / build-delete ----------------------------------------------
 
 @test
@@ -295,31 +272,7 @@ def "schema-filter matches qualified patterns against schema and name" [] {
     assert equal (sql schema-filter (filter-data) --include ["other.orders"] | get tables.name) []
 }
 
-@test
-def "csv-split normalizes a comma flag to a clean list" [] {
-    assert equal (sql csv-split "a, b ,,c") [a b c]
-    assert equal (sql csv-split "") []
-    assert equal (sql csv-split null) []
-}
-
 # ---- completion helpers -------------------------------------------------------
-
-@test
-def "parse-flag extracts flag values and returns null when absent" [] {
-    assert equal (sql parse-flag "select --from public.users -c prod" ["--connection" "-c"]) "prod"
-    assert equal (sql parse-flag "select --from public.users" ["--from" "-F"]) "public.users"
-    assert equal (sql parse-flag "select" ["--connection" "-c"]) null
-}
-
-@test
-def "lead-arg reads the table positional after a write verb" [] {
-    assert equal (sql lead-arg 'mole-psql update users "a = 1" st' [update delete]) "users"
-    assert equal (sql lead-arg "mole-psql delete sessions --where " [update delete]) "sessions"
-    assert equal (sql lead-arg "mole-psql update public.users col" [update delete]) "public.users"
-    # a flag in the slot, or no such verb (e.g. a select context) → null, so the caller falls back
-    assert equal (sql lead-arg "mole-psql update -c prod " [update delete]) null
-    assert equal (sql lead-arg "mole-psql select id --from users" [update delete]) null
-}
 
 @test
 def "complete-tables and complete-columns read a cache record" [] {
@@ -486,13 +439,13 @@ def "sanitize-name flattens non-word chars" [] {
 
 @test
 def "build-aggs expands requests into SQL-like named specs" [] {
-    assert equal (sql build-aggs [{fn: "count"} {fn: "sum", cols: "amount"}]) [{expr: "count(*)", name: "count"} {expr: "sum(amount)", name: "sum_amount"}]
+    assert equal (sql build-aggs [{fn: "count"} {fn: "sum", cols: [amount]}]) [{expr: "count(*)", name: "count"} {expr: "sum(amount)", name: "sum_amount"}]
     assert equal (sql build-aggs []) [{expr: "count(*)", name: "count"}]                              # empty → default count(*)
-    assert equal (sql build-aggs [{fn: "count-distinct", cols: "customer.id"}]) [{expr: "count(distinct customer.id)", name: "count_distinct_customer_id"}]
-    assert equal (sql build-aggs [{fn: "count"} {fn: "sum", cols: "x"} {fn: "avg", cols: "y"} {fn: "max", cols: "z"}] | get name) ["count" "sum_x" "avg_y" "max_z"]   # request order preserved
+    assert equal (sql build-aggs [{fn: "count-distinct", cols: [customer.id]}]) [{expr: "count(distinct customer.id)", name: "count_distinct_customer_id"}]
+    assert equal (sql build-aggs [{fn: "count"} {fn: "sum", cols: [x]} {fn: "avg", cols: [y]} {fn: "max", cols: [z]}] | get name) ["count" "sum_x" "avg_y" "max_z"]   # request order preserved
     # a driver's INJECTED dialect aggregate renders via its own closure (string_agg here)
     let aggs = (sql ansi-aggs | append {flag: "string_agg", fieldless: false, render: {|col| $"string_agg\(($col), ','\)" }})
-    assert equal (sql build-aggs [{fn: "string_agg", cols: "tags"}] $aggs) [{expr: "string_agg(tags, ',')", name: "string_agg_tags"}]
+    assert equal (sql build-aggs [{fn: "string_agg", cols: [tags]}] $aggs) [{expr: "string_agg(tags, ',')", name: "string_agg_tags"}]
 }
 
 @test
@@ -505,7 +458,7 @@ def "build-having expands aliases to expressions and count is always available" 
 
 @test
 def "apply-agg-types coerces numeric aggregate columns" [] {
-    let aggs = (sql build-aggs [{fn: "count"} {fn: "avg", cols: "amount"} {fn: "sum", cols: "x"} {fn: "min", cols: "ts"}])
+    let aggs = (sql build-aggs [{fn: "count"} {fn: "avg", cols: [amount]} {fn: "sum", cols: [x]} {fn: "min", cols: [ts]}])
     let out = ([{count: "3", avg_amount: "4.5", sum_x: "10", min_ts: "2024-01-01"}] | sql apply-agg-types $aggs | first)
     assert equal $out.count 3            # count → int
     assert equal $out.avg_amount 4.5     # avg → float
@@ -522,4 +475,78 @@ def "render-predicate and render-where forward the dialect escaping" [] {
     # render-where threads the dialect down to each predicate's literal
     assert equal (sql render-where [{col: path, op: "=", value: 'a\b'}] --dialect {backslash_escapes: true}) ("path = " + $q + 'a\\b' + $q)
     assert equal (sql render-where [{col: path, op: "=", value: 'a\b'}]) ("path = " + $q + 'a\b' + $q)
+}
+
+# ---- where-clause / where-plan ------------------------------------------------
+
+@test
+def "where-clause wraps the dual-mode body or drops it" [] {
+    assert equal (sql where-clause "status=active,age>=30") "WHERE status = 'active' AND age >= 30"
+    assert equal (sql where-clause "a > 1 OR b") "WHERE a > 1 OR b"
+    assert equal (sql where-clause "") null
+    assert equal (sql where-clause null) null
+}
+
+@test
+def "where-plan stage one offers columns with the committed prefix" [] {
+    assert equal (sql where-plan "na" [id name status]) {candidates: [id name status]}
+    assert equal (sql where-plan "status=active,na" [id name status]) {candidates: ["status=active,id" "status=active,name" "status=active,status"]}
+}
+
+@test
+def "where-plan stage two offers the dialect operators plus longer columns" [] {
+    let plan = (sql where-plan "status" [status status_code])
+    assert equal ($plan.candidates | first) {value: "status=", description: "equals"}
+    assert equal ($plan.candidates | last) {value: "status_code", description: "column"}
+    assert equal ($plan.candidates | where value == "status~*" | length) 0   # ANSI ops only by default
+    let pg = (sql where-plan "status" [status] --ops ((sql ansi-ops) ++ [{token: "~*", desc: "ILIKE", render: {|c, v, l| "" }}]))
+    assert equal ($pg.candidates | where value == "status~*" | length) 1
+}
+
+@test
+def "where-plan stage three is a probe scoped to the sibling predicates" [] {
+    assert equal (sql where-plan "role=" [role] --table users) {probe: {sql: "SELECT DISTINCT role AS v FROM users LIMIT 50", prefix: "role="}}
+    assert equal (sql where-plan "status=active,role!=" [role status] --table users) {probe: {sql: "SELECT DISTINCT role AS v FROM users WHERE status = 'active' LIMIT 50", prefix: "status=active,role!="}}
+    # the probed column's own earlier predicate is not used to scope itself
+    assert equal (sql where-plan "role=admin,role=" [role] --table users).probe.sql "SELECT DISTINCT role AS v FROM users LIMIT 50"
+}
+
+@test
+def "where-plan completes nothing for comparisons, in lists, open in lists, or no table" [] {
+    assert equal (sql where-plan "age>=" [age] --table t) {candidates: []}
+    assert equal (sql where-plan "role=in:a" [role] --table t) {candidates: []}
+    assert equal (sql where-plan "role=in:admin,op" [role status] --table t) {candidates: []}
+    assert equal (sql where-plan "role=" [role]) {candidates: []}
+}
+
+# ---- type-rows / schema-view / agg-requests -----------------------------------
+
+@test
+def "type-rows normalizes nulls and types the base table columns" [] {
+    let data = {columns: [{schema: public, table: users, name: id, data_type: integer}]}
+    let typer = {|c| if $c.data_type == "integer" { sql null-or {|x| $x | into int } } else { null } }
+    assert equal ([{id: "1", note: "NULL"}] | sql type-rows $data "users u" ["NULL"] $typer) [{id: 1, note: null}]
+    assert equal ([] | sql type-rows $data "users" ["NULL"] $typer) []
+}
+
+@test
+def "schema-view dispatches full find table and summary" [] {
+    let data = {
+        tables: [{schema: public, name: users, type: "BASE TABLE", comment: null, row_estimate: 5}]
+        columns: [{schema: public, table: users, name: id, position: 1, display_type: int4, nullable: false, default: null, comment: "pk"}]
+        constraints: []
+    }
+    assert equal (sql schema-view $data --full) $data
+    assert equal (sql schema-view $data --find pk | get kind) ["column-comment"]
+    assert equal (sql schema-view $data --table users | get name) "users"
+    assert equal (sql schema-view $data | get name) [users]
+}
+
+@test
+def "agg-requests walks the aggs table in order" [] {
+    assert equal (sql agg-requests {count: true, sum: [amount], avg: []}) [{fn: "count"} {fn: "sum", cols: [amount]}]
+    assert equal (sql agg-requests {sum: [a b], count: true} | get fn) ["count" "sum"]   # table order, not flag order
+    assert equal (sql agg-requests {}) []
+    let aggs = ((sql ansi-aggs) ++ [{flag: "string-agg", fieldless: false, render: {|c| "" }}])
+    assert equal (sql agg-requests {"string-agg": [name]} $aggs) [{fn: "string-agg", cols: [name]}]
 }

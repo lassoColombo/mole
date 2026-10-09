@@ -194,7 +194,7 @@ def duck-constraints-sql []: nothing -> string {
 def duck-schema-load [conf: record, --refresh]: nothing -> record {
   let dbkey = (duck-path $conf | path basename)
   let file = (cache path "duckdb" $"($conf.name)__($dbkey)")
-  if $refresh or (cache stale $file 1day) {
+  cache fetch $file 1day --refresh=$refresh {||
     let secs = [
         {k: "tables"      q: (duck-tables-sql)}
         {k: "columns"     q: (duck-columns-sql)}
@@ -203,11 +203,8 @@ def duck-schema-load [conf: record, --refresh]: nothing -> record {
       | par-each {|s| {key: $s.k, rows: (duck-rows $conf $s.q --readonly)} }
       | reduce --fold {} {|it, acc| $acc | upsert $it.key $it.rows }
     let body = (sql schema-body $secs.tables $secs.columns $secs.constraints {|c| duck-display-type $c } $DUCK_NULLS)
-    let data = ({meta: {connection: $conf.name, database: (duck-path $conf), driver: "duckdb", refreshed_at: (date now)}} | merge $body)
-    $data | cache write $file
-    return $data
+    {meta: {connection: $conf.name, database: (duck-path $conf), driver: "duckdb"}} | merge $body
   }
-  cache read $file
 }
 
 # The standard override record: named flags win over the resolved connection,
@@ -234,26 +231,26 @@ def "duckdb-table" [context: string]: nothing -> list<string> {
   sql complete-tables (duckdb-catalog $context)
 }
 
-# Comma-list variant for the `schema --include/--exclude` filters: re-prepend the
-# already-typed tables so accepting a candidate extends the list.
+# Comma-list variant for `schema --include/--exclude` (see `complete csv-extend`).
 def "duckdb-tables-csv" [context: string]: nothing -> list<string> {
-  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
-  sql complete-tables (duckdb-catalog $context) | each {|t| $"($prefix)($t)" }
+  complete csv-extend $context (duckdb-table $context)
+}
+
+# The table a line targets: `--from` (select/stats), else the leading positional of the
+# write verbs (`update <table>` / `delete <table>`); null when neither is typed yet.
+def duckdb-ctx-table [context: string]: nothing -> any {
+  complete flag $context [--from -F] | default (complete lead-arg $context [update delete])
 }
 
 def "duckdb-column" [context: string]: nothing -> list<string> {
-  # `select` names its table with --from; `update`/`delete` take it as the leading
-  # positional — fall back to that so column completion works for the write verbs too.
-  let tbl = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
-  sql complete-columns (duckdb-catalog $context) $tbl
+  sql complete-columns (duckdb-catalog $context) (duckdb-ctx-table $context)
 }
 
 # Comma-list variant of `duckdb-column` for the multi-value `--distinct-on`/
 # `--returning`/stats `--by`/agg flags: re-prepend the already-typed columns so
 # accepting a candidate extends the list (Nushell can't complete inside a `[...]` list literal).
 def "duckdb-columns-csv" [context: string]: nothing -> list<string> {
-  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
-  duckdb-column $context | each {|c| $"($prefix)($c)" }
+  complete csv-extend $context (duckdb-column $context)
 }
 
 # `select`'s `--sort-by` completer: the source columns as `col[:desc]` sort tokens.
@@ -270,46 +267,16 @@ def duck-probe [conf: record, sql: string]: nothing -> list<string> {
   $r.stdout | from csv --no-infer | get -o v | default []
 }
 
-# `--where` completer, csv-aware: `--where` holds a comma-list of `col<op>value` tokens;
-# this completes the LAST segment and re-prepends the earlier ones. Three stages: a
-# partial segment → column NAMES; a COMPLETE column → the dialect OPERATORS (`col=`,
-# … via `op-completions`, so you never type `=` by hand); an `=`/`!=` segment → a LIVE,
-# bounded `SELECT DISTINCT <col>` scoped to the committed sibling predicates + the
-# `--from`/leading table, offering `col<op>value` per distinct value (best-effort). A
-# comparison/LIKE/`in:` segment, or a bare segment right after an open `in:` list,
-# completes nothing further.
+# `--where` completer. The three stages — columns → the dialect operators → live
+# distinct values scoped to the sibling predicates — are planned by the pure
+# `sql where-plan`; this only runs the bounded probe (best-effort: unreachable /
+# slow / errored → nothing).
 def "duckdb-where" [context: string]: nothing -> list<any> {
-  let ops = (duck-ops)
-  let tok = (complete token $context)
-  let prefix = ($tok | str replace --regex '[^,]*$' '')       # everything up to & incl the last comma
-  let seg = ($tok | split row "," | last | default "")         # the segment being typed
-  let committed = ($prefix | str trim --char ",")
-  let pref_preds = (sql parse-where $committed --ops $ops)
-  let p = (sql predicate-token $seg --ops $ops)
-  # mid open-in:-list — a bare segment after an in:-valued predicate ⇒ don't offer columns
-  if ($p == null) and ($pref_preds != null) and ($pref_preds | is-not-empty) and (($pref_preds | last | get value) | str starts-with "in:") {
-    return []
-  }
-  if ($p == null) {
-    let cols = (duckdb-column $context)
-    if ($seg in $cols) {
-      let longer = ($cols | where {|c| $c != $seg and ($c | str starts-with $seg) } | each {|c| {value: ($prefix + $c), description: "column"} })
-      return (((sql op-completions $seg $ops) | each {|r| {value: ($prefix + $r.value), description: $r.description} }) ++ $longer)
-    }
-    return ($cols | each {|c| $prefix + $c })
-  }
-  if ($p.op not-in ["=" "!="]) or ($p.value | str starts-with "in:") { return [] }
-  let table = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
+  let plan = (sql where-plan (complete token $context) (duckdb-column $context) --ops (duck-ops) --dialect $DUCK_DIALECT --table (duckdb-ctx-table $context))
+  if ($plan.probe? == null) { return $plan.candidates }
   let conf = (complete conn-ctx $context "duckdb")
-  if ($table | is-empty) or ($conf | is-empty) { return [] }
-  let siblings = (if ($pref_preds == null) { [] } else { $pref_preds | where col != $p.col })
-  let where = (sql render-where $siblings --dialect $DUCK_DIALECT --ops $ops)
-  let q = (sql assemble [
-    $"SELECT DISTINCT ($p.col) AS v FROM ($table)"
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
-    "LIMIT 50"
-  ])
-  (try { duck-probe $conf $q } catch { [] }) | each {|v| $prefix + $p.col + $p.op + $v }
+  if ($conf | is-empty) { return [] }
+  (try { duck-probe $conf $plan.probe.sql } catch { [] }) | each {|v| $plan.probe.prefix + $v }
 }
 
 # ---- SELECT clause renderers (duckdb-specific) --------------------------------
@@ -435,7 +402,7 @@ export def "select" [
 ] {
   # Multi-value flags arrive as ONE comma-joined string (Nushell can't complete inside a
   # `[...]` literal); decode to the list the clause renderers want, shadowing the params.
-  let distinct_on = (sql csv-split $distinct_on)
+  let distinct_on = (complete csv $distinct_on)
   if $distinct and ($distinct_on | is-not-empty) {
     error make {msg: "select: --distinct and --distinct-on are mutually exclusive"}
   }
@@ -443,12 +410,11 @@ export def "select" [
   # The rest slot is projection-only now (commas optional); WHERE lives in --where,
   # dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse as tokens.
   let cols = ($columns | each {|c| $c | str trim --char "," } | where {|c| $c | is-not-empty })
-  let where_sql = (sql build-where ($where | default "") --dialect $DUCK_DIALECT --ops (duck-ops))
   let text = (sql assemble [
     (duck-projection $cols $distinct ($distinct_on | default []))
     $"FROM ($from)"
-    (if ($where_sql | is-not-empty) { $"WHERE ($where_sql)" })
-    (sql build-order (sql csv-split $sort_by))
+    (sql where-clause $where --dialect $DUCK_DIALECT --ops (duck-ops))
+    (sql build-order (complete csv $sort_by))
     (if $limit != null { $"LIMIT ($limit)" })
     (if $offset != null { $"OFFSET ($offset)" })
   ])
@@ -459,9 +425,7 @@ export def "select" [
   }
   let rows = (duck-rows $conf $text)
   if $raw { return $rows }
-  $rows
-  | sql normalize-nulls $DUCK_NULLS
-  | sql apply-types (sql columns-for (duck-schema-load $conf) (sql base-table $from)) {|c| duck-type $c }
+  $rows | sql type-rows (duck-schema-load $conf) $from $DUCK_NULLS {|c| duck-type $c }
 }
 
 # Compose and run a single-table DuckDB UPDATE.
@@ -508,7 +472,7 @@ export def "update" [
   if ($where | is-empty) and (not $all) {
     error make {msg: "update: refusing to update every row without --where (pass --all to override)"}
   }
-  let returning = (sql csv-split $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
+  let returning = (complete csv $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
   # --where is dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse.
   let where_sql = (sql build-where ($where | default "") --dialect $DUCK_DIALECT --ops (duck-ops))
   let text = (sql build-update --table $table --set $assignments --where ($where_sql | default "") --returning ($returning | default []))
@@ -516,10 +480,8 @@ export def "update" [
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This UPDATE will modify rows. Run it?" --yes=$yes)) { return }
   let rows = (duck-rows $conf $text)
-  if $raw or ($rows | is-empty) { return $rows }
-  $rows
-  | sql normalize-nulls $DUCK_NULLS
-  | sql apply-types (sql columns-for (duck-schema-load $conf) (sql base-table $table)) {|c| duck-type $c }
+  if $raw { return $rows }
+  $rows | sql type-rows (duck-schema-load $conf) $table $DUCK_NULLS {|c| duck-type $c }
 }
 
 # Compose and run a single-table DuckDB DELETE.
@@ -568,16 +530,14 @@ export def "delete" [
   if ($where_sql | is-empty) and (not $all) {
     error make {msg: "delete: refusing to delete every row without --where (pass --all to override)"}
   }
-  let returning = (sql csv-split $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
+  let returning = (complete csv $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
   let text = (sql build-delete --table $table --where ($where_sql | default "") --returning ($returning | default []))
   let conf = (duck-conf $connection $path $database $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This DELETE will remove rows. Run it?" --yes=$yes)) { return }
   let rows = (duck-rows $conf $text)
-  if $raw or ($rows | is-empty) { return $rows }
-  $rows
-  | sql normalize-nulls $DUCK_NULLS
-  | sql apply-types (sql columns-for (duck-schema-load $conf) (sql base-table $table)) {|c| duck-type $c }
+  if $raw { return $rows }
+  $rows | sql type-rows (duck-schema-load $conf) $table $DUCK_NULLS {|c| duck-type $c }
 }
 
 # Inspect a connection's cached schema (introspection is cached for a day).
@@ -631,15 +591,8 @@ export def "schema" [
     error make {msg: "schema: --include and --exclude are mutually exclusive"}
   }
   let conf = (duck-conf $connection $path $database $set)
-  let data = (sql schema-filter (duck-schema-load $conf --refresh=$refresh) --include (sql csv-split $include) --exclude (sql csv-split $exclude))
-  if $full { return $data }
-  if ($find | is-not-empty) {
-    sql schema-find $data $find
-  } else if ($table | is-not-empty) {
-    sql schema-detail $data $table
-  } else {
-    sql schema-tables $data
-  }
+  let data = (sql schema-filter (duck-schema-load $conf --refresh=$refresh) --include (complete csv $include) --exclude (complete csv $exclude))
+  sql schema-view $data --table ($table | default "") --find ($find | default "") --full=$full
 }
 
 # Make a duckdb connection the current one for this driver.

@@ -56,3 +56,31 @@ def "queryfile returns empty list when query dir missing" [] {
   rm --recursive $empty
   assert length $result 0
 }
+
+@test
+def "csv-extend re-prepends the typed comma prefix" [] {
+  assert equal (complete csv-extend "stats --by job," [method host]) ["job,method" "job,host"]
+  assert equal (complete csv-extend "stats --by job,me" [method]) ["job,method"]
+  assert equal (complete csv-extend "stats --by " [job host]) [job host]
+}
+
+# A stand-in driver so `ast` can parse write-verb lines with real signatures.
+module fakedb {
+  export def update [table: string, ...assignments: string, --where: string] { }
+  export def delete [table: string, --where: string] { }
+  export def show [...columns: string, --from: string, --where: string] { }
+}
+use fakedb
+
+@test
+def "lead-arg returns the write verbs leading table, unquoted" [] {
+  assert equal (complete lead-arg 'fakedb update users "a = 1" --where ' [update delete]) "users"
+  assert equal (complete lead-arg 'fakedb update "users u" "a = 1" --where ' [update delete]) "users u"
+  assert equal (complete lead-arg "fakedb delete sessions --where " [update delete]) "sessions"
+}
+
+@test
+def "lead-arg is null on other verbs or an empty slot" [] {
+  assert equal (complete lead-arg "fakedb show id --from users --where " [update delete]) null
+  assert equal (complete lead-arg "fakedb update " [update delete]) null
+}

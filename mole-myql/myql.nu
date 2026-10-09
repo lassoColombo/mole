@@ -183,7 +183,8 @@ export def "cell-type" [col: record]: nothing -> any {
 
 # ---- SELECT clause renderers --------------------------------------------------
 # Each renders one MySQL-dialect clause body from already-validated inputs; the
-# driver's `select` orders them through `sql assemble`.
+# driver's verbs order them through `sql assemble`. ORDER BY is the shared
+# `col[:desc]` grammar (`sql build-order`) on every verb, so nothing lives here for it.
 
 # SELECT head: `SELECT [DISTINCT] <cols>` (cols verbatim). MySQL has no DISTINCT ON.
 @category mole-myql
@@ -191,31 +192,6 @@ export def "cell-type" [col: record]: nothing -> any {
 export def "projection" [columns: list<string>, distinct: bool]: nothing -> string {
   let cols = if ($columns | is-empty) { "*" } else { $columns | str join ", " }
   $"SELECT (if $distinct { 'DISTINCT ' } else { '' })($cols)"
-}
-
-# One ORDER BY term: "<expr> [ASC|DESC]" (expr verbatim). MySQL has no NULLS ordering.
-@category mole-myql
-@example "normalize a sort direction" { myql order-term "age desc" } --result "age DESC"
-export def "order-term" [term: string]: nothing -> string {
-  let toks = ($term | str trim | split row --regex '\s+')
-  if ($toks | is-empty) or (($toks | first) == "") { return "" }
-  let m = ($toks | length)
-  if $m >= 1 and (($toks | last | str lowercase) in [asc desc]) {
-    $"($toks | first ($m - 1) | str join ' ') (($toks | last) | str uppercase)"
-  } else {
-    $toks | str join ' '
-  }
-}
-
-# ORDER BY from a comma-separated --sort-by string, or null when empty.
-@category mole-myql
-@example "compose an ORDER BY clause" {
-  myql order "salary desc, name asc"
-} --result "ORDER BY salary DESC, name ASC"
-export def "order" [sort_by: any]: nothing -> any {
-  if ($sort_by | is-empty) { return null }
-  let terms = ($sort_by | split row "," | each {|t| order-term $t } | where {|t| $t | is-not-empty })
-  sql join-list $terms --prefix "ORDER BY "
 }
 
 # Locking tail. "share-mode" → legacy `LOCK IN SHARE MODE` (no OF/wait policy);

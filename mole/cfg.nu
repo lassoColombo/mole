@@ -5,6 +5,7 @@
 use ./lib/conn.nu
 use ./lib/config.nu
 use ./lib/complete.nu
+use ./lib/editor.nu
 
 # Drop secret-looking fields from a piped connection record/table.
 #
@@ -56,4 +57,4 @@ export def "dir" []: nothing -> string { config dir }
 # Open the connections file in $EDITOR.
 @category mole
 @example "edit the connections file" { mole cfg edit }
-export def "edit" []: nothing -> nothing { nu -c $"($env.EDITOR) (config file)" }
+export def "edit" []: nothing -> any { editor launch (config file) }

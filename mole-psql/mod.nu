@@ -57,27 +57,13 @@ def "pg-ops" []: nothing -> list {
 # The dialect's aggregate vocabulary: the ANSI base (count/sum/avg/min/max/count-distinct)
 # plus Postgres's `string_agg(col, ',')` (comma-joined string aggregation) → `string_agg_<col>`.
 # Injected into `sql build-aggs` so `stats` can compute a dialect aggregate the ANSI set
-# can't. Closures compose the SQL — the injection twin of `pg-ops`.
+# can't. Closures compose the SQL — the injection twin of `pg-ops`. The flag keys are the
+# verb's own flag names, so `sql agg-requests` reads a `{count, sum, …, string-agg}` record.
 def "pg-aggs" []: nothing -> list {
   sql ansi-aggs
-  | append {flag: "string_agg", fieldless: false, render: {|col| $"string_agg\(($col), ','\)" }}
+  | append {flag: "string-agg", fieldless: false, render: {|col| $"string_agg\(($col), ','\)" }}
 }
 
-# Map the `stats` aggregate flags (typed values in the verb, completion-time strings in
-# the result-column completer) to the ordered `sql build-aggs` request list. Centralizes
-# the flag→request translation so the verb body and the `--sort-by`/`--having` completers
-# never drift; this order IS the SELECT output order.
-def "pg-agg-requests" [count: bool, sum: string, avg: string, min: string, max: string, count_distinct: string, string_agg: string]: nothing -> list {
-  [
-    (if $count { [{fn: "count"}] } else { [] })
-    (if ($sum | is-not-empty) { [{fn: "sum", cols: $sum}] } else { [] })
-    (if ($avg | is-not-empty) { [{fn: "avg", cols: $avg}] } else { [] })
-    (if ($min | is-not-empty) { [{fn: "min", cols: $min}] } else { [] })
-    (if ($max | is-not-empty) { [{fn: "max", cols: $max}] } else { [] })
-    (if ($count_distinct | is-not-empty) { [{fn: "count-distinct", cols: $count_distinct}] } else { [] })
-    (if ($string_agg | is-not-empty) { [{fn: "string_agg", cols: $string_agg}] } else { [] })
-  ] | flatten
-}
 
 # Statements that warrant a confirmation prompt before running.
 def pg-dangerous []: nothing -> string {
@@ -86,11 +72,14 @@ def pg-dangerous []: nothing -> string {
 
 # Run one SQL statement, returning a `complete` record. Password via PGPASSWORD;
 # output as CSV so it parses losslessly.
-def pg-exec [conf: record, sql: string]: nothing -> record {
+def pg-exec [conf: record, sql: string, --probe]: nothing -> record {
   let db = ($conf | get -o database)
   let db_args = if ($db | is-not-empty) { ["-d" $db] } else { [] }
-  with-env { PGPASSWORD: ($conf | get -o password | default "") } {
-    ^psql -h $conf.host -p ($conf | get -o port | default 5432) -U $conf.user ...$db_args --csv -q -c $sql | complete
+  # `--probe`: completion-time bounds — no password prompt, short connect + statement timeouts.
+  let bounds = (if $probe { {PGCONNECT_TIMEOUT: "3", PGOPTIONS: "-c statement_timeout=3000"} } else { {} })
+  let pflags = (if $probe { ["-w"] } else { [] })
+  with-env ({PGPASSWORD: ($conf | get -o password | default "")} | merge $bounds) {
+    ^psql ...$pflags -h $conf.host -p ($conf | get -o port | default 5432) -U $conf.user ...$db_args --csv -q -c $sql | complete
   }
 }
 
@@ -210,7 +199,7 @@ def pg-constraints-sql []: nothing -> string {
 def pg-schema-load [conf: record, --refresh]: nothing -> record {
   let db = ($conf | get -o database | default "_")
   let file = (cache path "psql" $"($conf.name)__($db)")
-  if $refresh or (cache stale $file 1day) {
+  cache fetch $file 1day --refresh=$refresh {||
     let secs = [
         {k: "tables"      q: (pg-tables-sql)}
         {k: "columns"     q: (pg-columns-sql)}
@@ -219,11 +208,8 @@ def pg-schema-load [conf: record, --refresh]: nothing -> record {
       | par-each {|s| {key: $s.k, rows: (pg-rows $conf $s.q)} }
       | reduce --fold {} {|it, acc| $acc | upsert $it.key $it.rows }
     let body = (sql schema-body $secs.tables $secs.columns $secs.constraints {|c| pg-display-type $c } $PG_NULLS)
-    let data = ({meta: {connection: $conf.name, database: $db, driver: "psql", refreshed_at: (date now)}} | merge $body)
-    $data | cache write $file
-    return $data
+    {meta: {connection: $conf.name, database: $db, driver: "psql"}} | merge $body
   }
-  cache read $file
 }
 
 # The standard override record: named flags win over the resolved connection,
@@ -251,18 +237,19 @@ def "psql-table" [context: string]: nothing -> list<string> {
   sql complete-tables (psql-catalog $context)
 }
 
-# Comma-list variant for the `schema --include/--exclude` filters: re-prepend the
-# already-typed tables so accepting a candidate extends the list.
+# Comma-list variant for `schema --include/--exclude` (see `complete csv-extend`).
 def "psql-tables-csv" [context: string]: nothing -> list<string> {
-  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
-  sql complete-tables (psql-catalog $context) | each {|t| $"($prefix)($t)" }
+  complete csv-extend $context (psql-table $context)
+}
+
+# The table a line targets: `--from` (select/stats), else the leading positional of the
+# write verbs (`update <table>` / `delete <table>`); null when neither is typed yet.
+def psql-ctx-table [context: string]: nothing -> any {
+  complete flag $context [--from -F] | default (complete lead-arg $context [update delete])
 }
 
 def "psql-column" [context: string]: nothing -> list<string> {
-  # `select` names its table with --from; `update`/`delete` take it as the leading
-  # positional — fall back to that so column completion works for the write verbs too.
-  let tbl = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
-  sql complete-columns (psql-catalog $context) $tbl
+  sql complete-columns (psql-catalog $context) (psql-ctx-table $context)
 }
 
 # Comma-list variant of `psql-column` for the multi-value column flags (`--distinct-on`,
@@ -270,75 +257,30 @@ def "psql-column" [context: string]: nothing -> list<string> {
 # columns so accepting a candidate extends the list (Nushell can't complete inside a
 # `[...]` list literal).
 def "psql-columns-csv" [context: string]: nothing -> list<string> {
-  let prefix = (complete token $context | str replace --regex '[^,]*$' '')
-  psql-column $context | each {|c| $"($prefix)($c)" }
+  complete csv-extend $context (psql-column $context)
 }
 
 # `select`'s `--sort-by` completer: the source columns as `col[:desc]` sort tokens.
 def "psql-sort" [context: string]: nothing -> list<string> { complete sort-csv $context (psql-column $context) }
 
-# Completion-only bounded/quiet distinct-value probe: a read-only SELECT run with a
-# short connect + statement timeout and no password prompt (`-w`), returning the `v`
-# column's values (empty on any non-zero exit). Kept separate from `pg-exec` so the
-# verbs' exec path is untouched; the caller wraps it in `try` for parse errors.
+# Completion-only distinct-value probe: `pg-exec --probe` (bounded, no password
+# prompt); `[]` on any non-zero exit. The caller wraps it in `try` for parse errors.
 def pg-probe [conf: record, sql: string]: nothing -> list<string> {
-  let db = ($conf | get -o database)
-  let db_args = if ($db | is-not-empty) { ["-d" $db] } else { [] }
-  let r = (with-env {
-    PGPASSWORD: ($conf | get -o password | default "")
-    PGCONNECT_TIMEOUT: "3"
-    PGOPTIONS: "-c statement_timeout=3000"
-  } {
-    ^psql -w -h ($conf | get -o host) -p ($conf | get -o port | default 5432) -U ($conf | get -o user) ...$db_args --csv -q -c $sql | complete
-  })
+  let r = (pg-exec $conf $sql --probe)
   if ($r.exit_code != 0) { return [] }
   $r.stdout | from csv --no-infer | get -o v | default []
 }
 
-# `--where` completer: the dialect predicate completer, csv-aware (like `psql-having`).
-# `--where` holds a comma-list of `col<op>value` tokens; this completes the LAST segment
-# and re-prepends the earlier ones. Three stages: a partial segment completes column
-# NAMES; a COMPLETE column completes into the dialect OPERATORS (`col=`, `col~*`, … via
-# `op-completions` — so you never type `=` by hand); an `=`/`!=` segment then runs a
-# LIVE, bounded `SELECT DISTINCT <col>` — scoped to the sibling predicates already
-# committed in the flag and the `--from`/leading table — offering `col<op>value` for each
-# distinct value (best-effort: unreachable/slow/errored → nothing). Comparison/LIKE/`in:`
-# complete nothing further; a bare segment right after an open `in:` list also completes
-# nothing (so typing more in-list values isn't drowned in column names).
+# `--where` completer. The three stages — columns → the dialect operators → live
+# distinct values scoped to the sibling predicates — are planned by the pure
+# `sql where-plan`; this only runs the bounded probe (best-effort: unreachable /
+# slow / errored → nothing).
 def "psql-where" [context: string]: nothing -> list<any> {
-  let ops = (pg-ops)
-  let tok = (complete token $context)
-  let prefix = ($tok | str replace --regex '[^,]*$' '')       # everything up to & incl the last comma
-  let seg = ($tok | split row "," | last | default "")         # the segment being typed
-  let committed = ($prefix | str trim --char ",")
-  let pref_preds = (sql parse-where $committed --ops $ops)      # sibling predicates (null if the committed part is raw)
-  let p = (sql predicate-token $seg --ops $ops)
-  # mid open-in:-list — a bare segment after an in:-valued predicate ⇒ don't offer columns
-  if ($p == null) and ($pref_preds != null) and ($pref_preds | is-not-empty) and (($pref_preds | last | get value) | str starts-with "in:") {
-    return []
-  }
-  if ($p == null) {
-    let cols = (psql-column $context)
-    if ($seg in $cols) {
-      # exact column → the dialect operators (+ any longer columns sharing the prefix)
-      let longer = ($cols | where {|c| $c != $seg and ($c | str starts-with $seg) } | each {|c| {value: ($prefix + $c), description: "column"} })
-      return (((sql op-completions $seg $ops) | each {|r| {value: ($prefix + $r.value), description: $r.description} }) ++ $longer)
-    }
-    return ($cols | each {|c| $prefix + $c })
-  }
-  if ($p.op not-in ["=" "!="]) or ($p.value | str starts-with "in:") { return [] }
-  let table = (complete flag $context [--from -F] | default (sql lead-arg $context [update delete]))
+  let plan = (sql where-plan (complete token $context) (psql-column $context) --ops (pg-ops) --dialect $PG_DIALECT --table (psql-ctx-table $context))
+  if ($plan.probe? == null) { return $plan.candidates }
   let conf = (complete conn-ctx $context "psql")
-  if ($table | is-empty) or ($conf | is-empty) { return [] }
-  # The probe SELECT frame (incl. LIMIT) is the driver's — mole-sql only composes the WHERE.
-  let siblings = (if ($pref_preds == null) { [] } else { $pref_preds | where col != $p.col })
-  let where = (sql render-where $siblings --dialect $PG_DIALECT --ops $ops)
-  let q = (sql assemble [
-    $"SELECT DISTINCT ($p.col) AS v FROM ($table)"
-    (if ($where | is-not-empty) { $"WHERE ($where)" })
-    "LIMIT 50"
-  ])
-  (try { pg-probe $conf $q } catch { [] }) | each {|v| $prefix + $p.col + $p.op + $v }
+  if ($conf | is-empty) { return [] }
+  (try { pg-probe $conf $plan.probe.sql } catch { [] }) | each {|v| $plan.probe.prefix + $v }
 }
 
 def "psql-lock" [context: string]: nothing -> list<string> { ["update" "share" "no key update" "key share"] }
@@ -491,8 +433,8 @@ export def "select" [
 ] {
   # Multi-value flags arrive as ONE comma-joined string (Nushell can't complete inside a
   # `[...]` literal); decode to the list the clause renderers want, shadowing the params.
-  let distinct_on = (sql csv-split $distinct_on)
-  let lock_of = (sql csv-split $lock_of)
+  let distinct_on = (complete csv $distinct_on)
+  let lock_of = (complete csv $lock_of)
   if $distinct and ($distinct_on | is-not-empty) {
     error make {msg: "select: --distinct and --distinct-on are mutually exclusive"}
   }
@@ -506,12 +448,11 @@ export def "select" [
   # The rest slot is projection-only now (commas optional); WHERE lives in --where,
   # dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse as tokens.
   let cols = ($columns | each {|c| $c | str trim --char "," } | where {|c| $c | is-not-empty })
-  let where_sql = (sql build-where ($where | default "") --dialect $PG_DIALECT --ops (pg-ops))
   let text = (sql assemble [
     (pg-projection $cols $distinct ($distinct_on | default []))
     $"FROM ($from)"
-    (if ($where_sql | is-not-empty) { $"WHERE ($where_sql)" })
-    (sql build-order (sql csv-split $sort_by))
+    (sql where-clause $where --dialect $PG_DIALECT --ops (pg-ops))
+    (sql build-order (complete csv $sort_by))
     (if $limit != null { $"LIMIT ($limit)" })
     (if $offset != null { $"OFFSET ($offset)" })
     (pg-lock $lock ($lock_of | default []) $skip_locked $nowait)
@@ -525,9 +466,7 @@ export def "select" [
   }
   let rows = (pg-rows $conf $text)
   if $raw { return $rows }
-  $rows
-  | sql normalize-nulls $PG_NULLS
-  | sql apply-types (sql columns-for (pg-schema-load $conf) (sql base-table $from)) {|c| pg-type $c }
+  $rows | sql type-rows (pg-schema-load $conf) $from $PG_NULLS {|c| pg-type $c }
 }
 
 # ---- stats completers (result-column pool) ------------------------------------
@@ -538,25 +477,19 @@ export def "select" [
 # even without a reachable database.
 def "psql-result-cols" [context: string]: nothing -> list<string> {
   let by = (complete csv (complete flag $context [--by -g]))
-  let requests = (pg-agg-requests
-    ($context =~ '(?:--count|-C)(?:\s|$)')
-    (complete flag $context [--sum] | default "")
-    (complete flag $context [--avg] | default "")
-    (complete flag $context [--min] | default "")
-    (complete flag $context [--max] | default "")
-    (complete flag $context [--count-distinct] | default "")
-    (complete flag $context [--string-agg] | default ""))
-  $by ++ ((sql build-aggs $requests (pg-aggs)) | get name)
+  # one flag per aggregate, read off the line by its `flag` name; `--count` is a switch
+  let flags = (pg-aggs | reduce --fold {count: ($context =~ '(?:--count|-C)(?:\s|$)')} {|a, acc|
+    if $a.fieldless { $acc } else { $acc | upsert $a.flag (complete csv (complete flag $context [("--" + $a.flag)])) }
+  })
+  $by ++ ((sql build-aggs (sql agg-requests $flags (pg-aggs)) (pg-aggs)) | get name)
 }
 
 # `--having` completer: partial two-stage — complete the RESULT-column name; once an
 # operator is typed the user fills the value (like mongo's `--having`). Comma-list aware.
 def "psql-having" [context: string]: nothing -> list<string> {
-  let tok = (complete token $context)
-  let seg = ($tok | split row "," | last)
+  let seg = (complete token $context | split row "," | last)
   if (sql predicate-token $seg --ops (pg-ops)) != null { return [] }
-  let prefix = ($tok | str replace --regex '[^,]*$' '')
-  psql-result-cols $context | each {|c| $"($prefix)($c)" }
+  complete csv-extend $context (psql-result-cols $context)
 }
 
 # `--sort-by` completer over RESULT columns (`col[:desc]`), via the shared sort helper.
@@ -625,18 +558,20 @@ export def "stats" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
 ] {
   if ($from | is-empty) { error make {msg: "stats: --from <table> is required"} }
-  let by = (sql csv-split $by)
-  let aggs = (sql build-aggs (pg-agg-requests $count ($sum | default "") ($avg | default "") ($min | default "") ($max | default "") ($count_distinct | default "") ($string_agg | default "")) (pg-aggs))
-  # --where is dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse.
-  let where_sql = (sql build-where ($where | default "") --dialect $PG_DIALECT --ops (pg-ops))
+  let by = (complete csv $by)
+  let flags = {
+    count: $count, sum: (complete csv $sum), avg: (complete csv $avg), min: (complete csv $min), max: (complete csv $max)
+    "count-distinct": (complete csv $count_distinct), "string-agg": (complete csv $string_agg)
+  }
+  let aggs = (sql build-aggs (sql agg-requests $flags (pg-aggs)) (pg-aggs))
   let proj = (($by ++ ($aggs | each {|a| $a.expr + " AS " + $a.name })) | str join ", ")
   let text = (sql assemble [
     $"SELECT ($proj)"
     $"FROM ($from)"
-    (if ($where_sql | is-not-empty) { $"WHERE ($where_sql)" })
+    (sql where-clause $where --dialect $PG_DIALECT --ops (pg-ops))
     (sql join-list $by --prefix "GROUP BY ")
-    (sql build-having (sql csv-split $having) $aggs --dialect $PG_DIALECT --ops (pg-ops))
-    (sql build-order (sql csv-split $sort_by))
+    (sql build-having (complete csv $having) $aggs --dialect $PG_DIALECT --ops (pg-ops))
+    (sql build-order (complete csv $sort_by))
     (if $limit != null { $"LIMIT ($limit)" })
     (if $offset != null { $"OFFSET ($offset)" })
   ])
@@ -644,9 +579,7 @@ export def "stats" [
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   let rows = (pg-rows $conf $text)
   if $raw { return $rows }
-  $rows
-  | sql normalize-nulls $PG_NULLS
-  | sql apply-types (sql columns-for (pg-schema-load $conf) (sql base-table $from)) {|c| pg-type $c }
+  $rows | sql type-rows (pg-schema-load $conf) $from $PG_NULLS {|c| pg-type $c }
   | sql apply-agg-types $aggs
 }
 
@@ -705,7 +638,7 @@ export def "update" [
   if ($where | is-empty) and (not $all) {
     error make {msg: "update: refusing to update every row without --where (pass --all to override)"}
   }
-  let returning = (sql csv-split $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
+  let returning = (complete csv $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
   # --where is dual-mode: a col<op>value token-list, or raw SQL when it doesn't parse.
   let where_sql = (sql build-where ($where | default "") --dialect $PG_DIALECT --ops (pg-ops))
   let text = (sql build-update --table $table --set $assignments --where ($where_sql | default "") --returning ($returning | default []))
@@ -713,10 +646,8 @@ export def "update" [
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This UPDATE will modify rows. Run it?" --yes=$yes)) { return }
   let rows = (pg-rows $conf $text)
-  if $raw or ($rows | is-empty) { return $rows }
-  $rows
-  | sql normalize-nulls $PG_NULLS
-  | sql apply-types (sql columns-for (pg-schema-load $conf) (sql base-table $table)) {|c| pg-type $c }
+  if $raw { return $rows }
+  $rows | sql type-rows (pg-schema-load $conf) $table $PG_NULLS {|c| pg-type $c }
 }
 
 # Compose and run a single-table PostgreSQL DELETE.
@@ -771,16 +702,14 @@ export def "delete" [
   if ($where_sql | is-empty) and (not $all) {
     error make {msg: "delete: refusing to delete every row without --where (pass --all to override)"}
   }
-  let returning = (sql csv-split $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
+  let returning = (complete csv $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
   let text = (sql build-delete --table $table --where ($where_sql | default "") --returning ($returning | default []))
   let conf = (pg-conf $connection $host $port $user $password $database $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This DELETE will remove rows. Run it?" --yes=$yes)) { return }
   let rows = (pg-rows $conf $text)
-  if $raw or ($rows | is-empty) { return $rows }
-  $rows
-  | sql normalize-nulls $PG_NULLS
-  | sql apply-types (sql columns-for (pg-schema-load $conf) (sql base-table $table)) {|c| pg-type $c }
+  if $raw { return $rows }
+  $rows | sql type-rows (pg-schema-load $conf) $table $PG_NULLS {|c| pg-type $c }
 }
 
 # Inspect a connection's cached schema (introspection is cached for a day).
@@ -837,15 +766,8 @@ export def "schema" [
     error make {msg: "schema: --include and --exclude are mutually exclusive"}
   }
   let conf = (pg-conf $connection $host $port $user $password $database $set)
-  let data = (sql schema-filter (pg-schema-load $conf --refresh=$refresh) --include (sql csv-split $include) --exclude (sql csv-split $exclude))
-  if $full { return $data }
-  if ($find | is-not-empty) {
-    sql schema-find $data $find
-  } else if ($table | is-not-empty) {
-    sql schema-detail $data $table
-  } else {
-    sql schema-tables $data
-  }
+  let data = (sql schema-filter (pg-schema-load $conf --refresh=$refresh) --include (complete csv $include) --exclude (complete csv $exclude))
+  sql schema-view $data --table ($table | default "") --find ($find | default "") --full=$full
 }
 
 # Make a psql connection the current one for this driver.

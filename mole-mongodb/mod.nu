@@ -18,7 +18,7 @@
 #     raw verbs can carry writes, so only they are danger-gated.
 #
 # All completers scope to the `--collection`/`--connection` already on the command
-# line (via `mongo parse-flag`); `aggregate`'s `--having`/`--sort-by` even complete
+# line (via `complete flag`); `aggregate`'s `--having`/`--sort-by` even complete
 # the RESULT columns derived from the sibling `--by`/`--agg` — completion is
 # contextual to the other arguments.
 
@@ -164,47 +164,41 @@ def mongo-collmeta-file [conf: record]: nothing -> string {   # tier 3
 # --refresh or when stale (1 day). System databases are dropped. `--fast` bounds
 # server selection so a dead server fails a keystroke quickly instead of hanging.
 def mongo-skeleton-load [conf: record, --refresh, --fast]: nothing -> record {
-  let file = (mongo-cache-file $conf)
-  if (not $refresh) and (not (cache stale $file 1day)) { return (cache read $file) }
-  let decoded = (mongo ejson-decode (mongo-exec $conf (mongo-skeleton-js) --fast=$fast))
-  let data = {
-    meta: {connection: ($conf | get -o name), database: ($conf | get -o database | default "_"), driver: "mongodb", refreshed_at: (date now)}
-    databases: ($decoded | get -o databases | default [] | where {|d| $d not-in ["admin" "config" "local"] })
-    collections: ($decoded | get -o collections | default [])
+  cache fetch (mongo-cache-file $conf) 1day --refresh=$refresh {||
+    let decoded = (mongo ejson-decode (mongo-exec $conf (mongo-skeleton-js) --fast=$fast))
+    {
+      meta: {connection: ($conf | get -o name), database: ($conf | get -o database | default "_"), driver: "mongodb"}
+      databases: ($decoded | get -o databases | default [] | where {|d| $d not-in ["admin" "config" "local"] })
+      collections: ($decoded | get -o collections | default [])
+    }
   }
-  $data | cache write $file
-  $data
 }
 
 # Tier 2 loader — one collection's `{count, indexes, fields}`, sampled + inferred.
 # Rebuilt on --refresh or when stale. This is the ONLY sampling path, and it touches
 # a single collection, so it stays cheap however large the database is.
 def mongo-collschema-load [conf: record, coll: string, --refresh, --sample: int = 100, --fast]: nothing -> record {
-  let file = (mongo-collcache-file $conf $coll)
-  if (not $refresh) and (not (cache stale $file 1day)) { return (cache read $file) }
-  let decoded = (mongo ejson-decode (mongo-exec $conf (mongo-collschema-js $coll $sample) --fast=$fast))
-  let data = {
-    meta: {connection: ($conf | get -o name), database: ($conf | get -o database | default "_"), collection: $coll, driver: "mongodb", refreshed_at: (date now)}
-    collection: $coll
-    count: ($decoded | get -o count)
-    indexes: ($decoded | get -o indexes | default [])
-    fields: (mongo infer-schema ($decoded | get -o sample | default []))
+  cache fetch (mongo-collcache-file $conf $coll) 1day --refresh=$refresh {||
+    let decoded = (mongo ejson-decode (mongo-exec $conf (mongo-collschema-js $coll $sample) --fast=$fast))
+    {
+      meta: {connection: ($conf | get -o name), database: ($conf | get -o database | default "_"), collection: $coll, driver: "mongodb"}
+      collection: $coll
+      count: ($decoded | get -o count)
+      indexes: ($decoded | get -o indexes | default [])
+      fields: (mongo infer-schema ($decoded | get -o sample | default []))
+    }
   }
-  $data | cache write $file
-  $data
 }
 
 # Tier 3 loader — per-collection metadata across the whole DB (name/type/count/
 # #indexes), no sampling. Returns the collection list; cached under its own key.
 def mongo-collmeta-load [conf: record, --refresh, --fast]: nothing -> list {
-  let file = (mongo-collmeta-file $conf)
-  if (not $refresh) and (not (cache stale $file 1day)) { return (cache read $file | get -o collections | default []) }
-  let colls = (mongo ejson-decode (mongo-exec $conf (mongo-collmeta-js) --fast=$fast) | default [])
-  {
-    meta: {connection: ($conf | get -o name), database: ($conf | get -o database | default "_"), driver: "mongodb", refreshed_at: (date now)}
-    collections: $colls
-  } | cache write $file
-  $colls
+  cache fetch (mongo-collmeta-file $conf) 1day --refresh=$refresh {||
+    {
+      meta: {connection: ($conf | get -o name), database: ($conf | get -o database | default "_"), driver: "mongodb"}
+      collections: (mongo ejson-decode (mongo-exec $conf (mongo-collmeta-js) --fast=$fast) | default [])
+    }
+  } | get -o collections | default []
 }
 
 # Warm the SKELETON after a successful query, but only when cold (missing).
@@ -216,9 +210,6 @@ def mongo-warm [conf: record]: nothing -> nothing {
 }
 
 # ---- completion helpers --------------------------------------------------------
-
-# The token under the cursor: the last whitespace-delimited chunk of the context.
-def mongo-token [ctx: string]: nothing -> string { $ctx | split row " " | last }
 
 # The resolved connection a completion line names (via `-c`/`--connection` and an
 # optional `--database` override), or the current one. Null when nothing resolves.
@@ -268,7 +259,7 @@ def mongo-collfields [conf: any, coll: string]: nothing -> list {
 
 # Sorted, deduped field names for the `--collection` on the line (see mongo-collfields).
 def mongo-fields-for [ctx: string]: nothing -> list<string> {
-  let coll = (mongo parse-flag $ctx ["--collection" "-C"])
+  let coll = (complete flag $ctx ["--collection" "-C"])
   mongo-collfields (mongo-ctx-conf $ctx) $coll | get -o name | default [] | uniq | sort
 }
 
@@ -276,10 +267,10 @@ def mongo-fields-for [ctx: string]: nothing -> list<string> {
 # group keys and the `--agg` accumulator aliases ALREADY on the line — so `--having`
 # and `--sort-by` complete columns that don't exist until the aggs are typed.
 def mongo-result-cols [ctx: string]: nothing -> list<string> {
-  let by = (complete csv (mongo parse-flag $ctx ["--by" "-b"]))
-  let dbk = (mongo parse-flag $ctx ["--date-bucket"])
+  let by = (complete csv (complete flag $ctx ["--by" "-b"]))
+  let dbk = (complete flag $ctx ["--date-bucket"])
   let bydate = if ($dbk | is-not-empty) { [($dbk | split row ":" | first)] } else { [] }
-  let aliases = (complete csv (mongo parse-flag $ctx ["--agg" "-a"]) | each {|t| try { (mongo parse-agg-token $t).alias } catch { null } } | where {|x| $x != null })
+  let aliases = (complete csv (complete flag $ctx ["--agg" "-a"]) | each {|t| try { (mongo parse-agg-token $t).alias } catch { null } } | where {|x| $x != null })
   $by ++ $bydate ++ $aliases
 }
 
@@ -295,8 +286,7 @@ def "mongo-field" [ctx: string]: nothing -> list<string> { mongo-fields-for $ctx
 # candidate extends the list (`_id,ho⇥` → `_id,host`). Nushell can't complete inside
 # a `[...]` literal, so these flags are comma-separated strings.
 def "mongo-fields-csv" [ctx: string]: nothing -> list<string> {
-  let prefix = (mongo-token $ctx | str replace --regex '[^,]*$' '')
-  mongo-fields-for $ctx | each {|f| $"($prefix)($f)" }
+  complete csv-extend $ctx (mongo-fields-for $ctx)
 }
 
 # Two-stage filter-token completer, like VictoriaLogs' `vl-filter`. No `:` in the
@@ -304,14 +294,14 @@ def "mongo-fields-csv" [ctx: string]: nothing -> list<string> {
 # LIVE `distinct` on that field (fast-timeout, best-effort, capped) so
 # `role:ad⇥` → `role:admin`. The one completer that touches the network.
 def "mongo-filter" [ctx: string]: nothing -> list<string> {
-  let tok = (mongo-token $ctx)
+  let tok = (complete token $ctx)
   if not ($tok | str contains ":") {
     mongo-fields-for $ctx | each {|f| $"($f):" }
   } else {
     try {
       let field = ($tok | split row ":" | first)
-      let coll = (mongo parse-flag $ctx ["--collection" "-C"])
-      let conf = (conn with mongodb (mongo parse-flag $ctx ["--connection" "-c"]) {})
+      let coll = (complete flag $ctx ["--collection" "-C"])
+      let conf = (mongo-ctx-conf $ctx)
       let js = "db.getCollection(" + (mongo lit $coll) + ").distinct(" + (mongo lit $field) + ").slice(0, 50)"
       (mongo ejson-decode (mongo-exec $conf $js --fast)) | each {|v| $"($field):($v)" }
     } catch { [] }
@@ -325,34 +315,32 @@ const AGG_FNS = [count "sum:" "avg:" "min:" "max:" "first:" "last:" "push:" "add
 # Multi-stage `--agg` completer over the last comma segment: function name → field
 # → param hint (N for the *N funcs, a percentile like 0.95). Comma-prefix preserved.
 def "mongo-agg" [ctx: string]: nothing -> list<string> {
-  let raw = (mongo-token $ctx)
-  let prefix = ($raw | str replace --regex '[^,]*$' '')
-  let seg = ($raw | split row "," | last)
+  let seg = (complete token $ctx | split row "," | last)
   let colons = ($seg | split row ":" | length) - 1
-  if $colons == 0 {
-    $AGG_FNS | each {|f| $"($prefix)($f)" }
+  let candidates = if $colons == 0 {
+    $AGG_FNS
   } else if $colons == 1 {
     let fn = ($seg | split row ":" | first)
-    mongo-fields-for $ctx | each {|f| $"($prefix)($fn):($f)" }
+    mongo-fields-for $ctx | each {|f| $"($fn):($f)" }
   } else {
     let base = ($seg | split row ":" | first 2 | str join ":")
     let fn = ($seg | split row ":" | first)
     let hints = if $fn == "percentile" { ["0.5" "0.9" "0.95" "0.99"] } else { ["5" "10" "25" "100"] }
-    $hints | each {|h| $"($prefix)($base):($h)" }
+    $hints | each {|h| $"($base):($h)" }
   }
+  complete csv-extend $ctx $candidates
 }
 
 # `--having` completes result-column tokens (`<col>:`), scoped to the sibling
 # `--by`/`--agg` (see mongo-result-cols).
 def "mongo-having" [ctx: string]: nothing -> list<string> {
-  let tok = (mongo-token $ctx)
+  let tok = (complete token $ctx)
   if not ($tok | str contains ":") { mongo-result-cols $ctx | each {|c| $"($c):" } } else { [] }
 }
 
 # `--sort-by` for aggregate: a comma-list over result columns (keys + agg aliases).
 def "mongo-result-sort-csv" [ctx: string]: nothing -> list<string> {
-  let prefix = (mongo-token $ctx | str replace --regex '[^,]*$' '')
-  mongo-result-cols $ctx | each {|c| $"($prefix)($c)" }
+  complete csv-extend $ctx (mongo-result-cols $ctx)
 }
 
 def "mongo-database" [ctx: string]: nothing -> list<string> {
@@ -362,9 +350,9 @@ def "mongo-database" [ctx: string]: nothing -> list<string> {
 # `--date-bucket` = `field:unit`. No `:` → datetime-typed fields as `field:`; after
 # the colon → the $dateTrunc units.
 def "mongo-datebucket" [ctx: string]: nothing -> list<string> {
-  let tok = (mongo-token $ctx)
+  let tok = (complete token $ctx)
   if not ($tok | str contains ":") {
-    let coll = (mongo parse-flag $ctx ["--collection" "-C"])
+    let coll = (complete flag $ctx ["--collection" "-C"])
     mongo-collfields (mongo-ctx-conf $ctx) $coll
     | where {|f| "datetime" in ($f | get -o types | default []) }
     | get -o name | default [] | each {|f| $"($f):" }

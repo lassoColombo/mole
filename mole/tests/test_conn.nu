@@ -99,3 +99,23 @@ def "redact drops secret-looking fields, keeps the rest" [] {
   assert equal ($out | columns) ["name" "host"]
   assert equal ({} | conn redact) {}
 }
+
+@test
+def "read errors when a name is filed under two drivers" [] {
+  let ctx = $in
+  $env.XDG_CONFIG_HOME = $ctx.temp
+  {connections: {psql: [{name: "prod"}], mysql: [{name: "prod"}]}}
+  | to yaml | save --force ([$ctx.temp mole connections.yaml] | path join)
+  let err = (try { conn list | ignore; "" } catch {|e| $e.msg })
+  assert ($err | str contains "unique across drivers")
+  assert ($err | str contains "'prod' in psql, mysql")
+}
+
+@test
+def "resolve by driver errors clearly when the current connection is gone" [] {
+  let ctx = $in
+  $env.XDG_CONFIG_HOME = $ctx.temp
+  $env.MOLE_CURRENT = {psql: "gone"}
+  let err = (try { conn resolve --driver psql | ignore; "" } catch {|e| $e.msg })
+  assert ($err | str contains "'gone' no longer exists")
+}

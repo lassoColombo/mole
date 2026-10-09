@@ -101,21 +101,6 @@ def "projection comma-joins columns and honors distinct" [] {
 }
 
 @test
-def "order-term normalizes direction and passes bare exprs through" [] {
-    assert equal (myql order-term "age desc") "age DESC"
-    assert equal (myql order-term "created_at ASC") "created_at ASC"
-    assert equal (myql order-term "name") "name"
-    assert equal (myql order-term "   ") ""
-}
-
-@test
-def "order composes a comma-separated ORDER BY, null when empty" [] {
-    assert equal (myql order "salary desc, name asc") "ORDER BY salary DESC, name ASC"
-    assert equal (myql order "name") "ORDER BY name"
-    assert equal (myql order "") null
-}
-
-@test
 def "lock renders FOR UPDATE and FOR SHARE with OF and wait policies" [] {
     assert equal (myql lock "update" [] false false) "FOR UPDATE"
     assert equal (myql lock "update" [] true false) "FOR UPDATE SKIP LOCKED"

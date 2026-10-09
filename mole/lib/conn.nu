@@ -15,8 +15,10 @@ use ./cache.nu
 # into a flat list, tagging every record with the `driver` it was filed under (the
 # section key is authoritative, so a stray per-record `driver` is overwritten).
 # Returns [] when the file does not exist. Errors when the file has no
-# `connections:` key, or when it is still the OLD flat list (group by driver
-# first — a scratch migration converts it).
+# `connections:` key, when it is still the OLD flat list (group by driver first),
+# or when a NAME appears in more than one section: names are GLOBALLY unique, so
+# `resolve <name>` and the cross-driver consumers (`mole cfg show`, mole-zellij's
+# picker, mole-sqls) never have to disambiguate.
 @category mole-lib
 @example "read the raw connection list" { read-connections }
 def read-connections []: nothing -> list {
@@ -30,7 +32,16 @@ def read-connections []: nothing -> list {
   if (($conns | describe) | str starts-with "list") {
     error make {msg: $"($f): the flat `connections:` list is no longer supported — group connections by driver, e.g. `connections: {psql: [...], vlogs: [...]}`"}
   }
-  $conns | items {|driver, rows| ($rows | default []) | each {|c| $c | upsert driver $driver } } | flatten
+  let all = ($conns | items {|driver, rows| ($rows | default []) | each {|c| $c | upsert driver $driver } } | flatten)
+  let dupes = ($all
+    | group-by {|c| $c | get -o name | default "" | into string }
+    | items {|n, rows| {name: $n, sections: ($rows | get driver)} }
+    | where {|d| ($d.sections | length) > 1 })
+  if ($dupes | is-not-empty) {
+    let detail = ($dupes | each {|d| $"'($d.name)' in ($d.sections | str join ', ')" } | str join "; ")
+    error make {msg: $"($f): connection names must be unique across drivers — ($detail)"}
+  }
+  $all
 }
 
 # Register a loaded driver into the session registry.
@@ -85,9 +96,10 @@ export def "names" [
 #
 # With a `name`, resolves that connection (errors if unknown). Otherwise, with
 # `--driver`, resolves the current connection for that driver (from
-# `$env.MOLE_CURRENT`). When `--driver` is given it also asserts the resolved
-# connection actually belongs to that driver. Errors if neither a name nor a
-# driver is given.
+# `$env.MOLE_CURRENT`; errors when none is set, or when the recorded name no
+# longer exists in the file). When `--driver` is given it also asserts the
+# resolved connection actually belongs to that driver. Errors if neither a name
+# nor a driver is given.
 @category mole-lib
 @example "resolve a connection by name" { resolve prod-db }
 @example "resolve the current connection for a driver" { resolve --driver sql }
@@ -105,7 +117,11 @@ export def "resolve" [
     if ($cur | is-empty) {
       error make {msg: $"no current ($driver) connection — pass a name or set one via `($driver) set-connection`"}
     }
-    $all | where name == $cur | first
+    let hit = ($all | where driver == $driver and name == $cur)
+    if ($hit | is-empty) {
+      error make {msg: $"current ($driver) connection '($cur)' no longer exists in (config file) — set another via `($driver) set-connection`"}
+    }
+    $hit | first
   } else {
     error make {msg: "specify a connection name or a --driver"}
   }

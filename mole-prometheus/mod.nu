@@ -65,16 +65,14 @@ def pq-insecure [conf: record]: nothing -> bool { $conf | get -o insecure | defa
 # for a day. `--refresh` rebuilds; otherwise a fresh cache is returned as-is. The
 # catalog calls are short-timeout and only power tab-completion.
 def pq-catalog-load [conf: record, --refresh]: nothing -> record {
-  let file = (cache path "prometheus" ($conf | get -o name | default "_"))
-  if (not $refresh) and (not (cache stale $file 1day)) { return (cache read $file) }
-  let base = (pq-base $conf)
-  let tok = (pq-token $conf)
-  let ins = (pq-insecure $conf)
-  let metrics = (client label-values get "__name__" --base-url $base --token $tok --insecure=$ins --max-time 10sec | get -o data | default [])
-  let labels = (client labels get --base-url $base --token $tok --insecure=$ins --max-time 10sec | get -o data | default [])
-  let data = {meta: {connection: ($conf | get -o name), driver: "prometheus", refreshed_at: (date now)}, metrics: $metrics, labels: $labels}
-  $data | cache write $file
-  $data
+  cache fetch (cache path "prometheus" ($conf | get -o name | default "_")) 1day --refresh=$refresh {||
+    let base = (pq-base $conf)
+    let tok = (pq-token $conf)
+    let ins = (pq-insecure $conf)
+    let metrics = (client label-values get "__name__" --base-url $base --token $tok --insecure=$ins --max-time 10sec | get -o data | default [])
+    let labels = (client labels get --base-url $base --token $tok --insecure=$ins --max-time 10sec | get -o data | default [])
+    {meta: {connection: ($conf | get -o name), driver: "prometheus"}, metrics: $metrics, labels: $labels}
+  }
 }
 
 # Warm the catalog after a successful query, but only when it is cold (missing).
@@ -86,32 +84,12 @@ def pq-warm [conf: record]: nothing -> nothing {
   try { pq-catalog-load $conf | ignore } catch { }
 }
 
-# Resolve a connection FOR COMPLETION — by the `-c` on the line, else the current
-# one — WITHOUT the `--driver` assertion. Completion runs in an environment that
-# does NOT carry the self-assembled `$env.MOLE_REGISTRY`, so `conn with prometheus`
-# (which asserts the connection's `driver` is `prometheus`) would
-# throw; a bare `conn resolve <name>` only needs the config file. Returns the
-# connection record, or null when no connection can be determined.
-# State file mirroring the current connection name, so completion can find it
-# without the session `$env` (completion may not carry `$env.MOLE_CURRENT`).
-# Written by `set-connection`.
-def pq-current-file []: nothing -> string { cache path "prometheus" "__current__" }
-
-def pq-conf-complete [context: string]: nothing -> any {
-  let named = (promql parse-flag $context ["--connection" "-c"])
-  let cur = ($env.MOLE_CURRENT? | default {} | get -o prometheus)
-  let filed = (cache read (pq-current-file) | get -o name)
-  let name = ([$named $cur $filed] | where {|x| $x | is-not-empty } | get -o 0)
-  if ($name | is-empty) { return null }
-  try { conn resolve $name } catch { null }
-}
-
-# The cached catalog for whatever connection the command line names (or the
-# current one). Cache-only — never hits the network, so completers stay instant.
+# The cached catalog for whatever connection the line targets (cache-only, instant).
+# `complete catalog-ctx` resolves the connection the shared way — the typed `-c`, else
+# the session-current, else the `__current__` mirror `conn set-current` writes — and
+# reads the name-keyed cache file; nothing resolves → {}.
 def pq-catalog-ctx [context: string]: nothing -> record {
-  let conf = (pq-conf-complete $context)
-  if ($conf | is-empty) { return {} }
-  (cache read (cache path "prometheus" ($conf | get -o name | default "_"))) | default {}
+  complete catalog-ctx $context "prometheus"
 }
 
 def "pq-metric" [context: string]: nothing -> list<string> { pq-catalog-ctx $context | get -o metrics | default [] }
@@ -127,19 +105,20 @@ def "pq-func" [context: string]: nothing -> list<string> { promql funcs }
 def "pq-agg" [context: string]: nothing -> list<string> { promql aggs }
 def "pq-window" [context: string]: nothing -> list<string> { promql windows }
 
-# Metric-scoped label NAMES for completion: a live `/labels?match[]=<metric>`
-# (short timeout), falling back to the cached global label names. Silent on failure.
+# Metric-scoped label NAMES for completion. With no metric (or no connection) on the
+# line there is nothing to scope by, so the cached global label names are the start.
+# With a metric, a live `/labels?match[]=<metric>` (short timeout) is AUTHORITATIVE:
+# empty or errored → [] — never the global catalog, which would offer labels the
+# metric does not have (the same rule mole-victoriametrics applies).
 def "pq-mlabel" [context: string]: nothing -> list<string> {
-  let cached = (pq-catalog-ctx $context | get -o labels | default [])
-  let metric = (promql metric-arg $context)
-  let conf = (pq-conf-complete $context)
-  if ($metric | is-empty) or ($conf | is-empty) { return $cached }
+  let conf = (complete conn-ctx $context "prometheus")
+  let metric = (complete positionals $context | get -o 0)
+  if ($metric | is-empty) or ($conf | is-empty) { return (pq-catalog-ctx $context | get -o labels | default []) }
   try {
-    let live = (client labels get --qp-match [$metric]
+    (client labels get --qp-match [$metric]
       --base-url (pq-base $conf) --token (pq-token $conf) --insecure=(pq-insecure $conf) --max-time 3sec
-      | get -o data | default [])
-    if ($live | is-empty) { $cached } else { $live }
-  } catch { $cached }
+    | get -o data | default [])
+  } catch { [] }
 }
 
 # Context-aware `label=value` matcher completion (models the old vlogs-eq). Before
@@ -147,12 +126,11 @@ def "pq-mlabel" [context: string]: nothing -> list<string> {
 # label's live values (scoped to the metric, short timeout), as `label=value`.
 # Silent on failure so a Tab never hangs the REPL.
 def "pq-eq" [context: string]: nothing -> list<string> {
-  let raw = ($context | str trim | split row --regex '\s+' | last | default "")
-  let bare = ($raw | str replace --regex '^\[' '' | str replace --regex '^"' '')
+  let bare = (complete token $context | str replace --regex '^\[' '' | str replace --regex '^"' '')
   if ($bare | str contains "=") {
     let label = ($bare | split row --number 2 "=" | first)
-    let metric = (promql metric-arg $context)
-    let conf = (pq-conf-complete $context)
+    let metric = (complete positionals $context | get -o 0)
+    let conf = (complete conn-ctx $context "prometheus")
     if ($conf | is-empty) { return [] }
     try {
       let m = if ($metric | is-empty) { [] } else { [$metric] }
@@ -421,6 +399,5 @@ export def --env "set-connection" [
   name: string@complete-connection               # a prometheus connection name (from the connections file)
 ]: nothing -> nothing {
   let conf = (conn set-current prometheus $name)
-  {name: $name} | cache write (pq-current-file)   # so completion finds it without $env
   try { pq-catalog-load $conf --refresh | ignore } catch { }
 }

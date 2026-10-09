@@ -64,3 +64,26 @@ def "stale is true when old, and clear removes the file" [] {
     cache clear $f
     assert equal (cache read $f) null
 }
+
+@test
+def "fetch builds, stamps refreshed_at, then serves the cache until refresh" [] {
+    let ctx = $in
+    $env.XDG_CACHE_HOME = $ctx.temp
+    let f = (cache path "t" "k")
+    let built = (cache fetch $f 1hr {|| {meta: {connection: "c"}, rows: [1]} })
+    assert equal $built.rows [1]
+    assert equal $built.meta.connection "c"
+    assert equal ($built.meta.refreshed_at | describe) "datetime"
+    assert equal (cache fetch $f 1hr {|| {rows: [2]} }).rows [1]            # fresh → served, not rebuilt
+    assert equal (cache fetch $f 1hr {|| {rows: [3]} } --refresh).rows [3]  # forced rebuild
+    assert equal (cache read $f).rows [3]
+}
+
+@test
+def "fetch rebuilds a stale cache" [] {
+    let ctx = $in
+    $env.XDG_CACHE_HOME = $ctx.temp
+    let f = (cache path "t" "k")
+    {meta: {refreshed_at: ((date now) - 2hr)}, rows: [1]} | cache write $f
+    assert equal (cache fetch $f 1hr {|| {rows: [2]} }).rows [2]
+}

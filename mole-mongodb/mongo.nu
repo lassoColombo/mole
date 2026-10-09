@@ -204,18 +204,6 @@ export def "build-find" [
 
 # ---- completion helper ---------------------------------------------------------
 
-# Read a flag's value out of a completion-context command line (the same helper
-# mole-sql exposes): tries each spelling, accepts `--flag value` / `--flag=value`,
-# last wins, null when absent. mod.nu's completers use it to recover the
-# `--connection` / `--collection` already typed.
-@category mole-mongodb
-@example "read a flag" { mongo parse-flag "find -C orders --limit 5" ["--collection" "-C"] } --result "orders"
-@example "null when absent" { mongo parse-flag "find" ["--collection" "-C"] } --result null
-export def "parse-flag" [ctx: string, names: list<string>]: nothing -> any {
-  let pat = '(?:' + ($names | str join "|") + ')[\s=]+(?P<v>[^\s]+)'
-  let m = ($ctx | parse --regex $pat)
-  if ($m | is-empty) { null } else { $m | last | get v }
-}
 
 # ---- safety --------------------------------------------------------------------
 
