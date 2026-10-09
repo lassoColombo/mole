@@ -97,3 +97,28 @@ def "schema views read the seeded cache and prune dangling fks" [] {
   assert equal (mole-duckdb schema --find mail -c duckdb-local-dev | get column) [email]
   assert equal (mole-duckdb schema --full --include orders -c duckdb-local-dev | get constraints | length) 0
 }
+
+# ---- stats: dry-run SQL assembly ----------------------------------------------
+
+@test
+def "dry-run stats count and sum per group ordered top-n" [] {
+  fixture
+  assert equal (mole-duckdb stats --from orders --by user_id --count --sum amount --sort-by sum_amount:desc --limit 10 -c duckdb-local-dev --dry-run | get query) "SELECT user_id, count(*) AS count, sum(amount) AS sum_amount FROM orders GROUP BY user_id ORDER BY sum_amount DESC LIMIT 10"
+  assert equal (mole-duckdb stats --from orders --by user_id --count --sort-by count:desc --limit 2 --offset 1 -c duckdb-local-dev --dry-run | get query) "SELECT user_id, count(*) AS count FROM orders GROUP BY user_id ORDER BY count DESC LIMIT 2 OFFSET 1"
+}
+
+@test
+def "dry-run stats with where and having over result aliases" [] {
+  fixture
+  assert equal (mole-duckdb stats --from orders --by user_id,status --count --avg amount --where status=paid --having count>=10 --sort-by avg_amount:desc -c duckdb-local-dev --dry-run | get query) "SELECT user_id, status, count(*) AS count, avg(amount) AS avg_amount FROM orders WHERE status = 'paid' GROUP BY user_id, status HAVING count(*) >= 10 ORDER BY avg_amount DESC"
+}
+
+@test
+def "dry-run stats grand total distinct count and the duckdb dialect aggregates" [] {
+  fixture
+  assert equal (mole-duckdb stats --from orders --count --sum amount -c duckdb-local-dev --dry-run | get query) "SELECT count(*) AS count, sum(amount) AS sum_amount FROM orders"
+  assert equal (mole-duckdb stats --from orders --by status --count-distinct user_id -c duckdb-local-dev --dry-run | get query) "SELECT status, count(distinct user_id) AS count_distinct_user_id FROM orders GROUP BY status"
+  assert equal (mole-duckdb stats --from orders --by user_id --median amount --string-agg status -c duckdb-local-dev --dry-run | get query) "SELECT user_id, string_agg(status, ',') AS string_agg_status, median(amount) AS median_amount FROM orders GROUP BY user_id"
+  assert equal (mole-duckdb stats --from orders --by user_id -c duckdb-local-dev --dry-run | get query) "SELECT user_id, count(*) AS count FROM orders GROUP BY user_id"
+  assert error { mole-duckdb stats -c duckdb-local-dev --dry-run }
+}

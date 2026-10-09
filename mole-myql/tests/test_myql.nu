@@ -1,6 +1,13 @@
 use std/assert
 use std/testing *
 use ../myql.nu
+use mole-sql/sql.nu
+
+@test
+def "aggs extends the ANSI base with an untyped group_concat" [] {
+  assert equal (myql aggs | get flag) ["count" "sum" "avg" "min" "max" "count-distinct" "group-concat"]
+  assert equal (sql build-aggs [{fn: "group-concat", cols: [name]}] (myql aggs)) [{expr: "group_concat(name)", name: "group_concat_name", type: null}]
+}
 
 # ---- dialect constants --------------------------------------------------------
 

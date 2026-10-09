@@ -1,7 +1,7 @@
 # mole-mariadb — MariaDB driver plugin.
 #
 # A PLUGIN (data source): registers the `mariadb` driver and exposes the user
-# verbs `raw-query` / `select` / `schema` / `set-connection`. SIBLING of
+# verbs `raw-query` / `select` / `stats` / `schema` / `set-connection`. SIBLING of
 # mole-mysql: MariaDB speaks the MySQL wire protocol and the MySQL dialect, so the
 # two drivers share everything dialect-shaped through mole-myql (information_schema
 # SQL, clause renderers, the tinyint(1)→bool + numeric/date coercions) and the
@@ -15,14 +15,22 @@
 #     the `mariadb` client and no longer guarantee the legacy `mysql` symlink, so a
 #     MariaDB-only host connects with this driver. It is a drop-in for the mysql
 #     client: same flags, same MYSQL_PWD, same batch → TSV output.
+#   - the probe bound — `SET STATEMENT max_statement_time=N FOR …`, MariaDB-only
+#     syntax (MySQL uses an optimizer hint instead);
 #   - the JSON policy — MariaDB's `JSON` is an ALIAS for `LONGTEXT`, so
 #     information_schema reports `data_type = longtext` and a JSON column is
 #     indistinguishable from plain text. `ma-type` therefore leaves it a string
-#     (parse it yourself with `from json`); it does NOT get MySQL's native-`json`
-#     auto-parse. This one divergence is the whole reason mole-mysql and mole-mariadb
-#     are separate drivers rather than one with a binary fallback.
-# Everything else — resolve → exec → check → parse → cache → type — is the same
-# shape as mole-mysql.
+#     (parse it yourself with `from json`). Note this is NOT why there are two
+#     drivers: mole-mysql's `json` branch simply never matches on MariaDB.
+# WHY TWO DRIVERS: today the engine pieces above are a handful of lines, and one
+# driver with a per-connection client binary would cover both engines. The split
+# is deliberate anyway: MySQL and MariaDB have diverged since 2012, and this
+# driver is where MariaDB-only features land (`DELETE/INSERT … RETURNING` since
+# 10.0/10.5, sequences, system-versioned tables, `SET STATEMENT`). The price is
+# that the verbs and completers below are clones of mole-mysql's — a change to
+# one is a change to both, and only the engine-specific pieces may differ.
+# Orchestration (resolve → exec → check → parse → cache → type) has the same shape
+# as mole-mysql.
 
 use mole/lib/conn.nu
 
@@ -328,6 +336,124 @@ export def "select" [
   $rows | sql type-rows (ma-schema-load $conf) $from (myql nulls) {|c| ma-type $c }
 }
 
+# ---- stats completers (result-column pool) ------------------------------------
+# The RESULT columns of a `stats` line: the `--by` keys ++ the aggregate auto-names,
+# reconstructed from the flags on the line via the SAME `sql result-cols` path the verb
+# body uses (so completion and the generated SQL never drift). No I/O: the aggregate
+# names come from the flags, not the schema, so this completes even without a reachable
+# database.
+def "mariadb-result-cols" [context: string]: nothing -> list<string> {
+  # one flag per aggregate, read off the line by its `flag` name; `--count` is a switch
+  let flags = (myql aggs | reduce --fold {count: ($context =~ '(?:--count|-C)(?:\s|$)')} {|a, acc|
+    if $a.fieldless { $acc } else { $acc | upsert $a.flag (complete csv (complete flag $context [("--" + $a.flag)])) }
+  })
+  sql result-cols (complete csv (complete flag $context [--by -g])) $flags (myql aggs)
+}
+
+# `--having` completer: partial two-stage — complete the RESULT-column name; once an
+# operator is typed the user fills the value. Comma-list aware.
+def "mariadb-having" [context: string]: nothing -> list<string> {
+  let seg = (complete token $context | split row "," | last)
+  if (sql predicate-token $seg --ops (myql ops)) != null { return [] }
+  complete csv-extend $context (mariadb-result-cols $context)
+}
+
+# `--sort-by` completer over RESULT columns (`col[:desc]`), via the shared sort helper.
+def "mariadb-rsort" [context: string]: nothing -> list<string> { complete sort-csv $context (mariadb-result-cols $context) }
+
+# Compose and run a single-table MariaDB aggregation (GROUP BY), returning typed rows.
+#
+# The analytics twin of `select`: `stats` groups by `--by` keys and computes the
+# per-function aggregate flags (`--count`, `--sum`, `--avg`, `--min`, `--max`,
+# `--count-distinct`, plus the dialect's `--group-concat`), each auto-named SQL-style
+# (`count`, `sum_<col>`, `avg_<col>`, `count_distinct_<col>`, `group_concat_<col>`).
+# `--where` is the PRE-aggregation filter — the same dual-mode `col<op>value`
+# token-list-or-raw-SQL as `select`. `--having` filters the grouped rows with the same
+# token grammar but over the RESULT columns (`count>=10`, `sum_amount>1000`) — the alias
+# is expanded back to its aggregate expression, so it is portable across dialects;
+# `count` is always available. `--sort-by` orders the RESULT columns (`col[:desc]`), and
+# `--limit`/`--offset` page them (MariaDB rejects a bare OFFSET, so `--offset` requires
+# `--limit`).
+#
+# No `--by` yields a grand total (one row); no aggregate flag defaults to `count(*)`.
+# Group keys come back DB-typed from the schema; `count`/`count_distinct` are ints and
+# `avg`/`sum` floats (`min`/`max`/`group_concat` keep the source string unless you
+# `--raw`). `--dry-run` returns `{connection, query}`. Aggregations only READ, so there
+# is no prompt. Anything past this subset — joins, expression aggregates, WITH ROLLUP,
+# windows — is a `raw-query`. Connection overridable as in `raw-query`.
+@category mole-mariadb
+@example "count and sum per group, ordered, top-N" {
+  mole-mariadb stats --from orders --by region --count --sum amount --sort-by sum_amount:desc --limit 10 --dry-run | get query
+} --result "SELECT region, count(*) AS count, sum(amount) AS sum_amount FROM orders GROUP BY region ORDER BY sum_amount DESC LIMIT 10"
+@example "pre-filter + HAVING over result columns (alias expands to the expression)" {
+  mole-mariadb stats --from orders --by region,tier --count --avg amount --where status=active --having count>=10 --sort-by avg_amount:desc --dry-run | get query
+} --result "SELECT region, tier, count(*) AS count, avg(amount) AS avg_amount FROM orders WHERE status = 'active' GROUP BY region, tier HAVING count(*) >= 10 ORDER BY avg_amount DESC"
+@example "grand total — no --by" {
+  mole-mariadb stats --from orders --count --sum amount --dry-run | get query
+} --result "SELECT count(*) AS count, sum(amount) AS sum_amount FROM orders"
+@example "distinct customers per region" {
+  mole-mariadb stats --from orders --by region --count-distinct customer_id --dry-run | get query
+} --result "SELECT region, count(distinct customer_id) AS count_distinct_customer_id FROM orders GROUP BY region"
+@example "a MariaDB dialect aggregate — comma-joined names per region" {
+  mole-mariadb stats --from users --by region --group-concat name --dry-run | get query
+} --result "SELECT region, group_concat(name) AS group_concat_name FROM users GROUP BY region"
+@example "run for real — grouped rows come back DB-typed" {
+  mole-mariadb stats --from orders --by user_id --count --avg amount -c mariadb-local-dev
+}
+export def "stats" [
+  --from(-F): string@"mariadb-table"               # source table, single table only (an alias is allowed: "users u")
+  --where(-w): string@"mariadb-where"              # WHERE: col<op>value token-list (comma-sep, completable) OR raw SQL (pre-aggregation)
+  --by(-g): string@"mariadb-columns-csv"           # GROUP BY keys, comma-separated
+  --count(-C)                                      # count(*) → `count`
+  --sum: string@"mariadb-columns-csv"              # sum(col) → `sum_<col>`, comma-separated columns
+  --avg: string@"mariadb-columns-csv"              # avg(col) → `avg_<col>`
+  --min: string@"mariadb-columns-csv"              # min(col) → `min_<col>`
+  --max: string@"mariadb-columns-csv"              # max(col) → `max_<col>`
+  --count-distinct: string@"mariadb-columns-csv"   # count(distinct col) → `count_distinct_<col>`
+  --group-concat: string@"mariadb-columns-csv"     # group_concat(col) → `group_concat_<col>` (MariaDB dialect aggregate)
+  --having: string@"mariadb-having"                # post-aggregation filter tokens over RESULT columns (AND-joined)
+  --sort-by(-s): string@"mariadb-rsort"            # ORDER BY over RESULT columns: col[:desc], comma-separated
+  --limit(-l): int                                 # LIMIT N
+  --offset(-o): int                                # OFFSET N (requires --limit)
+  --connection(-c): string@complete-connection   # named connection (default: current)
+  --host(-h): string
+  --port(-p): int
+  --user(-u): string
+  --password(-P): string
+  --database(-d): string
+  --set: record = {}
+  --raw(-R)                                         # raw driver output: no typing, no null-normalization
+  --dry-run(-n)                                    # return a {connection, query} record instead of running
+] {
+  if ($from | is-empty) { error make {msg: "stats: --from <table> is required"} }
+  if ($offset != null) and ($limit == null) {
+    error make {msg: "stats: --offset requires --limit (MariaDB rejects a bare OFFSET)"}
+  }
+  let by = (complete csv $by)
+  let flags = {
+    count: $count, sum: (complete csv $sum), avg: (complete csv $avg), min: (complete csv $min), max: (complete csv $max)
+    "count-distinct": (complete csv $count_distinct), "group-concat": (complete csv $group_concat)
+  }
+  let aggs = (sql build-aggs (sql agg-requests $flags (myql aggs)) (myql aggs))
+  let proj = (($by ++ ($aggs | each {|a| $a.expr + " AS " + $a.name })) | str join ", ")
+  let text = (sql assemble [
+    $"SELECT ($proj)"
+    $"FROM ($from)"
+    (sql where-clause $where --dialect (myql dialect) --ops (myql ops))
+    (sql join-list $by --prefix "GROUP BY ")
+    (sql build-having (complete csv $having) $aggs --dialect (myql dialect) --ops (myql ops))
+    (sql build-order (complete csv $sort_by))
+    (if $limit != null { $"LIMIT ($limit)" })
+    (if $offset != null { $"OFFSET ($offset)" })
+  ])
+  let conf = (ma-conf $connection $host $port $user $password $database $set)
+  if $dry_run { return {connection: ($conf | conn redact), query: $text} }
+  let rows = (ma-rows $conf $text)
+  if $raw { return $rows }
+  $rows | sql type-rows (ma-schema-load $conf) $from (myql nulls) {|c| ma-type $c }
+  | sql apply-agg-types $aggs
+}
+
 # Compose and run a single-table MariaDB UPDATE.
 #
 # Reads like the statement: `update <table> <assignment>...`. The table is the
@@ -402,8 +528,9 @@ export def "update" [
 # a sub-select) when it doesn't parse — the same grammar as `select`. Like UPDATE,
 # MariaDB scopes a single-table DELETE
 # with an optional `ORDER BY ... LIMIT` (`--sort-by` / `--limit`) — delete the
-# "oldest N" and so on. There is NO RETURNING and NO join support (reach for
-# `raw-query` for `DELETE ... USING`/multi-table).
+# "oldest N" and so on. MariaDB (10.0+) does support `DELETE ... RETURNING`, but
+# this verb does not expose it yet (roadmap); until then, and for joins
+# (`DELETE ... USING`/multi-table), reach for `raw-query`.
 #
 # DELETE always writes, so it prompts before running (skip with `--yes`) and
 # REFUSES to delete every row unless you pass `--all`. `--dry-run` returns a

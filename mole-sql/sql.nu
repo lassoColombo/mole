@@ -539,18 +539,21 @@ export def "sanitize-name" [s: string]: nothing -> string {
 # and count(distinct). Like the operator table, the aggregates `stats` can compute are
 # DIALECT-INJECTED: `mole-sql` ships this base and a driver passes its own `aggs` table
 # (base ++ extras, e.g. `string_agg`/`group_concat`/`median`) into `build-aggs`. Each
-# entry is `{flag, fieldless, render}` whose `render` closure `{|col|}` returns the SQL
-# aggregate expression; `count` is fieldless (`count(*)`), the rest take one column.
+# entry is `{flag, fieldless, render, type?}`: the `render` closure `{|col|}` returns the
+# SQL aggregate expression (`count` is fieldless → `count(*)`, the rest take one column);
+# the optional `type` (`"int"` | `"float"`) is how `apply-agg-types` coerces the result
+# column — so a dialect extra types itself by declaring one (`median` → float), and an
+# entry without it (min/max, string aggregates) is left to the schema / `--raw`.
 @category mole-sql
 @example "the base flags" { sql ansi-aggs | get flag } --result ["count" "sum" "avg" "min" "max" "count-distinct"]
 export def "ansi-aggs" []: nothing -> list {
   [
-    {flag: "count",          fieldless: true,  render: {|col| "count(*)" }}
-    {flag: "sum",            fieldless: false, render: {|col| $"sum\(($col)\)" }}
-    {flag: "avg",            fieldless: false, render: {|col| $"avg\(($col)\)" }}
-    {flag: "min",            fieldless: false, render: {|col| $"min\(($col)\)" }}
-    {flag: "max",            fieldless: false, render: {|col| $"max\(($col)\)" }}
-    {flag: "count-distinct", fieldless: false, render: {|col| $"count\(distinct ($col)\)" }}
+    {flag: "count",          fieldless: true,  type: "int",   render: {|col| "count(*)" }}
+    {flag: "sum",            fieldless: false, type: "float", render: {|col| $"sum\(($col)\)" }}
+    {flag: "avg",            fieldless: false, type: "float", render: {|col| $"avg\(($col)\)" }}
+    {flag: "min",            fieldless: false,                render: {|col| $"min\(($col)\)" }}
+    {flag: "max",            fieldless: false,                render: {|col| $"max\(($col)\)" }}
+    {flag: "count-distinct", fieldless: false, type: "int",   render: {|col| $"count\(distinct ($col)\)" }}
   ]
 }
 
@@ -579,35 +582,54 @@ export def "agg-requests" [
   } | flatten
 }
 
-# Build the ordered aggregate specs `[{expr, name}]` from a list of REQUESTS and the
-# injected aggregate table. Each request is `{fn, cols?}`: a fieldless aggregate
+# Build the ordered aggregate specs `[{expr, name, type}]` from a list of REQUESTS and
+# the injected aggregate table. Each request is `{fn, cols?}`: a fieldless aggregate
 # (`{fn: "count"}`) yields one spec named after the fn; a field-list aggregate
 # (`{fn: "sum", cols: [a b]}`) expands to one spec per field, auto-named `<fn>_<field>`
 # (fn and field sanitized, so `count-distinct`→`count_distinct_<field>`). The SQL comes
-# from the matched entry's `render` closure in `aggs` (default → `ansi-aggs`), so a
-# driver adds dialect aggregates by extending that table. Requests are emitted in order;
-# empty requests default to a single `count(*)` — so `stats --by x` counts rows per group.
+# from the matched entry's `render` closure in `aggs` (default → `ansi-aggs`), and the
+# result `type` (`int`/`float`/null) is carried over from the entry, so a driver adds
+# dialect aggregates — rendering AND typing — by extending that table. Requests are
+# emitted in order; empty requests default to a single `count(*)` — so `stats --by x`
+# counts rows per group.
 @category mole-sql
 @example "a fieldless count and a per-column sum" {
   sql build-aggs [{fn: "count"} {fn: "sum", cols: [amount]}]
-} --result [{expr: "count(*)", name: count}, {expr: "sum(amount)", name: sum_amount}]
+} --result [{expr: "count(*)", name: count, type: int}, {expr: "sum(amount)", name: sum_amount, type: float}]
 @example "empty request defaults to count(*)" {
   sql build-aggs []
-} --result [{expr: "count(*)", name: count}]
+} --result [{expr: "count(*)", name: count, type: int}]
 export def "build-aggs" [
   requests: list = []      # [{fn, cols?}] gathered from the driver's stats flags, in output order
-  aggs: list = []          # injected [{flag, fieldless, render}]; default → ansi-aggs
+  aggs: list = []          # injected [{flag, fieldless, render, type?}]; default → ansi-aggs
 ]: nothing -> list {
   let aggs = (if ($aggs | is-empty) { ansi-aggs } else { $aggs })
   let specs = ($requests | each {|req|
     let spec = ($aggs | where flag == $req.fn | first)
+    let type = ($spec | get -o type)
     if $spec.fieldless {
-      [{expr: (do $spec.render ""), name: (sanitize-name $spec.flag)}]
+      [{expr: (do $spec.render ""), name: (sanitize-name $spec.flag), type: $type}]
     } else {
-      ($req.cols? | default []) | each {|c| {expr: (do $spec.render $c), name: ((sanitize-name $spec.flag) + "_" + (sanitize-name $c))} }
+      ($req.cols? | default []) | each {|c| {expr: (do $spec.render $c), name: ((sanitize-name $spec.flag) + "_" + (sanitize-name $c)), type: $type} }
     }
   } | flatten)
-  if ($specs | is-empty) { [{expr: "count(*)", name: "count"}] } else { $specs }
+  if ($specs | is-empty) { [{expr: "count(*)", name: "count", type: "int"}] } else { $specs }
+}
+
+# The RESULT columns of a `stats` query — the `--by` keys followed by the aggregate
+# auto-names — from the same `flags` record and `aggs` table the verb body feeds
+# `agg-requests`/`build-aggs`, so a driver's `--having`/`--sort-by` completers and its
+# generated SQL can never drift. Pure: the driver reads `by` and `flags` off the line.
+@category mole-sql
+@example "group keys then aggregate names, in table order" {
+  sql result-cols [region] {count: true, sum: [amount]}
+} --result [region count sum_amount]
+export def "result-cols" [
+  by: list<string>         # the GROUP BY keys
+  flags: record            # {<flag>: bool | list<string>}, as for `agg-requests`
+  aggs: list = []          # injected aggregate table; default → ansi-aggs
+]: nothing -> list<string> {
+  $by ++ (build-aggs (agg-requests $flags $aggs) $aggs | get name)
 }
 
 # AND-join HAVING predicate tokens over the RESULT columns of a `stats` query. Each
@@ -661,26 +683,26 @@ export def "null-or" [
   {|| if $in == null { null } else { do $convert $in } }
 }
 
-# Coerce the well-known numeric aggregate result columns of a `stats` result to real
-# numbers: `count`/`count_distinct_*` → int, `avg_*`/`sum_*` → float. `min_*`/`max_*`
-# mirror an arbitrary source column, so they are LEFT untouched here (the driver types
-# them from the schema like any other column, or `--raw` keeps them raw); group-key
-# columns are likewise typed upstream by the driver's schema `apply-types`. A null cell
-# stays null. Reads the rows via `$in`; uses the same `core-update` + `null-or` idiom as
-# `apply-types`.
+# Coerce the aggregate result columns of a `stats` result by the `type` each spec
+# carries from the aggregate table (`int` → int, `float` → float; the ANSI base types
+# count/count-distinct as int and sum/avg as float). A spec without a type (min/max,
+# string aggregates) mirrors an arbitrary source column, so it is LEFT untouched here
+# (the driver types it from the schema like any other column, or `--raw` keeps it raw);
+# group-key columns are likewise typed upstream by the driver's schema `apply-types`. A
+# null cell stays null. Reads the rows via `$in`; uses the same `core-update` + `null-or`
+# idiom as `apply-types`.
 @category mole-sql
 @example "count comes back int, avg float" {
-  [{count: "3", avg_amount: "4.5"}] | sql apply-agg-types [{expr: "count(*)", name: count}, {expr: "avg(amount)", name: avg_amount}]
+  [{count: "3", avg_amount: "4.5"}] | sql apply-agg-types [{expr: "count(*)", name: count, type: int}, {expr: "avg(amount)", name: avg_amount, type: float}]
 } --result [{count: 3, avg_amount: 4.5}]
 export def "apply-agg-types" [aggs: list]: table -> table {
   let rows = $in   # capture BEFORE piping aggs into reduce (else `$in` becomes `$aggs`)
   $aggs | reduce --fold $rows {|a, acc|
-    let conv = if ($a.name == "count") or ($a.name | str starts-with "count_distinct_") {
-      (null-or {|x| $x | into int })
-    } else if ($a.name | str starts-with "avg_") or ($a.name | str starts-with "sum_") {
-      (null-or {|x| $x | into float })
-    } else { null }
-    if $conv == null { $acc } else { $acc | core-update $a.name $conv }
+    match ($a | get -o type) {
+      "int" => ($acc | core-update $a.name (null-or {|x| $x | into int }))
+      "float" => ($acc | core-update $a.name (null-or {|x| $x | into float }))
+      _ => $acc
+    }
   }
 }
 

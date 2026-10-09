@@ -11,15 +11,17 @@
 #        │              tinyint(1)→bool + numeric/date type coercions)
 #     ┌──┴───────────┐
 #  mole-mysql   mole-mariadb   the engines: each owns only what truly differs —
-#                              its client binary (`^mysql` vs `^mariadb`) and its
-#                              JSON policy (native JSON vs the LONGTEXT alias).
+#                              its client binary (`^mysql` vs `^mariadb`), its
+#                              probe bound (hint vs SET STATEMENT), its JSON
+#                              policy (native JSON vs the LONGTEXT alias), and
+#                              any engine-only feature (MariaDB RETURNING, …).
 #
 # LAYERING: this is a pure library — it imports ONLY `mole-sql` (itself pure) and
 # does no I/O (no connection, no CLI, no cache, no `$env`). Everything here is
-# data-in / data-out, so it is shared VERBATIM by both engines; the two genuine
-# divergences (binary + JSON typing) are NOT expressed here — they live in each
-# driver, injected at the call site exactly like `mole-sql` takes type maps as
-# closures. Discovered via `NU_LIB_DIRS`; no manifest, no registration.
+# data-in / data-out, so it is shared VERBATIM by both engines; the genuine
+# divergences (binary, probe bound, JSON typing) are NOT expressed here — they
+# live in each driver, injected at the call site exactly like `mole-sql` takes
+# type maps as closures. Discovered via `NU_LIB_DIRS`; no manifest, no registration.
 
 use mole-sql/sql.nu
 
@@ -56,6 +58,18 @@ export def "ops" []: nothing -> list {
   | append {token: "=~",  desc: "regex match (REGEXP)",   render: {|c, v, lit| sql render-like "REGEXP" $c $v $lit }}
   | append {token: "!=~", desc: "not regex (NOT REGEXP)", render: {|c, v, lit| sql render-like "NOT REGEXP" $c $v $lit }}
   | append {token: "<=>", desc: "null-safe = (<=>)",      render: {|c, v, lit| sql render-nullsafe "<=>" $c $v $lit }}
+}
+
+# The dialect's aggregate vocabulary: the ANSI base (count/sum/avg/min/max/count-distinct)
+# plus the MySQL family's `group_concat(col)` (comma-joined string aggregation) →
+# `group_concat_<col>`. Injected into `sql build-aggs` so `stats` can compute a dialect
+# aggregate the ANSI set can't — the aggregate twin of `ops`. The flag keys are the verb's
+# own flag names, so `sql agg-requests` reads a `{count, sum, …, group-concat}` record.
+@category mole-myql
+@example "adds group_concat to the ANSI base" { myql aggs | get flag | last } --result "group-concat"
+export def "aggs" []: nothing -> list {
+  sql ansi-aggs
+  | append {flag: "group-concat", fieldless: false, render: {|col| $"group_concat\(($col)\)" }}
 }
 
 # Statements that warrant a confirmation prompt before running (writes, DDL,

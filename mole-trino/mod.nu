@@ -1,7 +1,7 @@
 # mole-trino — Trino driver plugin.
 #
 # A PLUGIN (data source): supports the trino technology, registers itself as a
-# driver, and exposes the user verbs `raw-query` / `select` / `schema`. It DEPENDS on:
+# driver, and exposes the user verbs `raw-query` / `select` / `stats` / `schema`. It DEPENDS on:
 #   - mole core plumbing        (`use mole/lib/*.nu`)
 #   - the generic mole-sql pure LIBRARY (`use mole-sql/sql.nu`)
 # The mole-sql library must be reachable via `NU_LIB_DIRS`.
@@ -55,6 +55,19 @@ def "trino-ops" []: nothing -> list {
   | append {token: "=~",  desc: "regex match (regexp_like)",   render: {|c, v, lit| sql render-func "regexp_like" $c $v $lit }}
   | append {token: "!=~", desc: "not regex (NOT regexp_like)", render: {|c, v, lit| "NOT " + (sql render-func "regexp_like" $c $v $lit) }}
   | append {token: "<=>", desc: "null-safe = (IS NOT DISTINCT FROM)", render: {|c, v, lit| sql render-nullsafe "IS NOT DISTINCT FROM" $c $v $lit }}
+}
+
+# The dialect's aggregate vocabulary: the ANSI base (count/sum/avg/min/max/count-distinct)
+# plus Trino's `approx_distinct(col)` (HyperLogLog cardinality, typed int) →
+# `approx_distinct_<col>` and its string aggregation `listagg(col, ',') WITHIN GROUP
+# (ORDER BY col)` → `string_agg_<col>` (listagg needs Trino ≥ 359; verified on 483).
+# Injected into `sql build-aggs` so `stats` can compute a dialect aggregate the ANSI set
+# can't — the aggregate twin of `trino-ops`. The flag keys are the verb's own flag names,
+# so `sql agg-requests` reads a `{count, sum, …, approx-distinct, string-agg}` record.
+def "trino-aggs" []: nothing -> list {
+  sql ansi-aggs
+  | append {flag: "approx-distinct", fieldless: false, type: "int", render: {|col| $"approx_distinct\(($col)\)" }}
+  | append {flag: "string-agg",      fieldless: false,              render: {|col| $"listagg\(($col), ','\) WITHIN GROUP \(ORDER BY ($col)\)" }}
 }
 
 # Statements that warrant a confirmation prompt before running. Trino writes/DDL
@@ -344,9 +357,9 @@ export def "raw-query" [
 @example "DISTINCT (Trino has no DISTINCT ON)" {
   mole-trino select mktsegment --distinct --from customer --dry-run | get query
 } --result "SELECT DISTINCT mktsegment FROM customer"
-@example "pagination with LIMIT + OFFSET" {
+@example "pagination — Trino's grammar puts OFFSET before LIMIT" {
   mole-trino select --from customer --sort-by custkey --limit 5 --offset 10 --dry-run | get query
-} --result "SELECT * FROM customer ORDER BY custkey LIMIT 5 OFFSET 10"
+} --result "SELECT * FROM customer ORDER BY custkey OFFSET 10 LIMIT 5"
 @example "a --where token-list composes the WHERE clause (columns + operators complete)" {
   mole-trino select custkey name --from customer --where mktsegment=BUILDING,acctbal>=5000 --dry-run | get query
 } --result "SELECT custkey, name FROM customer WHERE mktsegment = 'BUILDING' AND acctbal >= 5000"
@@ -387,8 +400,10 @@ export def "select" [
     $"FROM ($from)"
     (sql where-clause $where --dialect $TRINO_DIALECT --ops (trino-ops))
     (sql build-order (complete csv $sort_by))
-    (if $limit != null { $"LIMIT ($limit)" })
+    # Trino's grammar is `[OFFSET n] [LIMIT n]` — the reverse of the RDBMS siblings
+    # (`LIMIT 5 OFFSET 10` is a syntax error on the server).
     (if $offset != null { $"OFFSET ($offset)" })
+    (if $limit != null { $"LIMIT ($limit)" })
   ])
   let conf = (trino-conf $connection $host $port $user $catalog $schema $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
@@ -398,6 +413,123 @@ export def "select" [
   let rows = (trino-rows $conf $text)
   if $raw { return $rows }
   $rows | sql type-rows (trino-schema-load $conf) $from $TRINO_NULLS {|c| trino-type $c }
+}
+
+# ---- stats completers (result-column pool) ------------------------------------
+# The RESULT columns of a `stats` line: the `--by` keys ++ the aggregate auto-names,
+# reconstructed from the flags on the line via the SAME `sql result-cols` path the verb
+# body uses (so completion and the generated SQL never drift). No I/O: the aggregate
+# names come from the flags, not the schema, so this completes even without a reachable
+# cluster.
+def "trino-result-cols" [context: string]: nothing -> list<string> {
+  # one flag per aggregate, read off the line by its `flag` name; `--count` is a switch
+  let flags = (trino-aggs | reduce --fold {count: ($context =~ '(?:--count|-C)(?:\s|$)')} {|a, acc|
+    if $a.fieldless { $acc } else { $acc | upsert $a.flag (complete csv (complete flag $context [("--" + $a.flag)])) }
+  })
+  sql result-cols (complete csv (complete flag $context [--by -g])) $flags (trino-aggs)
+}
+
+# `--having` completer: partial two-stage — complete the RESULT-column name; once an
+# operator is typed the user fills the value. Comma-list aware.
+def "trino-having" [context: string]: nothing -> list<string> {
+  let seg = (complete token $context | split row "," | last)
+  if (sql predicate-token $seg --ops (trino-ops)) != null { return [] }
+  complete csv-extend $context (trino-result-cols $context)
+}
+
+# `--sort-by` completer over RESULT columns (`col[:desc]`), via the shared sort helper.
+def "trino-rsort" [context: string]: nothing -> list<string> { complete sort-csv $context (trino-result-cols $context) }
+
+# Compose and run a single-table Trino aggregation (GROUP BY), returning typed rows.
+#
+# The analytics twin of `select`: `stats` groups by `--by` keys and computes the
+# per-function aggregate flags (`--count`, `--sum`, `--avg`, `--min`, `--max`,
+# `--count-distinct`, plus the dialect's `--approx-distinct` and `--string-agg`), each
+# auto-named SQL-style (`count`, `sum_<col>`, `avg_<col>`, `count_distinct_<col>`,
+# `approx_distinct_<col>`, `string_agg_<col>`). `--where` is the PRE-aggregation filter —
+# the same dual-mode `col<op>value` token-list-or-raw-SQL as `select`. `--having` filters
+# the grouped rows with the same token grammar but over the RESULT columns (`count>=10`,
+# `sum_amount>1000`) — the alias is expanded back to its aggregate expression, so it is
+# portable across dialects; `count` is always available. `--sort-by` orders the RESULT
+# columns (`col[:desc]`), and `--limit`/`--offset` page them (rendered `OFFSET … LIMIT …`,
+# Trino's grammar order).
+#
+# No `--by` yields a grand total (one row); no aggregate flag defaults to `count(*)`.
+# Group keys come back DB-typed from the schema; `count`/`count_distinct`/
+# `approx_distinct` are ints and `avg`/`sum` floats (`min`/`max`/`string_agg` keep the
+# source string unless you `--raw`). `--dry-run` returns `{connection, query}`.
+# Aggregations only READ, so there is no prompt. Anything past this subset — joins,
+# expression aggregates, GROUPING SETS, windows — is a `raw-query`. Connection
+# overridable via `--connection` + per-field flags / `--catalog` / `--schema` / `--set`.
+@category mole-trino
+@example "count and sum per group, ordered, top-N" {
+  mole-trino stats --from customer --by mktsegment --count --sum acctbal --sort-by sum_acctbal:desc --limit 10 --dry-run | get query
+} --result "SELECT mktsegment, count(*) AS count, sum(acctbal) AS sum_acctbal FROM customer GROUP BY mktsegment ORDER BY sum_acctbal DESC LIMIT 10"
+@example "pre-filter + HAVING over result columns (alias expands to the expression)" {
+  mole-trino stats --from customer --by mktsegment,nationkey --count --avg acctbal --where acctbal>0 --having count>=10 --sort-by avg_acctbal:desc --dry-run | get query
+} --result "SELECT mktsegment, nationkey, count(*) AS count, avg(acctbal) AS avg_acctbal FROM customer WHERE acctbal > 0 GROUP BY mktsegment, nationkey HAVING count(*) >= 10 ORDER BY avg_acctbal DESC"
+@example "grand total — no --by" {
+  mole-trino stats --from customer --count --sum acctbal --dry-run | get query
+} --result "SELECT count(*) AS count, sum(acctbal) AS sum_acctbal FROM customer"
+@example "paging — OFFSET renders before LIMIT" {
+  mole-trino stats --from customer --by mktsegment --count --sort-by count:desc --limit 2 --offset 1 --dry-run | get query
+} --result "SELECT mktsegment, count(*) AS count FROM customer GROUP BY mktsegment ORDER BY count DESC OFFSET 1 LIMIT 2"
+@example "Trino dialect aggregates — approximate distinct nations and comma-joined names" {
+  mole-trino stats --from customer --by mktsegment --approx-distinct nationkey --string-agg name --dry-run | get query
+} --result "SELECT mktsegment, approx_distinct(nationkey) AS approx_distinct_nationkey, listagg(name, ',') WITHIN GROUP (ORDER BY name) AS string_agg_name FROM customer GROUP BY mktsegment"
+@example "run for real — grouped rows come back DB-typed (tpch.tiny)" {
+  mole-trino stats --from customer --by mktsegment --count --avg acctbal --catalog tpch --schema tiny -c trino-local-dev
+}
+export def "stats" [
+  --from(-F): string@"trino-table"                 # source table, single table only (an alias is allowed: "customer c")
+  --where(-w): string@"trino-where"                # WHERE: col<op>value token-list (comma-sep, completable) OR raw SQL (pre-aggregation)
+  --by(-g): string@"trino-columns-csv"             # GROUP BY keys, comma-separated
+  --count(-C)                                      # count(*) → `count`
+  --sum: string@"trino-columns-csv"                # sum(col) → `sum_<col>`, comma-separated columns
+  --avg: string@"trino-columns-csv"                # avg(col) → `avg_<col>`
+  --min: string@"trino-columns-csv"                # min(col) → `min_<col>`
+  --max: string@"trino-columns-csv"                # max(col) → `max_<col>`
+  --count-distinct: string@"trino-columns-csv"     # count(distinct col) → `count_distinct_<col>`
+  --approx-distinct: string@"trino-columns-csv"    # approx_distinct(col) → `approx_distinct_<col>` (Trino dialect aggregate)
+  --string-agg: string@"trino-columns-csv"         # listagg(col, ',') WITHIN GROUP (ORDER BY col) → `string_agg_<col>` (Trino dialect aggregate)
+  --having: string@"trino-having"                  # post-aggregation filter tokens over RESULT columns (AND-joined)
+  --sort-by(-s): string@"trino-rsort"              # ORDER BY over RESULT columns: col[:desc], comma-separated
+  --limit(-l): int                                 # LIMIT N
+  --offset(-o): int                                # OFFSET N
+  --connection(-c): string@complete-connection   # named connection (default: current)
+  --host(-h): string
+  --port(-p): int
+  --user(-u): string
+  --catalog: string                                # override catalog (Trino-specific)
+  --schema: string                                 # override schema (Trino-specific)
+  --set: record = {}
+  --raw(-R)                                         # raw driver output: no typing, no null-normalization
+  --dry-run(-n)                                    # return a {connection, query} record instead of running
+] {
+  if ($from | is-empty) { error make {msg: "stats: --from <table> is required"} }
+  let by = (complete csv $by)
+  let flags = {
+    count: $count, sum: (complete csv $sum), avg: (complete csv $avg), min: (complete csv $min), max: (complete csv $max)
+    "count-distinct": (complete csv $count_distinct), "approx-distinct": (complete csv $approx_distinct), "string-agg": (complete csv $string_agg)
+  }
+  let aggs = (sql build-aggs (sql agg-requests $flags (trino-aggs)) (trino-aggs))
+  let proj = (($by ++ ($aggs | each {|a| $a.expr + " AS " + $a.name })) | str join ", ")
+  let text = (sql assemble [
+    $"SELECT ($proj)"
+    $"FROM ($from)"
+    (sql where-clause $where --dialect $TRINO_DIALECT --ops (trino-ops))
+    (sql join-list $by --prefix "GROUP BY ")
+    (sql build-having (complete csv $having) $aggs --dialect $TRINO_DIALECT --ops (trino-ops))
+    (sql build-order (complete csv $sort_by))
+    (if $offset != null { $"OFFSET ($offset)" })   # Trino: OFFSET before LIMIT (see `select`)
+    (if $limit != null { $"LIMIT ($limit)" })
+  ])
+  let conf = (trino-conf $connection $host $port $user $catalog $schema $set)
+  if $dry_run { return {connection: ($conf | conn redact), query: $text} }
+  let rows = (trino-rows $conf $text)
+  if $raw { return $rows }
+  $rows | sql type-rows (trino-schema-load $conf) $from $TRINO_NULLS {|c| trino-type $c }
+  | sql apply-agg-types $aggs
 }
 
 # Compose and run a single-table Trino UPDATE.

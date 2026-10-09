@@ -439,13 +439,26 @@ def "sanitize-name flattens non-word chars" [] {
 
 @test
 def "build-aggs expands requests into SQL-like named specs" [] {
-    assert equal (sql build-aggs [{fn: "count"} {fn: "sum", cols: [amount]}]) [{expr: "count(*)", name: "count"} {expr: "sum(amount)", name: "sum_amount"}]
-    assert equal (sql build-aggs []) [{expr: "count(*)", name: "count"}]                              # empty → default count(*)
-    assert equal (sql build-aggs [{fn: "count-distinct", cols: [customer.id]}]) [{expr: "count(distinct customer.id)", name: "count_distinct_customer_id"}]
+    assert equal (sql build-aggs [{fn: "count"} {fn: "sum", cols: [amount]}]) [{expr: "count(*)", name: "count", type: "int"} {expr: "sum(amount)", name: "sum_amount", type: "float"}]
+    assert equal (sql build-aggs []) [{expr: "count(*)", name: "count", type: "int"}]                 # empty → default count(*)
+    assert equal (sql build-aggs [{fn: "count-distinct", cols: [customer.id]}]) [{expr: "count(distinct customer.id)", name: "count_distinct_customer_id", type: "int"}]
     assert equal (sql build-aggs [{fn: "count"} {fn: "sum", cols: [x]} {fn: "avg", cols: [y]} {fn: "max", cols: [z]}] | get name) ["count" "sum_x" "avg_y" "max_z"]   # request order preserved
-    # a driver's INJECTED dialect aggregate renders via its own closure (string_agg here)
-    let aggs = (sql ansi-aggs | append {flag: "string_agg", fieldless: false, render: {|col| $"string_agg\(($col), ','\)" }})
-    assert equal (sql build-aggs [{fn: "string_agg", cols: [tags]}] $aggs) [{expr: "string_agg(tags, ',')", name: "string_agg_tags"}]
+    assert equal (sql build-aggs [{fn: "min", cols: [ts]}] | first | get type) null                   # min/max carry no type
+    # a driver's INJECTED dialect aggregate renders via its own closure (string_agg here) and
+    # carries its own type (median → float)
+    let aggs = (sql ansi-aggs
+      | append {flag: "string_agg", fieldless: false, render: {|col| $"string_agg\(($col), ','\)" }}
+      | append {flag: "median", fieldless: false, type: "float", render: {|col| $"median\(($col)\)" }})
+    assert equal (sql build-aggs [{fn: "string_agg", cols: [tags]}] $aggs) [{expr: "string_agg(tags, ',')", name: "string_agg_tags", type: null}]
+    assert equal (sql build-aggs [{fn: "median", cols: [amount]}] $aggs) [{expr: "median(amount)", name: "median_amount", type: "float"}]
+}
+
+@test
+def "result-cols lists the group keys then the aggregate names" [] {
+    assert equal (sql result-cols [region] {count: true, sum: [amount]}) [region count sum_amount]
+    assert equal (sql result-cols [] {}) [count]                                                      # the default count(*)
+    let aggs = (sql ansi-aggs | append {flag: "string-agg", fieldless: false, render: {|c| "" }})
+    assert equal (sql result-cols [a b] {"string-agg": [name], count: true} $aggs) [a b count string_agg_name]
 }
 
 @test
@@ -457,13 +470,16 @@ def "build-having expands aliases to expressions and count is always available" 
 }
 
 @test
-def "apply-agg-types coerces numeric aggregate columns" [] {
-    let aggs = (sql build-aggs [{fn: "count"} {fn: "avg", cols: [amount]} {fn: "sum", cols: [x]} {fn: "min", cols: [ts]}])
-    let out = ([{count: "3", avg_amount: "4.5", sum_x: "10", min_ts: "2024-01-01"}] | sql apply-agg-types $aggs | first)
+def "apply-agg-types coerces aggregate columns by their declared type" [] {
+    let table = (sql ansi-aggs | append {flag: "median", fieldless: false, type: "float", render: {|col| $"median\(($col)\)" }})
+    let aggs = (sql build-aggs [{fn: "count"} {fn: "avg", cols: [amount]} {fn: "sum", cols: [x]} {fn: "min", cols: [ts]} {fn: "median", cols: [amount]}] $table)
+    let out = ([{count: "3", avg_amount: "4.5", sum_x: "10", min_ts: "2024-01-01", median_amount: "7.5"}] | sql apply-agg-types $aggs | first)
     assert equal $out.count 3            # count → int
     assert equal $out.avg_amount 4.5     # avg → float
     assert equal $out.sum_x 10.0         # sum → float
     assert equal $out.min_ts "2024-01-01"   # min/max untouched (schema types them)
+    assert equal $out.median_amount 7.5  # a dialect extra types itself from the table
+    assert equal ([{count: null}] | sql apply-agg-types (sql build-aggs []) | first | get count) null   # null stays null
 }
 
 @test

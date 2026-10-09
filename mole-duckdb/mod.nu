@@ -1,7 +1,7 @@
 # mole-duckdb — DuckDB driver plugin.
 #
 # A PLUGIN (data source): supports the duckdb technology, registers itself as a
-# driver, and exposes the user verbs `raw-query` / `select` / `schema`. It DEPENDS on:
+# driver, and exposes the user verbs `raw-query` / `select` / `stats` / `schema`. It DEPENDS on:
 #   - mole core plumbing        (`use mole/lib/*.nu`)
 #   - the generic mole-sql pure LIBRARY (`use mole-sql/sql.nu`)
 # The mole-sql library must be reachable via `NU_LIB_DIRS`.
@@ -54,6 +54,18 @@ def "duck-ops" []: nothing -> list {
   | append {token: "=~",  desc: "regex match (regexp_matches, partial)", render: {|c, v, lit| sql render-func "regexp_matches" $c $v $lit }}
   | append {token: "!=~", desc: "not regex (NOT regexp_matches)",        render: {|c, v, lit| "NOT " + (sql render-func "regexp_matches" $c $v $lit) }}
   | append {token: "<=>", desc: "null-safe = (IS NOT DISTINCT FROM)",    render: {|c, v, lit| sql render-nullsafe "IS NOT DISTINCT FROM" $c $v $lit }}
+}
+
+# The dialect's aggregate vocabulary: the ANSI base (count/sum/avg/min/max/count-distinct)
+# plus DuckDB's `string_agg(col, ',')` (comma-joined string aggregation) → `string_agg_<col>`
+# and `median(col)` (typed float) → `median_<col>` (both verified on DuckDB 1.5). Injected
+# into `sql build-aggs` so `stats` can compute a dialect aggregate the ANSI set can't — the
+# aggregate twin of `duck-ops`. The flag keys are the verb's own flag names, so
+# `sql agg-requests` reads a `{count, sum, …, string-agg, median}` record.
+def "duck-aggs" []: nothing -> list {
+  sql ansi-aggs
+  | append {flag: "string-agg", fieldless: false,                render: {|col| $"string_agg\(($col), ','\)" }}
+  | append {flag: "median",     fieldless: false, type: "float", render: {|col| $"median\(($col)\)" }}
 }
 
 # Statements that warrant a confirmation prompt before running.
@@ -426,6 +438,118 @@ export def "select" [
   let rows = (duck-rows $conf $text)
   if $raw { return $rows }
   $rows | sql type-rows (duck-schema-load $conf) $from $DUCK_NULLS {|c| duck-type $c }
+}
+
+# ---- stats completers (result-column pool) ------------------------------------
+# The RESULT columns of a `stats` line: the `--by` keys ++ the aggregate auto-names,
+# reconstructed from the flags on the line via the SAME `sql result-cols` path the verb
+# body uses (so completion and the generated SQL never drift). No I/O: the aggregate
+# names come from the flags, not the schema, so this completes even without the file.
+def "duckdb-result-cols" [context: string]: nothing -> list<string> {
+  # one flag per aggregate, read off the line by its `flag` name; `--count` is a switch
+  let flags = (duck-aggs | reduce --fold {count: ($context =~ '(?:--count|-C)(?:\s|$)')} {|a, acc|
+    if $a.fieldless { $acc } else { $acc | upsert $a.flag (complete csv (complete flag $context [("--" + $a.flag)])) }
+  })
+  sql result-cols (complete csv (complete flag $context [--by -g])) $flags (duck-aggs)
+}
+
+# `--having` completer: partial two-stage — complete the RESULT-column name; once an
+# operator is typed the user fills the value. Comma-list aware.
+def "duckdb-having" [context: string]: nothing -> list<string> {
+  let seg = (complete token $context | split row "," | last)
+  if (sql predicate-token $seg --ops (duck-ops)) != null { return [] }
+  complete csv-extend $context (duckdb-result-cols $context)
+}
+
+# `--sort-by` completer over RESULT columns (`col[:desc]`), via the shared sort helper.
+def "duckdb-rsort" [context: string]: nothing -> list<string> { complete sort-csv $context (duckdb-result-cols $context) }
+
+# Compose and run a single-table DuckDB aggregation (GROUP BY), returning typed rows.
+#
+# The analytics twin of `select`: `stats` groups by `--by` keys and computes the
+# per-function aggregate flags (`--count`, `--sum`, `--avg`, `--min`, `--max`,
+# `--count-distinct`, plus the dialect's `--string-agg` and `--median`), each auto-named
+# SQL-style (`count`, `sum_<col>`, `avg_<col>`, `count_distinct_<col>`, `string_agg_<col>`,
+# `median_<col>`). `--where` is the PRE-aggregation filter — the same dual-mode
+# `col<op>value` token-list-or-raw-SQL as `select`. `--having` filters the grouped rows
+# with the same token grammar but over the RESULT columns (`count>=10`, `sum_amount>1000`)
+# — the alias is expanded back to its aggregate expression, so it is portable across
+# dialects; `count` is always available. `--sort-by` orders the RESULT columns
+# (`col[:desc]`), and `--limit`/`--offset` page them.
+#
+# No `--by` yields a grand total (one row); no aggregate flag defaults to `count(*)`.
+# Group keys come back DB-typed from the schema; `count`/`count_distinct` are ints and
+# `avg`/`sum`/`median` floats (`min`/`max`/`string_agg` keep the source string unless you
+# `--raw`). `--dry-run` returns `{connection, query}`. Aggregations only READ, so there
+# is no prompt. Anything past this subset — joins, expression aggregates, GROUPING SETS,
+# windows, quantiles — is a `raw-query`. Connection/target overridable via
+# `--connection` + `--path` / `--database` / `--set`.
+@category mole-duckdb
+@example "count and sum per group, ordered, top-N" {
+  mole-duckdb stats --from orders --by user_id --count --sum amount --sort-by sum_amount:desc --limit 10 --dry-run | get query
+} --result "SELECT user_id, count(*) AS count, sum(amount) AS sum_amount FROM orders GROUP BY user_id ORDER BY sum_amount DESC LIMIT 10"
+@example "pre-filter + HAVING over result columns (alias expands to the expression)" {
+  mole-duckdb stats --from orders --by user_id,status --count --avg amount --where status=paid --having count>=10 --sort-by avg_amount:desc --dry-run | get query
+} --result "SELECT user_id, status, count(*) AS count, avg(amount) AS avg_amount FROM orders WHERE status = 'paid' GROUP BY user_id, status HAVING count(*) >= 10 ORDER BY avg_amount DESC"
+@example "grand total — no --by" {
+  mole-duckdb stats --from orders --count --sum amount --dry-run | get query
+} --result "SELECT count(*) AS count, sum(amount) AS sum_amount FROM orders"
+@example "distinct customers per status" {
+  mole-duckdb stats --from orders --by status --count-distinct user_id --dry-run | get query
+} --result "SELECT status, count(distinct user_id) AS count_distinct_user_id FROM orders GROUP BY status"
+@example "DuckDB dialect aggregates — median amount and comma-joined statuses per user" {
+  mole-duckdb stats --from orders --by user_id --median amount --string-agg status --dry-run | get query
+} --result "SELECT user_id, string_agg(status, ',') AS string_agg_status, median(amount) AS median_amount FROM orders GROUP BY user_id"
+@example "run for real — grouped rows come back DB-typed" {
+  mole-duckdb stats --from orders --by user_id --count --avg amount -c duckdb-local-dev
+}
+export def "stats" [
+  --from(-F): string@"duckdb-table"                # source table, single table only (an alias is allowed: "users u")
+  --where(-w): string@"duckdb-where"               # WHERE: col<op>value token-list (comma-sep, completable) OR raw SQL (pre-aggregation)
+  --by(-g): string@"duckdb-columns-csv"            # GROUP BY keys, comma-separated
+  --count(-C)                                      # count(*) → `count`
+  --sum: string@"duckdb-columns-csv"               # sum(col) → `sum_<col>`, comma-separated columns
+  --avg: string@"duckdb-columns-csv"               # avg(col) → `avg_<col>`
+  --min: string@"duckdb-columns-csv"               # min(col) → `min_<col>`
+  --max: string@"duckdb-columns-csv"               # max(col) → `max_<col>`
+  --count-distinct: string@"duckdb-columns-csv"    # count(distinct col) → `count_distinct_<col>`
+  --string-agg: string@"duckdb-columns-csv"        # string_agg(col, ',') → `string_agg_<col>` (DuckDB dialect aggregate)
+  --median: string@"duckdb-columns-csv"            # median(col) → `median_<col>` (DuckDB dialect aggregate)
+  --having: string@"duckdb-having"                 # post-aggregation filter tokens over RESULT columns (AND-joined)
+  --sort-by(-s): string@"duckdb-rsort"             # ORDER BY over RESULT columns: col[:desc], comma-separated
+  --limit(-l): int                                 # LIMIT N
+  --offset(-o): int                                # OFFSET N
+  --connection(-c): string@complete-connection   # named connection (default: current)
+  --path(-p): string                               # database file path (or :memory:)
+  --database(-d): string                           # database file path (alias of --path)
+  --set: record = {}
+  --raw(-R)                                         # raw driver output: no typing, no null-normalization
+  --dry-run(-n)                                    # return a {connection, query} record instead of running
+] {
+  if ($from | is-empty) { error make {msg: "stats: --from <table> is required"} }
+  let by = (complete csv $by)
+  let flags = {
+    count: $count, sum: (complete csv $sum), avg: (complete csv $avg), min: (complete csv $min), max: (complete csv $max)
+    "count-distinct": (complete csv $count_distinct), "string-agg": (complete csv $string_agg), median: (complete csv $median)
+  }
+  let aggs = (sql build-aggs (sql agg-requests $flags (duck-aggs)) (duck-aggs))
+  let proj = (($by ++ ($aggs | each {|a| $a.expr + " AS " + $a.name })) | str join ", ")
+  let text = (sql assemble [
+    $"SELECT ($proj)"
+    $"FROM ($from)"
+    (sql where-clause $where --dialect $DUCK_DIALECT --ops (duck-ops))
+    (sql join-list $by --prefix "GROUP BY ")
+    (sql build-having (complete csv $having) $aggs --dialect $DUCK_DIALECT --ops (duck-ops))
+    (sql build-order (complete csv $sort_by))
+    (if $limit != null { $"LIMIT ($limit)" })
+    (if $offset != null { $"OFFSET ($offset)" })
+  ])
+  let conf = (duck-conf $connection $path $database $set)
+  if $dry_run { return {connection: ($conf | conn redact), query: $text} }
+  let rows = (duck-rows $conf $text)
+  if $raw { return $rows }
+  $rows | sql type-rows (duck-schema-load $conf) $from $DUCK_NULLS {|c| duck-type $c }
+  | sql apply-agg-types $aggs
 }
 
 # Compose and run a single-table DuckDB UPDATE.

@@ -194,3 +194,29 @@ def "delete refuses an unfiltered write without --all" [] {
 # The target table is a REQUIRED leading positional, so omitting it is a parse-time
 # error enforced by the signature (`update <table> …` / `delete <table> …`) — not a
 # runtime one, so there is nothing catchable to assert here.
+
+# ---- stats: dry-run SQL assembly ----------------------------------------------
+
+@test
+def "dry-run stats count and sum per group ordered top-n" [] {
+  fixture
+  assert equal (mole-mysql stats --from orders --by region --count --sum amount --sort-by sum_amount:desc --limit 10 -c mysql-local-dev --dry-run | get query) "SELECT region, count(*) AS count, sum(amount) AS sum_amount FROM orders GROUP BY region ORDER BY sum_amount DESC LIMIT 10"
+  assert equal (mole-mysql stats --from orders --by region --count --sort-by count:desc --limit 2 --offset 1 -c mysql-local-dev --dry-run | get query) "SELECT region, count(*) AS count FROM orders GROUP BY region ORDER BY count DESC LIMIT 2 OFFSET 1"
+}
+
+@test
+def "dry-run stats with where and having over result aliases" [] {
+  fixture
+  assert equal (mole-mysql stats --from orders --by region,tier --count --avg amount --where status=active --having count>=10 --sort-by avg_amount:desc -c mysql-local-dev --dry-run | get query) "SELECT region, tier, count(*) AS count, avg(amount) AS avg_amount FROM orders WHERE status = 'active' GROUP BY region, tier HAVING count(*) >= 10 ORDER BY avg_amount DESC"
+}
+
+@test
+def "dry-run stats grand total distinct count the group-concat dialect aggregate and the offset guard" [] {
+  fixture
+  assert equal (mole-mysql stats --from orders --count --sum amount -c mysql-local-dev --dry-run | get query) "SELECT count(*) AS count, sum(amount) AS sum_amount FROM orders"
+  assert equal (mole-mysql stats --from orders --by region --count-distinct customer_id -c mysql-local-dev --dry-run | get query) "SELECT region, count(distinct customer_id) AS count_distinct_customer_id FROM orders GROUP BY region"
+  assert equal (mole-mysql stats --from users --by region --group-concat name -c mysql-local-dev --dry-run | get query) "SELECT region, group_concat(name) AS group_concat_name FROM users GROUP BY region"
+  assert equal (mole-mysql stats --from orders --by region -c mysql-local-dev --dry-run | get query) "SELECT region, count(*) AS count FROM orders GROUP BY region"
+  assert error { mole-mysql stats --from orders --by region --offset 1 -c mysql-local-dev --dry-run }   # MySQL rejects a bare OFFSET
+  assert error { mole-mysql stats -c mysql-local-dev --dry-run }
+}

@@ -1,7 +1,7 @@
 # mole-psql — PostgreSQL driver plugin.
 #
 # A PLUGIN (data source): supports the postgres technology, registers itself as a
-# driver, and exposes the user verbs `raw-query` / `select` / `schema`. It DEPENDS on:
+# driver, and exposes the user verbs `raw-query` / `select` / `stats` / `schema`. It DEPENDS on:
 #   - mole core plumbing        (`use mole/lib/*.nu`)
 #   - the generic mole-sql pure LIBRARY (`use mole-sql/sql.nu`)
 # The mole-sql library must be reachable via `NU_LIB_DIRS`.
@@ -471,17 +471,16 @@ export def "select" [
 
 # ---- stats completers (result-column pool) ------------------------------------
 # The RESULT columns of a `stats` line: the `--by` keys ++ the aggregate auto-names,
-# reconstructed from the flags on the line via the SAME `sql build-aggs` the verb body
-# uses (so completion and the generated SQL never drift — the `vl-stat-cols` pattern).
-# No I/O: the aggregate names come from the flags, not the schema, so this completes
-# even without a reachable database.
+# reconstructed from the flags on the line via the SAME `sql result-cols` path the verb
+# body uses (so completion and the generated SQL never drift — the `vl-stat-cols`
+# pattern). No I/O: the aggregate names come from the flags, not the schema, so this
+# completes even without a reachable database.
 def "psql-result-cols" [context: string]: nothing -> list<string> {
-  let by = (complete csv (complete flag $context [--by -g]))
   # one flag per aggregate, read off the line by its `flag` name; `--count` is a switch
   let flags = (pg-aggs | reduce --fold {count: ($context =~ '(?:--count|-C)(?:\s|$)')} {|a, acc|
     if $a.fieldless { $acc } else { $acc | upsert $a.flag (complete csv (complete flag $context [("--" + $a.flag)])) }
   })
-  $by ++ ((sql build-aggs (sql agg-requests $flags (pg-aggs)) (pg-aggs)) | get name)
+  sql result-cols (complete csv (complete flag $context [--by -g])) $flags (pg-aggs)
 }
 
 # `--having` completer: partial two-stage — complete the RESULT-column name; once an
