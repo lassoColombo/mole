@@ -96,26 +96,12 @@ def vm-warm [conf: record]: nothing -> nothing {
   try { vm-catalog-load $conf | ignore } catch { }
 }
 
-# ---- query composition (shared by the verbs) ----------------------------------
-
-# Build a scoping selector from an optional metric + matcher tokens. A "metric" that
-# actually carries an operator (`labels job=api`) is folded into the matchers, so
-# the leading positional stays unambiguous. Returns `metric{block}`, a bare
-# `{block}`, or "" (match everything). Shared by the enumeration verbs; `select`
-# builds its own expression via `promql build` (it also wraps func/agg/range).
-def vm-scope [metric: any, matchers: list<string>]: nothing -> string {
-  let is_matcher = (($metric | is-not-empty) and ((promql matcher-token $metric) != null))
-  let m = if $is_matcher { null } else { $metric }
-  let toks = if $is_matcher { [$metric] ++ $matchers } else { $matchers }
-  let block = (promql matchers-tokens $toks)
-  if ($m | is-empty) { $block } else { $m + $block }
-}
-
 # ---- contextual completion ----------------------------------------------------
 # Every completer resolves the connection / catalog / metric / siblings / window the
 # line targets, then scopes its suggestions. The shared `complete` toolkit does the
 # parsing and NEVER throws, so a Tab never errors; these add the metrics-specific
-# projection on top.
+# projection on top. The scoping selector itself is `promql scope` and the
+# positional split is `promql split-tokens` — both shared with mole-prometheus.
 
 # The verb on a completion line (the first known-verb token), so metric recovery can
 # account for `label-values`' leading <label> positional.
@@ -127,36 +113,32 @@ def vm-ctx-verb [context: string]: nothing -> string {
 # The metric already typed on the line: the `--metric` flag if present (how
 # `label-values` names it, so the flag can precede the <label> and scope its
 # completion), else the first operator-free positional (how the metric-first verbs
-# name it). `label-values` has NO positional metric — its first positional is the
-# <label> — so it never mistakes that for a metric. Null when none is present.
+# name it; `promql split-tokens` does the split). `label-values` has NO positional
+# metric — its first positional is the <label> — so it never mistakes that for a
+# metric. Null when none is present.
 def vm-ctx-metric [context: string]: nothing -> any {
   let flagged = (complete flag $context ["--metric" "-M"])
   if ($flagged | is-not-empty) { return $flagged }
   if (vm-ctx-verb $context) == "label-values" { return null }
-  complete positionals $context | where {|t| (promql matcher-token $t) == null } | get -o 0
+  promql split-tokens (complete positionals $context) | get metric
 }
 
 # The sibling matcher tokens already typed (the operator-bearing positionals); the
 # metric and any <label> positional are operator-free, so they drop out naturally.
 def vm-ctx-siblings [context: string]: nothing -> list<string> {
-  complete positionals $context | where {|t| (promql matcher-token $t) != null }
+  promql split-tokens (complete positionals $context) | get matchers
 }
 
 # The selector the line implies (metric + siblings), for scoping live lookups.
 def vm-ctx-selector [context: string]: nothing -> string {
-  try { vm-scope (vm-ctx-metric $context) (vm-ctx-siblings $context) } catch { "" }
+  try { promql scope (vm-ctx-metric $context) (vm-ctx-siblings $context) } catch { "" }
 }
 
 # The {start, end} window implied by the --last/--start/--end flags on the line
 # (absent/unparseable → unbounded), so contextual lookups honor the typed window.
 def vm-range-ctx [context: string]: nothing -> record {
-  let lastRaw = (complete flag $context ["--last" "-L"])
-  let startRaw = (complete flag $context ["--start" "-a"])
-  let endRaw = (complete flag $context ["--end" "-b"])
-  let last = (if ($lastRaw | is-empty) { null } else { try { $lastRaw | into duration } catch { null } })
-  let start = (if ($startRaw | is-empty) { null } else { try { $startRaw | into datetime } catch { null } })
-  let end = (if ($endRaw | is-empty) { null } else { try { $endRaw | into datetime } catch { null } })
-  promql resolve-range $last $start $end (date now)
+  let f = (complete range-flags $context)
+  promql resolve-range $f.last $f.start $f.end (date now)
 }
 
 # The cached catalog for whatever connection the line targets (cache-only, instant).
@@ -431,7 +413,7 @@ export def "series" [
   --set: record = {}
   --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
-  let sel = (vm-scope $metric $matchers)
+  let sel = (promql scope $metric $matchers)
   if ($sel | is-empty) { error make {msg: "series: a metric or at least one matcher is required"} }
   let conf = (vm-conf $connection $url $token $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
@@ -465,7 +447,7 @@ export def "labels" [
   --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vm-conf $connection $url $token $set)
-  let sel = (vm-scope $metric $matchers)
+  let sel = (promql scope $metric $matchers)
   if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let range = (promql resolve-range $last $start $end (date now))
   let match = (if ($sel | is-empty) { null } else { [$sel] })
@@ -502,7 +484,7 @@ export def "label-values" [
   --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vm-conf $connection $url $token $set)
-  let sel = (vm-scope $metric $matchers)
+  let sel = (promql scope $metric $matchers)
   if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let range = (promql resolve-range $last $start $end (date now))
   let match = (if ($sel | is-empty) { null } else { [$sel] })
@@ -557,7 +539,7 @@ export def "tsdb-status" [
   --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vm-conf $connection $url $token $set)
-  let sel = (vm-scope $metric $matchers)
+  let sel = (promql scope $metric $matchers)
   if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let match = (if ($sel | is-empty) { null } else { [$sel] })
   let resp = (client status-tsdb get --date $date --topN $topN --match $match
@@ -592,7 +574,7 @@ export def "export-samples" [
   --raw(-R)                                         # return the parsed JSONL objects (columnar), untidied
   --dry-run(-n)                                     # return {connection, query} instead of running
 ] {
-  let sel = (vm-scope $metric $matchers)
+  let sel = (promql scope $metric $matchers)
   if ($sel | is-empty) { error make {msg: "export-samples: a metric or at least one matcher is required"} }
   let conf = (vm-conf $connection $url $token $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $sel} }

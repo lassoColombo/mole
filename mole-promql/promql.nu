@@ -179,46 +179,6 @@ def esc [v: string]: nothing -> string {
   $v | str replace --all '\' '\\' | str replace --all '"' '\"'
 }
 
-# Split a `label=value` token on its FIRST `=` → {label, value}; null when there
-# is no `=` (the value keeps any further `=`).
-@category mole-promql
-@example "split on the first =" { promql matcher-parts "status=5.." } --result {label: status, value: "5.."}
-@example "no = yields null" { promql matcher-parts "status" } --result null
-export def "matcher-parts" [token: string]: nothing -> any {
-  if not ($token | str contains "=") { return null }
-  let p = ($token | split row --number 2 "=")
-  {label: ($p | first | str trim), value: ($p | get 1)}
-}
-
-# Render one matcher `label<op>"value"` from a `label=value` token (value quoted
-# and escaped). Null for a token with no `=`.
-def render-matcher [token: string, op: string]: nothing -> any {
-  let p = (matcher-parts $token)
-  if $p == null { null } else { $p.label + $op + '"' + (esc $p.value) + '"' }
-}
-
-# Assemble the `{...}` matcher block from the four matcher kinds; each list holds
-# `label=value` tokens (value = the match RHS). Empty inputs → "".
-@category mole-promql
-@example "eq and regex matchers compose in order" {
-  promql matchers ["job=api" "method=GET"] [] ["status=5.."] []
-} --result '{job="api", method="GET", status=~"5.."}'
-@example "no matchers → empty string" { promql matchers [] [] [] [] } --result ""
-export def "matchers" [
-  eq: list<string>    # label=value → label="value"
-  ne: list<string>    # label=value → label!="value"
-  re: list<string>    # label=value → label=~"value"
-  nre: list<string>   # label=value → label!~"value"
-]: nothing -> string {
-  let parts = ([
-    ...($eq  | each {|t| render-matcher $t "=" })
-    ...($ne  | each {|t| render-matcher $t "!=" })
-    ...($re  | each {|t| render-matcher $t "=~" })
-    ...($nre | each {|t| render-matcher $t "!~" })
-  ] | compact)
-  if ($parts | is-empty) { "" } else { "{" + ($parts | str join ", ") + "}" }
-}
-
 # Split a matcher token `label<op>value` into {label, op, value}; `op` is one of
 # `=`, `!=`, `=~`, `!~`. Null when the token carries no operator. The operator is
 # anchored right after the label identifier and the alternation is longest-first,
@@ -239,8 +199,7 @@ export def "matcher-token" [token: string]: nothing -> any {
 # `status=~5..`, `env!=dev`). Each value is quoted and escaped (via `esc`). An empty
 # list → "". Errors on a non-empty token that carries no operator — silently
 # dropping it would run a wrongly-unfiltered query, the worst failure for a metrics
-# tool. This is the single-list superset of `matchers` (each token names its own
-# operator instead of the caller splitting into four lists).
+# tool. Each token names its own operator, so ONE list carries every matcher kind.
 @category mole-promql
 @example "mixed operators compose in order" {
   promql matchers-tokens ["job=api" "status=~5.." "env!=dev"]
@@ -313,9 +272,58 @@ export def "aggs" []: nothing -> list<string> {
 @category mole-promql
 export def "windows" []: nothing -> list<string> { [30s 1m 5m 10m 15m 30m 1h 3h 6h 12h 1d] }
 
-# ---- pure completion / context parsing ----------------------------------------
+# ---- selector scoping / context parsing (pure) --------------------------------
+# Shared by the Prometheus-API drivers (mole-prometheus, mole-victoriametrics): the
+# enumeration verbs build their scoping selector with `scope`, and the contextual
+# completers classify the positionals already on the line with `split-tokens`.
 
+# Build a scoping selector from an optional metric + matcher tokens. A "metric" that
+# actually carries an operator (`labels job=api`) is folded into the matchers, so a
+# verb's leading positional stays unambiguous. Returns `metric{block}`, a bare
+# `{block}`, or "" (match everything). `select` builds its own expression via
+# `build` (it also wraps func/agg/range). Errors, via `matchers-tokens`, on a bare
+# non-matcher sibling.
+@category mole-promql
+@example "a metric plus matchers" { promql scope "up" ["job=api"] } --result 'up{job="api"}'
+@example "a leading matcher folds into the block" { promql scope "job=api" ["env!=dev"] } --result '{job="api", env!="dev"}'
+@example "nothing to scope by" { promql scope null [] } --result ""
+export def "scope" [
+  metric: any              # metric name, null / "" for none, or a matcher token (folded in)
+  matchers: list<string>   # operator-carrying tokens (label=v | label!=v | label=~v | label!~v)
+]: nothing -> string {
+  let is_matcher = (($metric | is-not-empty) and ((matcher-token $metric) != null))
+  let m = if $is_matcher { null } else { $metric }
+  let toks = if $is_matcher { [$metric] ++ $matchers } else { $matchers }
+  let block = (matchers-tokens $toks)
+  if ($m | is-empty) { $block } else { $m + $block }
+}
 
+# Classify the positional tokens of a partial command line into the metric and the
+# matcher siblings: `{metric: <first operator-free token | null>, matchers: <the
+# operator-carrying tokens>}`. One pair of matching surrounding quotes is stripped
+# first — the parser keeps them on a `'msg=hello world'` positional, and a quoted
+# matcher would otherwise read as operator-free and masquerade as the metric. A
+# driver feeds it `complete positionals <ctx>` and keeps its own policy on top (a
+# `--metric` flag, a verb whose first positional is a <label>, …).
+@category mole-promql
+@example "metric first, matchers after" { promql split-tokens ["up" "job=api" "status=~5.."] } --result {metric: up, matchers: ["job=api" "status=~5.."]}
+@example "no metric on the line" { promql split-tokens ["job=api"] } --result {metric: null, matchers: ["job=api"]}
+@example "a quoted token is unwrapped before classifying" { promql split-tokens ["'msg=hello world'"] } --result {metric: null, matchers: ["msg=hello world"]}
+export def "split-tokens" [tokens: list<string>]: nothing -> record {
+  let toks = ($tokens | each {|t| unquote $t })
+  {
+    metric: ($toks | where {|t| (matcher-token $t) == null } | get -o 0)
+    matchers: ($toks | where {|t| (matcher-token $t) != null })
+  }
+}
+
+# Strip one matching pair of surrounding quotes from a token (the parser keeps them).
+def unquote [s: string]: nothing -> string {
+  let len = ($s | str length)
+  if $len < 2 { return $s }
+  let d = ($s | str substring 0..0)
+  if ($d in ['"' "'"]) and ($s | str ends-with $d) { $s | str substring 1..($len - 2) } else { $s }
+}
 
 # ---- time range (clock injected, so the library stays pure) -------------------
 

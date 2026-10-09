@@ -118,6 +118,14 @@ export def "sort-csv" [context: string, cols: list<string>]: nothing -> list<str
 # (a regex split would stop at the space). `--flag=value` is handled; the last
 # occurrence wins; null when the flag is absent. The ast-based replacement for the
 # per-library `parse-flag` / `vl-flag`.
+#
+# Two reads, parser first. The non-flattened `ast` keeps a Named argument's value as
+# ONE expression, so `--last 1hr` reads `1hr` — the flattened token stream splits a
+# duration literal into `1` + `hr` (a datetime stays whole, which is why only
+# `--last` ever showed it). The flat scan remains the fallback for what the parser
+# can't see as a Named argument with a value: an external/unknown command head, a
+# flag the command doesn't declare (the parser reads it as a switch), a parse
+# failure, or a flag whose "value" is really the next flag (`--last -c pg`).
 @category mole-lib
 @example "read a flag the user typed" { flag "select --from public.users -c prod" [--connection -c] } --result "prod"
 @example "a quoted value stays whole" { flag 'select --from "users u"' [--from -F] } --result "users u"
@@ -127,6 +135,8 @@ export def "flag" [
   names: list<string>   # flag spellings to try, e.g. [--from -F]
 ]: nothing -> any {
   let want = ($names | each {|n| $n | into string })
+  let named = (flag-named $context $want)
+  if ($named != null) { return $named }
   let toks = (tokens $context)
   let hits = ($toks | enumerate | where {|t|
     let c = ($t.item.content | into string)
@@ -142,6 +152,44 @@ export def "flag" [
     if ($nxt != null) and (not ($nxt | into string | str starts-with "-")) { ($nxt | into string) } else { null }
   }
   if ($val == null) { null } else { unquote ($val | into string) }
+}
+
+# The parser's reading of a value-flag (see `flag`): the value of the LAST Named
+# argument spelled as one of `want` (`Named.0.span.span_source` is the spelling the
+# user typed, also for `--flag=value`), unquoted. Null when there is no such Named
+# argument, it is bare, or its "value" starts with `-` — all of which `flag` then
+# re-reads with the flat token scan.
+def flag-named [context: string, want: list<string>]: nothing -> any {
+  let hits = (try {
+    ast $context --json | get block | from json
+    | get pipelines.0.elements.0.expr.expr.Call.arguments
+    | each {|a| $a.Named? } | compact
+    | where {|n| ($n | get -o 0.span.span_source | default "" | into string) in $want }
+  } catch { [] })
+  if ($hits | is-empty) { return null }
+  let v = ($hits | last | get -o 2)
+  let val = (if ($v == null) { null } else { $v | get -o span.span_source })
+  if ($val == null) or ($val | into string | str starts-with "-") { null } else { unquote ($val | into string) }
+}
+
+# The time window a line already carries, typed: `{last: duration|null, start:
+# datetime|null, end: datetime|null}` read from `--last/-L`, `--start/-a`, `--end/-b`
+# (absent or unparseable → null; never throws). Every windowed verb in the
+# metrics/logs family declares exactly these flags, so one reader serves them all;
+# each driver then feeds the record to its own resolver (`promql resolve-range`,
+# `vl-range`) to get the {start, end} that scopes its live lookups.
+@category mole-lib
+@example "a typed --last window" { range-flags "mydriver select up --last 1hr" } --result {last: 1hr, start: null, end: null}
+@example "nothing on the line" { range-flags "mydriver select up" } --result {last: null, start: null, end: null}
+export def "range-flags" [context: string]: nothing -> record {
+  let last = (flag $context ["--last" "-L"])
+  let start = (flag $context ["--start" "-a"])
+  let end = (flag $context ["--end" "-b"])
+  {
+    last: (if ($last | is-empty) { null } else { try { $last | into duration } catch { null } })
+    start: (if ($start | is-empty) { null } else { try { $start | into datetime } catch { null } })
+    end: (if ($end | is-empty) { null } else { try { $end | into datetime } catch { null } })
+  }
 }
 
 # Resolve the connection a completion line targets, robustly and never throwing.

@@ -102,13 +102,8 @@ def vl-filters-ctx [context: string]: nothing -> string {
 # line, best-effort (absent/unparseable → unbounded). Lets contextual lookups honor
 # the time window the user has typed.
 def vl-range-ctx [context: string]: nothing -> record {
-  let lastRaw = (complete flag $context ["--last" "-L"])
-  let startRaw = (complete flag $context ["--start" "-a"])
-  let endRaw = (complete flag $context ["--end" "-b"])
-  let last = (if ($lastRaw | is-empty) { null } else { try { $lastRaw | into duration } catch { null } })
-  let start = (if ($startRaw | is-empty) { null } else { try { $startRaw | into datetime } catch { null } })
-  let end = (if ($endRaw | is-empty) { null } else { try { $endRaw | into datetime } catch { null } })
-  vl-range $last $start $end
+  let f = (complete range-flags $context)
+  vl-range $f.last $f.start $f.end
 }
 
 # The cached catalog for whatever connection the command line names (or the current

@@ -68,10 +68,13 @@ tools ship a `mod.nu` (`use mole-psql` → `mole-psql …`).
 | `use mole/lib/cache.nu`    | `cache path/read/write/stale/fetch/clear` — `fetch file ttl {|| build}` is the one memoize primitive (it stamps `meta.refreshed_at`) |
 | `use mole/lib/query.nu`    | `query resolve/confirm/check/is-dangerous` — query text from positional → `--file` → stdin → `$EDITOR`; the y/N prompt; the `complete`-record check; the quote-aware danger test |
 | `use mole/lib/editor.nu`   | `editor launch target --cwd dir` — the ONE way `$EDITOR` is run (directly, flags split, vim cwd pinned) |
-| `use mole/lib/complete.nu` | cross-driver completers `complete connection/queryfile`; the contextual toolkit `complete token/csv/csv-extend/sort-csv/flag/positionals/lead-arg/conn-ctx/catalog-ctx` |
+| `use mole/lib/complete.nu` | cross-driver completers `complete connection/queryfile`; the contextual toolkit `complete token/csv/csv-extend/sort-csv/flag/positionals/lead-arg/conn-ctx/catalog-ctx/range-flags` |
 
 The contextual toolkit is the part every driver builds on: `flag` and
-`positionals` read the partial line through the parser (quote-aware), `conn-ctx`
+`positionals` read the partial line through the parser (quote-aware; `flag` reads
+the parser's Named arguments first, so a `--last 1hr` value stays whole, and only
+falls back to the flat token scan), `range-flags` types the `--last/--start/--end`
+window a line carries, `conn-ctx`
 resolves the connection a line targets (typed `-c` → session current → the
 `__current__` mirror `conn set-current` writes, because completion often can't see
 the session `$env`), `catalog-ctx` reads that connection's cached catalog, and none

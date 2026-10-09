@@ -69,6 +69,7 @@ module fakedb {
   export def update [table: string, ...assignments: string, --where: string] { }
   export def delete [table: string, --where: string] { }
   export def show [...columns: string, --from: string, --where: string] { }
+  export def query [...terms: string, --last(-L): duration, --start(-a): datetime, --end(-b): datetime, --connection(-c): string] { }
 }
 use fakedb
 
@@ -83,4 +84,33 @@ def "lead-arg returns the write verbs leading table, unquoted" [] {
 def "lead-arg is null on other verbs or an empty slot" [] {
   assert equal (complete lead-arg "fakedb show id --from users --where " [update delete]) null
   assert equal (complete lead-arg "fakedb update " [update delete]) null
+}
+
+# ---- flag / range-flags: the parser-first read ----------------------------------
+
+@test
+def "flag reads a duration literal whole on a real signature" [] {
+  # the flattened token stream splits `1hr` into `1` + `hr`; the Named read keeps it
+  assert equal (complete flag "fakedb query up --last 1hr" [--last -L]) "1hr"
+  assert equal (complete flag "fakedb query up -L 15min" [--last -L]) "15min"
+  assert equal (complete flag "fakedb query up --last=1hr" [--last -L]) "1hr"
+  assert equal (complete flag "fakedb query up --last 1hr -L 2hr" [--last -L]) "2hr"   # last occurrence wins
+  assert equal (complete flag "fakedb query up -a 2026-01-01T00:00:00Z" [--start -a]) "2026-01-01T00:00:00Z"
+  assert equal (complete flag 'fakedb query up -c "vm dev" j' [--connection -c]) "vm dev"
+}
+
+@test
+def "flag falls back to the token scan for an external head, a bare flag and a foreign flag" [] {
+  assert equal (complete flag "x query --last 1hr" [--last -L]) "1hr"                # unknown command: no Named args
+  assert equal (complete flag "fakedb query --last -c pg" [--last -L]) null           # bare flag followed by another flag
+  assert equal (complete flag "fakedb query --last " [--last -L]) null                # value still under the cursor
+  assert equal (complete flag 'fakedb query --from "users u"' [--from -F]) "users u"  # a flag the command does not declare
+}
+
+@test
+def "range-flags types the window and nulls the rest" [] {
+  assert equal (complete range-flags "fakedb query up --last 1hr") {last: 1hr, start: null, end: null}
+  assert equal (complete range-flags "fakedb query up -a 2026-01-01T00:00:00Z -b 2026-01-02T00:00:00Z") {last: null, start: 2026-01-01T00:00:00Z, end: 2026-01-02T00:00:00Z}
+  assert equal (complete range-flags "fakedb query up") {last: null, start: null, end: null}
+  assert equal (complete range-flags "fakedb query up --last nope") {last: null, start: null, end: null}
 }

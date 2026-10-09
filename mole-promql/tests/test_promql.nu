@@ -92,22 +92,33 @@ def "metadata flattens rows and normalizes empty strings to null" [] {
 # ---- query composition (the select builder) -----------------------------------
 
 @test
-def "matcher-parts splits on the first equals only" [] {
-    assert equal (promql matcher-parts "status=5..") {label: status, value: "5.."}
-    assert equal (promql matcher-parts "path=/a=b") {label: path, value: "/a=b"}   # value keeps later =
-    assert equal (promql matcher-parts "nolabel") null
+def "scope builds metric{block}, a bare block, or empty" [] {
+    assert equal (promql scope "up" ["job=api"]) 'up{job="api"}'
+    assert equal (promql scope null ["job=api"]) '{job="api"}'
+    assert equal (promql scope "job=api" ["env!=dev"]) '{job="api", env!="dev"}'   # a leading matcher folds in
+    assert equal (promql scope "up" []) "up"
+    assert equal (promql scope null []) ""
+    assert equal (promql scope "" []) ""
 }
 
 @test
-def "matchers renders the four kinds, quoted and comma-joined" [] {
-    assert equal (promql matchers ["job=api" "method=GET"] [] ["status=5.."] []) '{job="api", method="GET", status=~"5.."}'
-    assert equal (promql matchers [] [] [] []) ""
-    assert equal (promql matchers [] ["job=api"] [] ["env=dev"]) '{job!="api", env!~"dev"}'
+def "scope errors on a bare non-matcher sibling" [] {
+    assert error { promql scope "up" ["world"] }
 }
 
 @test
-def "matchers escapes quotes and backslashes in values" [] {
-    assert equal (promql matchers ['path=a"b'] [] [] []) '{path="a\"b"}'
+def "split-tokens separates the first operator-free token from the matchers" [] {
+    assert equal (promql split-tokens ["up" "job=api" "status=~5.."]) {metric: up, matchers: ["job=api" "status=~5.."]}
+    assert equal (promql split-tokens ["job=api"]) {metric: null, matchers: ["job=api"]}
+    assert equal (promql split-tokens ["job=api" "up" "env!=dev"]) {metric: up, matchers: ["job=api" "env!=dev"]}
+    assert equal (promql split-tokens []) {metric: null, matchers: []}
+}
+
+@test
+def "split-tokens strips one pair of surrounding quotes" [] {
+    assert equal (promql split-tokens ["'msg=hello world'"]) {metric: null, matchers: ["msg=hello world"]}
+    assert equal (promql split-tokens ['"msg=hello world"']) {metric: null, matchers: ["msg=hello world"]}
+    assert equal (promql split-tokens ["'up"]) {metric: "'up", matchers: []}   # mismatched quotes are left alone
 }
 
 @test

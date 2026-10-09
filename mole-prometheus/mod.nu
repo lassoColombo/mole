@@ -1,9 +1,13 @@
 # mole-prometheus — Prometheus driver plugin (READ-ONLY HTTP API).
 #
 # A PLUGIN (data source): supports the `prometheus` driver, registers itself as a
-# driver, and exposes read-only verbs — `raw-query` / `raw-query-range` / `series` /
-# `labels` / `label-values` / `metrics`. It talks to Prometheus over its HTTP API
-# using Nushell's built-in `http` (no external CLI), with no external dependencies.
+# driver, and exposes read-only verbs — `raw-query` / `raw-query-range` (raw PromQL)
+# and the composing `select` / `series` / `labels` / `label-values` (a metric plus
+# matcher TOKENS, `up job=api status=~5..`, fully tab-completed) / `metrics`. It
+# talks to Prometheus over its HTTP API using Nushell's built-in `http` (no external
+# CLI), with no external dependencies. mole-victoriametrics is its near-twin (same
+# verbs, same token model, same completers); the shared pure pieces — the PromQL
+# builder, the scoping selector, the result typing — live in mole-promql.
 #
 # LAYERING (two files, like the old client+wrapper split):
 #   - client.nu  — GENERATED, do not edit. A lean, typed HTTP client for the
@@ -92,12 +96,57 @@ def pq-catalog-ctx [context: string]: nothing -> record {
   complete catalog-ctx $context "prometheus"
 }
 
+# ---- contextual completion ----------------------------------------------------
+# Every completer resolves the connection / catalog / metric / siblings / window the
+# line targets, then scopes its suggestions. The shared `complete` toolkit does the
+# parsing and NEVER throws, so a Tab never errors; these add the metrics-specific
+# projection on top. The scoping selector itself is `promql scope` and the
+# positional split is `promql split-tokens` — both shared with mole-victoriametrics,
+# whose `vm-*` completers are the twins of these.
+
+# The verb on a completion line (the first known-verb token), so metric recovery can
+# account for `label-values`' leading <label> positional.
+def pq-ctx-verb [context: string]: nothing -> string {
+  let known = [select series labels label-values metrics]
+  $context | split row --regex '\s+' | where {|t| $t in $known } | get -o 0 | default "select"
+}
+
+# The metric already typed on the line: the `--metric` flag if present (how
+# `label-values` names it, so the flag can precede the <label> and scope its
+# completion), else the first operator-free positional (how the metric-first verbs
+# name it; `promql split-tokens` does the split). `label-values` has NO positional
+# metric — its first positional is the <label> — so it never mistakes that for a
+# metric. Null when none is present.
+def pq-ctx-metric [context: string]: nothing -> any {
+  let flagged = (complete flag $context ["--metric" "-M"])
+  if ($flagged | is-not-empty) { return $flagged }
+  if (pq-ctx-verb $context) == "label-values" { return null }
+  promql split-tokens (complete positionals $context) | get metric
+}
+
+# The sibling matcher tokens already typed (the operator-bearing positionals); the
+# metric and any <label> positional are operator-free, so they drop out naturally.
+def pq-ctx-siblings [context: string]: nothing -> list<string> {
+  promql split-tokens (complete positionals $context) | get matchers
+}
+
+# The selector the line implies (metric + siblings), for scoping live lookups.
+def pq-ctx-selector [context: string]: nothing -> string {
+  try { promql scope (pq-ctx-metric $context) (pq-ctx-siblings $context) } catch { "" }
+}
+
+# The {start, end} window implied by the --last/--start/--end flags on the line
+# (absent/unparseable → unbounded), so contextual lookups honor the typed window.
+def pq-range-ctx [context: string]: nothing -> record {
+  let f = (complete range-flags $context)
+  promql resolve-range $f.last $f.start $f.end (date now)
+}
+
+# Metric NAMES from the cached catalog. `pq-expr` starts a raw PromQL expression; the
+# cheapest useful suggestion is a metric name. (Label-name completion is `pq-mlabel`,
+# which scopes to the metric on the line.)
 def "pq-metric" [context: string]: nothing -> list<string> { pq-catalog-ctx $context | get -o metrics | default [] }
-def "pq-label" [context: string]: nothing -> list<string> { pq-catalog-ctx $context | get -o labels | default [] }
-# PromQL is a full expression; the best cheap suggestion is a metric name to start.
 def "pq-expr" [context: string]: nothing -> list<string> { pq-metric $context }
-# A series selector usually starts with a metric name.
-def "pq-selector" [context: string]: nothing -> list<string> { pq-metric $context }
 
 # Static PromQL function / aggregation / range-window completers (no server call);
 # the base vocab lives in the library. Prometheus is plain PromQL — no extras.
@@ -105,42 +154,64 @@ def "pq-func" [context: string]: nothing -> list<string> { promql funcs }
 def "pq-agg" [context: string]: nothing -> list<string> { promql aggs }
 def "pq-window" [context: string]: nothing -> list<string> { promql windows }
 
-# Metric-scoped label NAMES for completion. With no metric (or no connection) on the
-# line there is nothing to scope by, so the cached global label names are the start.
-# With a metric, a live `/labels?match[]=<metric>` (short timeout) is AUTHORITATIVE:
-# empty or errored → [] — never the global catalog, which would offer labels the
-# metric does not have (the same rule mole-victoriametrics applies).
+# Metric-scoped label NAMES for completion. `__name__` is dropped — the metric
+# positional is how you pin it.
+#
+# With NO metric on the line, there is nothing to scope by, so the global cached
+# label names are the reasonable start. With a metric present, this is a LIVE
+# `/labels?match[]=<selector>` scoped to the metric + sibling matchers + the typed
+# window (short timeout), and the result is authoritative: a successful-but-EMPTY
+# result means the metric has no such labels (or doesn't exist), and an ERROR/timeout
+# means we can't tell — either way it returns EMPTY rather than the global catalog,
+# which would offer labels the metric does not have. (The global set is misleading
+# here precisely because it is NOT scoped; a Tab that shows nothing is honest.)
 def "pq-mlabel" [context: string]: nothing -> list<string> {
   let conf = (complete conn-ctx $context "prometheus")
-  let metric = (complete positionals $context | get -o 0)
-  if ($metric | is-empty) or ($conf | is-empty) { return (pq-catalog-ctx $context | get -o labels | default []) }
+  let sel = (pq-ctx-selector $context)
+  if ($conf | is-empty) or ($sel | is-empty) {
+    return (pq-catalog-ctx $context | get -o labels | default [] | where {|l| $l != "__name__" })
+  }
+  let r = (pq-range-ctx $context)
   try {
-    (client labels get --qp-match [$metric]
+    (client labels get --qp-match [$sel] --start (promql ts $r.start) --end (promql ts $r.end)
       --base-url (pq-base $conf) --token (pq-token $conf) --insecure=(pq-insecure $conf) --max-time 3sec
-    | get -o data | default [])
+      | get -o data | default [] | where {|l| $l != "__name__" })
   } catch { [] }
 }
 
-# Context-aware `label=value` matcher completion (models the old vlogs-eq). Before
-# the `=`: metric-scoped label names, each with `=` appended. After the `=`: that
-# label's live values (scoped to the metric, short timeout), as `label=value`.
-# Silent on failure so a Tab never hangs the REPL.
-def "pq-eq" [context: string]: nothing -> list<string> {
-  let bare = (complete token $context | str replace --regex '^\[' '' | str replace --regex '^"' '')
-  if ($bare | str contains "=") {
-    let label = ($bare | split row --number 2 "=" | first)
-    let metric = (complete positionals $context | get -o 0)
+# Rest-positional completer for matcher tokens. Two stages on the token under the
+# cursor, both contextual to the metric + sibling matchers + window on the line:
+#   - no operator → field stage: `label=` for each metric-scoped label (pq-mlabel).
+#   - `label<op>…` → value stage: a LIVE `label-values` for that label, scoped by the
+#      sibling selector + window, returning `label<op>value` (the operator the user
+#      chose is preserved). The stage branches on `matcher-token` (never `str contains
+#      "="`, which `!=`/`=~`/`!~` all satisfy). Best-effort — errors → no candidates.
+def "pq-matcher" [context: string]: nothing -> list<string> {
+  let tok = (complete token $context)
+  let parsed = (promql matcher-token $tok)
+  if ($parsed == null) {
+    (pq-mlabel $context) | each {|l| $l + "=" }
+  } else {
     let conf = (complete conn-ctx $context "prometheus")
     if ($conf | is-empty) { return [] }
+    let sel = (pq-ctx-selector $context)
+    let match = (if ($sel | is-empty) { [] } else { [$sel] })
+    let r = (pq-range-ctx $context)
     try {
-      let m = if ($metric | is-empty) { [] } else { [$metric] }
-      (client label-values get $label --qp-match $m
+      (client label-values get $parsed.label --qp-match $match
+        --start (promql ts $r.start) --end (promql ts $r.end)
         --base-url (pq-base $conf) --token (pq-token $conf) --insecure=(pq-insecure $conf) --max-time 3sec
-      | get -o data | default [] | each {|v| $label + "=" + $v })
+      | get -o data | default []
+      | each {|v| $parsed.label + $parsed.op + $v })
     } catch { [] }
-  } else {
-    (pq-mlabel $context) | each {|l| $l + "=" }
   }
+}
+
+# Completer for the comma-separated `--by`/`--without`: metric-scoped label names,
+# re-prepending the already-typed comma items so accepting a candidate EXTENDS the
+# list (`job,me⇥` → `job,method`).
+def "pq-by" [context: string]: nothing -> list<string> {
+  complete csv-extend $context (pq-mlabel $context)
 }
 
 # ---- user verbs ---------------------------------------------------------------
@@ -223,40 +294,42 @@ export def "raw-query-range" [
   if $raw { $data } else { promql normalize $data }
 }
 
-# Compose and run a PromQL query from completion-aware flags — the ergonomic
+# Compose and run a PromQL query from completion-aware tokens — the ergonomic
 # alternative to writing raw PromQL in `raw-query`.
 #
 # Assembles `[agg [by/without (labels)]] ( [func] ( metric{matchers}[range] ) )`
-# from the flags, then runs it: INSTANT by default, or as a RANGE query when any
-# of `--last`/`--start`/`--end` is given. `--dry-run` returns a `{connection, query}` record — the resolved
-# connection (secrets dropped) and the assembled PromQL — without running. Completion is the point —
-# `<metric>` completes from the catalog; `--eq`/`--ne`/`--re`/`--nre` complete the
-# label name and, after `=`, that label's live values SCOPED TO THE METRIC;
-# `--func`/`--agg` complete from the PromQL function/aggregation sets; `--by`/
-# `--without` complete the metric's labels. Matcher tokens are `label=value` (the
-# value is quoted for you); use `--re`/`--nre` for regex values. Results are typed
-# exactly as `raw-query`/`raw-query-range`.
+# from the metric, the matcher tokens and the flags, then runs it: INSTANT by
+# default, or as a RANGE query when any of `--last`/`--start`/`--end` is given.
+# `--dry-run` returns a `{connection, query}` record — the resolved connection
+# (secrets dropped) and the assembled PromQL — without running.
+#
+# Completion is the point. `<metric>` completes from the catalog; each `...matchers`
+# token completes the label name first, then — after an operator — that label's LIVE
+# values, SCOPED to the metric and the sibling matchers already typed (and the time
+# window). A matcher token is `label=value` (→ `label="value"`), `label!=value`,
+# `label=~value` (regex) or `label!~value`; the value is quoted for you, so type
+# `code=~5..`, NOT `code=~"5.."`, and single-quote a value with spaces
+# (`'msg=hello world'`). `--func`/`--agg` complete from the PromQL
+# function/aggregation sets; `--by`/`--without` are comma-separated lists of the
+# metric's labels. Results are typed exactly as `raw-query`/`raw-query-range`.
 @category mole-prometheus
 @example "filter a metric by labels (instant)" {
-  mole-prometheus select http_requests_total --eq [job=api method=GET] --dry-run | get query
+  mole-prometheus select http_requests_total job=api method=GET --dry-run | get query
 } --result 'http_requests_total{job="api", method="GET"}'
 @example "a rate aggregated by job (range window applied at run time)" {
-  mole-prometheus select http_requests_total --eq [job=api] --re [status=5..] --range 5m --func rate --agg sum --by [job] --last 1hr --step 1min --dry-run | get query
+  mole-prometheus select http_requests_total job=api status=~5.. --range 5m --func rate --agg sum --by job --last 1hr --step 1min --dry-run | get query
 } --result 'sum by (job) (rate(http_requests_total{job="api", status=~"5.."}[5m]))'
 @example "run it for real against a connection" {
-  mole-prometheus select up --eq [job=prometheus] -c prometheus-local-dev
+  mole-prometheus select up job=prometheus -c prometheus-local-dev
 }
 export def "select" [
   metric: string@"pq-metric"                       # metric name (completes from the catalog)
-  --eq(-e): list<string>@"pq-eq"                   # equality matchers:   label=value → label="value"
-  --ne: list<string>@"pq-eq"                       # inequality matchers: label=value → label!="value"
-  --re: list<string>@"pq-eq"                       # regex matchers:      label=value → label=~"value"
-  --nre: list<string>@"pq-eq"                      # negative-regex:      label=value → label!~"value"
+  ...matchers: string@"pq-matcher"                 # label matchers: label=value | label!=value | label=~value | label!~value
   --range(-r): string@"pq-window"                  # range-vector window, e.g. 5m → [5m] (for rate/increase/…)
   --func: string@"pq-func"                         # wrap the selector in this function (rate, increase, …)
   --agg: string@"pq-agg"                           # aggregate with this operator (sum, avg, topk, …)
-  --by: list<string>@"pq-mlabel"                   # aggregation grouping: by (labels) — needs --agg
-  --without: list<string>@"pq-mlabel"              # aggregation grouping: without (labels) — needs --agg
+  --by: string@"pq-by"                             # aggregation grouping: by (labels), comma-separated — needs --agg
+  --without: string@"pq-by"                        # aggregation grouping: without (labels), comma-separated — needs --agg
   --time(-t): datetime                             # instant to evaluate at (default: server now)
   --last(-L): duration                             # range mode: window ending now
   --start(-a): datetime                            # range mode: window start
@@ -271,6 +344,11 @@ export def "select" [
   --full(-F)                                        # return the whole {status, data, …} envelope
   --dry-run(-n)                                    # return a {connection, query} record instead of running
 ] {
+  if ((promql matcher-token $metric) != null) {
+    error make {msg: "select: the first argument must be a metric name, not a matcher"}
+  }
+  let by = (complete csv $by)
+  let without = (complete csv $without)
   if (($by | is-not-empty) or ($without | is-not-empty)) and ($agg | is-empty) {
     error make {msg: "select: --by/--without require --agg"}
   }
@@ -278,12 +356,12 @@ export def "select" [
     error make {msg: "select: --by and --without are mutually exclusive"}
   }
   let expr = (promql build $metric
-    --matchers (promql matchers ($eq | default []) ($ne | default []) ($re | default []) ($nre | default []))
+    --matchers (promql matchers-tokens $matchers)
     --range ($range | default "")
     --func ($func | default "")
     --agg ($agg | default "")
-    --by ($by | default [])
-    --without ($without | default []))
+    --by $by
+    --without $without)
   if $dry_run { return {connection: (pq-conf $connection $url $token $set | conn redact), query: $expr} }
   if (($last | is-not-empty) or ($start | is-not-empty) or ($end | is-not-empty)) {
     raw-query-range $expr --last $last --start $start --end $end --step $step --limit $limit --connection $connection --url $url --token $token --set $set --raw=$raw --full=$full
@@ -292,17 +370,20 @@ export def "select" [
   }
 }
 
-# List the series matching one or more selectors.
+# List the series matching a selector.
 #
-# Each positional is a series selector (the `match[]` argument), e.g.
-# `'up{job="api"}'`; at least one is required. Returns one row per series — a
-# table of its label sets. The window (`--last` / `--start` / `--end`) is optional
-# and scopes the lookup; omit it to search all time.
+# Builds ONE selector from `<metric>` + matcher tokens (`series up job=api
+# status=~5..`), exactly like `select`, and returns one row per matching series — a
+# table of its label sets. A metric that is itself a matcher (`series job=api`)
+# becomes a bare `{job="api"}` selector. The window (`--last` / `--start` / `--end`)
+# is optional and scopes the lookup; omit it to search all time.
 @category mole-prometheus
-@example "series for a metric" { mole-prometheus series "up" }
-@example "series across two selectors in the last day" { mole-prometheus series 'up{job="api"}' 'process_start_time_seconds' --last 1day }
+@example "series for a metric" { mole-prometheus series up }
+@example "series for a filtered selector in the last day" { mole-prometheus series up job=api --last 1day }
+@example "inspect the composed selector without running" { mole-prometheus series up job=api --dry-run | get query } --result 'up{job="api"}'
 export def "series" [
-  ...match: string@"pq-selector"                   # series selector(s) — at least one required
+  metric?: string@"pq-metric"                      # metric name (completes from the catalog)
+  ...matchers: string@"pq-matcher"                 # label matchers (AND-joined into the selector)
   --last(-L): duration                             # scope to a window ending now
   --start(-a): datetime                            # window start
   --end(-b): datetime                              # window end
@@ -311,22 +392,31 @@ export def "series" [
   --url: string
   --token: string
   --set: record = {}
+  --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
-  if ($match | is-empty) { error make {msg: "series: at least one selector is required"} }
+  let sel = (promql scope $metric $matchers)
+  if ($sel | is-empty) { error make {msg: "series: a metric or at least one matcher is required"} }
   let conf = (pq-conf $connection $url $token $set)
+  if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let range = (promql resolve-range $last $start $end (date now))
-  (client series get --qp-match $match --start (promql ts $range.start) --end (promql ts $range.end) --limit $limit
+  (client series get --qp-match [$sel] --start (promql ts $range.start) --end (promql ts $range.end) --limit $limit
     --base-url (pq-base $conf) --token (pq-token $conf) --insecure=(pq-insecure $conf))
   | get -o data | default []
   | each {|r| promql relabel $r }   # surface __name__ as `metric`, as raw-query/raw-query-range do
 }
 
-# List label names present in the data (optionally scoped by selectors/window).
+# List label names present in the data (optionally scoped by a selector/window).
+#
+# Scope with `[metric]` + matcher tokens (`labels up job=api`), exactly like
+# `select`; with no arguments it returns every label name. The window scopes the
+# lookup.
 @category mole-prometheus
 @example "all label names" { mole-prometheus labels }
-@example "label names used by a selector" { mole-prometheus labels --match ['up'] --last 1hr }
+@example "label names used by a selector" { mole-prometheus labels up --last 1hr }
+@example "inspect the composed selector without running" { mole-prometheus labels up job=api --dry-run | get query } --result 'up{job="api"}'
 export def "labels" [
-  --match(-m): list<string>@"pq-selector"          # series selector(s) to scope the label names
+  metric?: string@"pq-metric"                      # metric to scope by (completes from the catalog)
+  ...matchers: string@"pq-matcher"                 # label matchers to further scope the label names
   --last(-L): duration
   --start(-a): datetime
   --end(-b): datetime
@@ -335,21 +425,35 @@ export def "labels" [
   --url: string
   --token: string
   --set: record = {}
+  --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (pq-conf $connection $url $token $set)
+  let sel = (promql scope $metric $matchers)
+  if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let range = (promql resolve-range $last $start $end (date now))
+  let match = (if ($sel | is-empty) { null } else { [$sel] })
   (client labels get --qp-match $match --start (promql ts $range.start) --end (promql ts $range.end) --limit $limit
     --base-url (pq-base $conf) --token (pq-token $conf) --insecure=(pq-insecure $conf))
   | get -o data | default []
 }
 
-# List the distinct values of a label (optionally scoped by selectors/window).
+# List the distinct values of a label (optionally scoped by a metric/matchers/window).
+#
+# `--metric M` scopes the lookup — and, typed FIRST, makes the <label> itself
+# complete to only M's labels, so you can tab through a metric's labels while
+# exploring (`label-values --metric up ⇥`). Add matcher tokens to narrow further
+# (`label-values --metric up instance job=api`), like `select`. `--limit` caps the
+# values. With no `--metric`, <label> completes from the global catalog and the
+# values span every series.
 @category mole-prometheus
 @example "every job value" { mole-prometheus label-values job }
-@example "instance values for one job" { mole-prometheus label-values instance --match ['up{job="api"}'] }
+@example "explore a metric's labels, then a label's values" { mole-prometheus label-values --metric up instance }
+@example "values within a filtered selector" { mole-prometheus label-values --metric up instance job=api }
+@example "inspect the composed selector without running" { mole-prometheus label-values instance --metric up job=api --dry-run | get query } --result 'up{job="api"}'
 export def "label-values" [
-  label: string@"pq-label"                         # the label name to enumerate
-  --match(-m): list<string>@"pq-selector"          # series selector(s) to scope the values
+  label: string@"pq-mlabel"                        # the label name to enumerate (completes to --metric's labels when given)
+  --metric(-M): string@"pq-metric"                 # metric to scope by (completes from the catalog)
+  ...matchers: string@"pq-matcher"                 # label matchers to further scope the values
   --last(-L): duration
   --start(-a): datetime
   --end(-b): datetime
@@ -358,9 +462,13 @@ export def "label-values" [
   --url: string
   --token: string
   --set: record = {}
+  --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (pq-conf $connection $url $token $set)
+  let sel = (promql scope $metric $matchers)
+  if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let range = (promql resolve-range $last $start $end (date now))
+  let match = (if ($sel | is-empty) { null } else { [$sel] })
   (client label-values get $label --qp-match $match --start (promql ts $range.start) --end (promql ts $range.end) --limit $limit
     --base-url (pq-base $conf) --token (pq-token $conf) --insecure=(pq-insecure $conf))
   | get -o data | default []
