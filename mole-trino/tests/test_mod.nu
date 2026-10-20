@@ -39,7 +39,7 @@ def seed-schema [] {
 def "dry-run select assembly" [] {
   fixture
   assert equal (mole-trino select --from customer -c trino-local-dev --dry-run | get query) "SELECT * FROM customer"
-  assert equal (mole-trino select custkey name acctbal --from customer --where "acctbal > 5000" --sort-by acctbal:desc --limit 5 -c trino-local-dev --dry-run | get query) "SELECT custkey, name, acctbal FROM customer WHERE acctbal > 5000 ORDER BY acctbal DESC LIMIT 5"
+  assert equal (mole-trino select custkey name acctbal --from customer --where-sql "acctbal > 5000" --sort-by acctbal:desc --limit 5 -c trino-local-dev --dry-run | get query) "SELECT custkey, name, acctbal FROM customer WHERE acctbal > 5000 ORDER BY acctbal DESC LIMIT 5"
   assert equal (mole-trino select mktsegment --distinct --from customer -c trino-local-dev --dry-run | get query) "SELECT DISTINCT mktsegment FROM customer"
   # Trino's grammar is `[OFFSET n] [LIMIT n]` — `LIMIT 5 OFFSET 10` is a server-side syntax error
   assert equal (mole-trino select --from customer --sort-by custkey --limit 5 --offset 10 -c trino-local-dev --dry-run | get query) "SELECT * FROM customer ORDER BY custkey OFFSET 10 LIMIT 5"
@@ -71,10 +71,13 @@ def "dry-run stats grand total distinct count and the trino dialect aggregates" 
 }
 
 @test
-def "dry-run where token-list raw fallback IN LIKE NULL and the regexp_like operator" [] {
+def "dry-run where token-list, raw --where-sql, IN LIKE NULL and the regexp_like operator" [] {
   fixture
   assert equal (mole-trino select custkey name --from customer --where mktsegment=BUILDING,acctbal>=5000 -c trino-local-dev --dry-run | get query) "SELECT custkey, name FROM customer WHERE mktsegment = 'BUILDING' AND acctbal >= 5000"
-  assert equal (mole-trino select --from customer --where "acctbal > 0 AND mktsegment <> 'AUTOMOBILE'" -c trino-local-dev --dry-run | get query) "SELECT * FROM customer WHERE acctbal > 0 AND mktsegment <> 'AUTOMOBILE'"
+  assert equal (mole-trino select --from customer --where-sql "acctbal > 0 AND mktsegment <> 'AUTOMOBILE'" -c trino-local-dev --dry-run | get query) "SELECT * FROM customer WHERE acctbal > 0 AND mktsegment <> 'AUTOMOBILE'"
+  assert error { mole-trino select --from customer --where "a=1 AND b=2" -c trino-local-dev --dry-run }   # raw SQL in the token slot errors instead of rendering a = '1 AND b=2'
+  assert error { mole-trino select --from customer --where "id = 42" -c trino-local-dev --dry-run }
+  assert equal (mole-trino select --from customer --where status=active --where-sql "total > 0 OR legacy" -c trino-local-dev --dry-run | get query) "SELECT * FROM customer WHERE (status = 'active') AND (total > 0 OR legacy)"
   assert equal (mole-trino select --from customer --where mktsegment=in:BUILDING,MACHINERY,name~%Corp%,phone=null -c trino-local-dev --dry-run | get query) "SELECT * FROM customer WHERE mktsegment IN ('BUILDING', 'MACHINERY') AND name LIKE '%Corp%' AND phone IS NULL"
   assert equal (mole-trino select --from customer --where "name=~^A" -c trino-local-dev --dry-run | get query) "SELECT * FROM customer WHERE regexp_like(name, '^A')"
 }
@@ -82,11 +85,11 @@ def "dry-run where token-list raw fallback IN LIKE NULL and the regexp_like oper
 @test
 def "dry-run update and delete assembly" [] {
   fixture
-  assert equal (mole-trino update users "status = 'inactive'" --where "id = 5" -c trino-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE id = 5"
-  assert equal (mole-trino update t "a = 1" "b = 2" --where "id = 5" -c trino-local-dev --dry-run | get query) "UPDATE t SET a = 1, b = 2 WHERE id = 5"
+  assert equal (mole-trino update users "status = 'inactive'" --where-sql "id = 5" -c trino-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE id = 5"
+  assert equal (mole-trino update t "a = 1" "b = 2" --where-sql "id = 5" -c trino-local-dev --dry-run | get query) "UPDATE t SET a = 1, b = 2 WHERE id = 5"
   assert equal (mole-trino update users "archived = true" --all -c trino-local-dev --dry-run | get query) "UPDATE users SET archived = true"
   assert equal (mole-trino delete sessions --where user_id=7 -c trino-local-dev --dry-run | get query) "DELETE FROM sessions WHERE user_id = 7"
-  assert equal (mole-trino delete sessions --where "expires_at < now()" -c trino-local-dev --dry-run | get query) "DELETE FROM sessions WHERE expires_at < now()"
+  assert equal (mole-trino delete sessions --where-sql "expires_at < now()" -c trino-local-dev --dry-run | get query) "DELETE FROM sessions WHERE expires_at < now()"
   assert equal (mole-trino delete staging_rows --all -c trino-local-dev --dry-run | get query) "DELETE FROM staging_rows"
 }
 
@@ -104,8 +107,13 @@ def "connection is redacted and tagged and other drivers are rejected" [] {
 def "guards error" [] {
   fixture
   assert error { mole-trino select -c trino-local-dev --dry-run }
+  assert error { mole-trino select --from t --limit -1 -c trino-local-dev --dry-run }           # negative paging is rejected before the round trip
+  assert error { mole-trino select --from t --where "a==1" -c trino-local-dev --dry-run }      # typo'd operator is an error, not a literal
   assert error { mole-trino update t "x = 1" -c trino-local-dev --dry-run }
-  assert error { mole-trino update t --where "id = 1" -c trino-local-dev --dry-run }
+  assert error { mole-trino update t "x = 1" --where " " -c trino-local-dev --dry-run }   # a blank --where is no filter
+  assert error { mole-trino delete t --where "," -c trino-local-dev --dry-run }            # nor is a bare comma
+  assert error { mole-trino delete t --where-sql " " -c trino-local-dev --dry-run }       # nor a blank raw filter
+  assert error { mole-trino update t --where-sql "id = 1" -c trino-local-dev --dry-run }
   assert error { mole-trino delete t -c trino-local-dev --dry-run }
   assert error { mole-trino schema --include a --exclude b -c trino-local-dev }
 }

@@ -163,7 +163,8 @@ export def "build-delete" [
 # quotes), Postgres/Trino/DuckDB take it literally. Pagination (`LIMIT`) and the rest of
 # the SELECT frame are NOT built here: the plugins render their own, as they already do
 # for `select`. Anything the grammar can't express (an expression RHS, `OR`, a
-# sub-select) falls through `build-where`'s dual-mode to raw SQL.
+# sub-select) goes in the sibling `--where-sql` flag as raw SQL; `build-where`
+# AND-joins the two. A `--where` item that isn't a token is an error, never a guess.
 
 # ---- operator table (the injected WHERE-predicate vocabulary) ------------------
 # The set of comparison operators a `col<op>value` token may use is DIALECT-INJECTED:
@@ -192,6 +193,7 @@ export def "render-eq" [neg: bool, col: string, value: string, lit: closure]: no
   if (($value | str lowercase) == "null") { return ($col + (if $neg { " IS NOT NULL" } else { " IS NULL" })) }
   if ($value | str starts-with "in:") {
     let items = ($value | str replace --regex '^in:' '' | split row "," | where {|x| $x | is-not-empty } | each {|x| do $lit ($x | str trim) })
+    if ($items | is-empty) { error make {msg: $"empty in: list for '($col)' — give at least one value, e.g. ($col)=in:a,b"} }
     return ($col + (if $neg { " NOT IN (" } else { " IN (" }) + ($items | str join ", ") + ")")
   }
   $col + (if $neg { " <> " } else { " = " }) + (do $lit $value)
@@ -263,22 +265,35 @@ export def "predicate-token" [
 }
 
 # A value token → a SQL string literal, quoted by SHAPE: `true`/`false` and a plain
-# number stay bare; everything else is single-quoted with `'` doubled (`''`, which
-# every supported dialect accepts). The one dialect-varying bit — whether `\` is an
-# escape character inside a string literal — is INJECTED via `dialect`: pass
-# `{backslash_escapes: true}` (MySQL/MariaDB) to also double `\`→`\\`; an empty/absent
-# record (Postgres/Trino/DuckDB) leaves `\` literal. This matters for correctness AND
-# safety — on MySQL an un-escaped `\'` would break out of the quotes.
+# number stay bare (`30`, `-3.5`, `+5`, `.5`, `1e5`, `2.5E-3` — the numeric literal
+# forms every supported dialect reads bare) — except a leading-zero integer (`007`, a
+# zip or code), which is an identifier and stays quoted, as in mongo's `coerce-scalar`; everything else is
+# single-quoted with `'` doubled (`''`, which every supported dialect accepts). The
+# one dialect-varying bit — whether `\` is an escape character inside a string
+# literal — is INJECTED via `dialect`: pass `{backslash_escapes: true}` (MySQL/MariaDB)
+# to also double `\`→`\\`; an empty/absent record (Postgres/Trino/DuckDB) leaves `\`
+# literal. This matters for correctness AND safety — on MySQL an un-escaped `\'`
+# would break out of the quotes.
 @category mole-sql
 @example "a word is quoted" { sql sql-literal "active" } --result "'active'"
 @example "a number stays bare" { sql sql-literal "30" } --result "30"
+@example "a leading-zero code stays quoted" { sql sql-literal "01234" } --result "'01234'"
+@example "scientific notation is a number" { sql sql-literal "1e5" } --result "1e5"
 @example "an embedded quote is doubled (every dialect)" { sql sql-literal "O'Brien" } --result "'O''Brien'"
 export def "sql-literal" [
   value: string
   dialect: record = {}   # {backslash_escapes: bool}; injected by the plugin (default = ANSI, `\` literal)
 ]: nothing -> string {
   if ($value | str lowercase) in ["true" "false"] { return ($value | str lowercase) }
-  if ($value =~ '^-?[0-9]+(\.[0-9]+)?$') { return $value }
+  if ($value =~ '^[+-]?([0-9]+(\.[0-9]+)?|\.[0-9]+)([eE][+-]?[0-9]+)?$') and not ($value =~ '^[+-]?0[0-9]') { return $value }
+  str-literal $value $dialect
+}
+
+# A value → a SQL STRING literal regardless of shape (`30` → `'30'`): the quoting half
+# of `sql-literal`, used on its own for a value the user quoted to mean literally.
+@category mole-sql
+@example "a number is still quoted" { sql str-literal "30" } --result "'30'"
+export def "str-literal" [value: string, dialect: record = {}]: nothing -> string {
   # `'`→`''` is universal; `\`→`\\` only where the dialect treats `\` as an escape
   # char (do it FIRST, so the quotes we add aren't themselves backslash-escaped).
   let esc = if ($dialect | get -o backslash_escapes | default false) {
@@ -297,9 +312,19 @@ export def "sql-literal" [
 # string-escaping, so operators never re-implement quoting. `--ops` defaults to
 # `ansi-ops` (`= != >= <= > < ~ !~`, with the `=null`→IS NULL and `=in:`→IN forms).
 # `dialect` stays the 2nd positional for back-compat.
+#
+# The VALUE is a literal by definition. Three rules keep that honest: a value wrapped in
+# matching quotes (`status='active'`, `zip="01234"`) is unwrapped and ALWAYS a string
+# literal, whatever its shape; an unquoted value holding a standalone `AND`/`OR` is
+# rejected — it is a whole predicate list pasted into one token (`a=1 AND b=2`), and
+# rendering it as `a = '1 AND b=2'` would run a wrong query without a word; and an
+# unquoted value STARTING with an operator character (`a==1`, `a=>1`, `a!==1`) is
+# rejected too — that is a typo'd or reordered operator, and `a = '=1'` would run and
+# return nothing. Quote the value to mean it literally (`a='=1'`).
 @category mole-sql
 @example "an equality becomes a quoted comparison" { sql render-predicate {col: status, op: "=", value: active} } --result "status = 'active'"
 @example "a numeric comparison stays bare" { sql render-predicate {col: age, op: ">=", value: "30"} } --result "age >= 30"
+@example "a quoted value is a string literal whatever its shape" { sql render-predicate {col: zip, op: "=", value: "'30'"} } --result "zip = '30'"
 @example "null becomes IS NULL" { sql render-predicate {col: deleted, op: "=", value: "null"} } --result "deleted IS NULL"
 @example "an in: value becomes an IN list" { sql render-predicate {col: role, op: "=", value: "in:admin,ops"} } --result "role IN ('admin', 'ops')"
 @example "a tilde becomes LIKE" { sql render-predicate {col: name, op: "~", value: "%acme%"} } --result "name LIKE '%acme%'"
@@ -309,65 +334,58 @@ export def "render-predicate" [
   --ops: list = []       # injected operator table [{token, desc, render}]; default → ansi-ops
 ]: nothing -> string {
   let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
-  let lit = {|v| sql-literal $v $dialect }
-  let spec = ($ops | where token == $pred.op | first)
-  do $spec.render $pred.col ($pred.value | into string) $lit
-}
-
-# ---- WHERE clause: parse / render / dual-mode build --------------------------
-# The `--where` flag is the single home for predicates on select/stats/update/delete.
-# Its value is EITHER a completable `col<op>value` token-list OR raw SQL, decided by
-# whether it parses (below). A token-list is comma-separated; an `in:` list keeps its
-# own commas, so `split row ","` alone would shatter `role=in:admin,ops` — `coalesce-
-# preds` folds an operator-LESS item back onto the preceding predicate to heal that.
-
-# Fold a comma-split back into predicate strings: an item that begins a `col<op>…`
-# token starts a new predicate; an operator-less item is an in:-list continuation and
-# re-joins (with its comma) to the previous one. A LEADING operator-less item ⇒ null
-# (the value isn't a token-list — it's raw SQL).
-def "coalesce-preds" [items: list<string>, ops: list]: nothing -> any {
-  mut out = []
-  for it in $items {
-    if ((predicate-token $it --ops $ops) != null) {
-      $out = ($out | append $it)
-    } else if ($out | is-empty) {
-      return null
-    } else {
-      # in:-list continuation: re-join to the predicate being built
-      $out = (($out | drop 1) | append (($out | last) + "," + $it))
-    }
+  let v = ($pred.value | into string)
+  let q = ($v | str substring 0..0)
+  let quoted = ((($v | str length) >= 2) and ($q in ['"' "'"]) and ($v | str ends-with $q))
+  if (not $quoted) and ($v =~ '(?i)\s(and|or)\s') {
+    error make {msg: $"'($pred.col)($pred.op)($v)' reads like raw SQL — put it in --where-sql, or quote the value to mean it literally"}
   }
-  $out
+  if (not $quoted) and ($v =~ '^[=<>~!]') {
+    error make {msg: $"'($pred.col)($pred.op)($v)': the value starts with an operator character — check the operator \(did you mean ($pred.col)>=…?\), or quote the value to mean it literally"}
+  }
+  let value = (if $quoted { $v | str substring 1..<(($v | str length) - 1) } else { $v })
+  let lit = (if $quoted { {|x| str-literal $x $dialect } } else { {|x| sql-literal $x $dialect } })
+  let spec = ($ops | where token == $pred.op | first)
+  do $spec.render $pred.col $value $lit
 }
 
-# Dual-mode discriminator: parse a `--where` VALUE as a comma-list of col<op>value
-# tokens (folding in:-list continuations). Returns the parsed predicate records when
-# EVERY item parses, `[]` when empty, or null when it is NOT a clean token-list (⇒ the
-# caller renders it as raw SQL). Because `predicate-token` anchors the operator right
-# after the column, idiomatic raw SQL (spaced operators, parens, functions) fails here
-# and falls through to raw — while tight tokens (`status=active,age>=30`) parse.
+# ---- WHERE clause: token-list + raw SQL ---------------------------------------
+# A verb takes its filter through TWO flags, one language each: `--where` is a
+# comma-separated, completable `col<op>value` token-list; `--where-sql` is raw SQL,
+# verbatim. Nothing guesses between them — a `--where` item that isn't a token is an
+# ERROR (a guess once turned `a=1 AND b=2` into `a = '1 AND b=2'` and ran it). Both
+# given ⇒ `(tokens) AND (raw)`. An `in:` list keeps its own commas, so the comma-split
+# folds an operator-less item back onto a preceding `in:` predicate.
+
+# Parse a `--where` VALUE into predicate records. Items are trimmed and blank ones (a
+# trailing or doubled comma) dropped; `[]` when nothing is left. Errors, naming the
+# item, on anything that is not a `col<op>value` token — including raw SQL (`a = 1`,
+# `a=1 AND b=2`), which belongs in `--where-sql`.
 @category mole-sql
 @example "a token-list parses to predicate records" {
-  sql parse-where "status=active,age>=30"
+  sql parse-where "status=active, age>=30"
 } --result [{col: status, op: "=", value: active}, {col: age, op: ">=", value: "30"}]
 @example "an in: list survives the comma-split as one predicate" {
   sql parse-where "role=in:admin,ops"
 } --result [{col: role, op: "=", value: "in:admin,ops"}]
-@example "raw SQL (spaced operator) is not a token-list" {
-  sql parse-where "status = 'active' AND age > 5"
-} --result null
-export def "parse-where" [value: string, --ops: list = []]: nothing -> any {
+export def "parse-where" [value: string, --ops: list = []]: nothing -> list<any> {
   let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
-  if ($value | str trim | is-empty) { return [] }
-  let coalesced = (coalesce-preds ($value | split row ",") $ops)
-  if ($coalesced == null) { return null }
-  let parsed = ($coalesced | each {|it| predicate-token $it --ops $ops })
-  if ($parsed | any {|p| $p == null }) { null } else { $parsed }
+  mut out = []
+  for it in ($value | split row "," | str trim | where {|x| $x | is-not-empty }) {
+    if ((predicate-token $it --ops $ops) != null) {
+      $out = ($out | append $it)
+    } else if ($out | is-not-empty) and ((predicate-token ($out | last) --ops $ops).value | str starts-with "in:") {
+      $out = (($out | drop 1) | append (($out | last) + "," + $it))   # in:-list continuation
+    } else {
+      error make {msg: $"not a --where token: '($it)' — use col<op>value, e.g. status=active or age>=30; raw SQL goes in --where-sql"}
+    }
+  }
+  $out | each {|it| predicate-token $it --ops $ops }
 }
 
-# AND-join rendered predicate records into a WHERE body (null when empty) — the render
-# half of the dual-mode builder. The `--where` completer reuses it to scope its live
-# distinct-probe to the sibling predicates already committed on the line.
+# AND-join rendered predicate records into a WHERE body (null when empty). The
+# `--where` completer reuses it to scope its live distinct-probe to the sibling
+# predicates already committed on the line.
 @category mole-sql
 @example "predicates AND-join into a WHERE body" {
   sql render-where [{col: status, op: "=", value: active}, {col: age, op: ">=", value: "30"}]
@@ -382,43 +400,48 @@ export def "render-where" [
   if ($composed | is-empty) { null } else { $composed | str join " AND " }
 }
 
-# Build a WHERE body from a `--where` flag VALUE (dual-mode): when it parses as a
-# col<op>value token-list, render it per-dialect (structured); otherwise return it
-# VERBATIM (raw SQL fallback). Null when empty. The caller wraps `WHERE (<body>)`.
+# The WHERE body (no keyword) from a verb's two filter flags: the `--where` token-list
+# rendered per-dialect, the `--where-sql` text verbatim, `(a) AND (b)` when both are
+# given, null when neither says anything. `update`/`delete` hand it to their builders.
 @category mole-sql
-@example "a structured token-list renders per-dialect" {
+@example "a token-list renders per-dialect" {
   sql build-where "status=active,age>=30"
 } --result "status = 'active' AND age >= 30"
-@example "an in: list renders as IN" {
-  sql build-where "role=in:admin,ops"
-} --result "role IN ('admin', 'ops')"
-@example "raw SQL falls through verbatim" {
-  sql build-where "created_at > now() - interval '1 day'"
+@example "raw SQL passes through verbatim" {
+  sql build-where null "created_at > now() - interval '1 day'"
 } --result "created_at > now() - interval '1 day'"
+@example "both AND-join, each parenthesized" {
+  sql build-where "status=active" "a > 1 OR b"
+} --result "(status = 'active') AND (a > 1 OR b)"
 export def "build-where" [
-  value: string
+  tokens: any = null      # the `--where` value: col<op>value token-list (null/"" → none)
+  raw: any = null         # the `--where-sql` value: raw SQL, verbatim (null/"" → none)
   --dialect: record = {}  # {backslash_escapes: bool}, forwarded to `render-predicate` → `sql-literal`
   --ops: list = []        # injected operator table; default → ansi-ops
 ]: nothing -> any {
   let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
-  if ($value | str trim | is-empty) { return null }
-  let preds = (parse-where $value --ops $ops)
-  if ($preds == null) { return $value }   # not a token-list ⇒ raw SQL, verbatim
-  render-where $preds --dialect $dialect --ops $ops
+  let structured = (render-where (parse-where ($tokens | default "") --ops $ops) --dialect $dialect --ops $ops)
+  let parts = ([$structured ($raw | default "" | str trim)] | where {|p| $p | is-not-empty })
+  match ($parts | length) {
+    0 => null
+    1 => ($parts | first)
+    _ => ($parts | each {|p| "(" + $p + ")" } | str join " AND ")
+  }
 }
 
-# The full `WHERE …` clause for a `--where` flag value (dual-mode, see `build-where`),
-# or null when the value is empty/absent — so a verb drops it straight into `assemble`.
+# The full `WHERE …` clause from the two filter flags (see `build-where`), or null
+# when neither is given — so a verb drops it straight into `assemble`.
 @category mole-sql
 @example "a token-list renders as a WHERE clause" { sql where-clause "status=active" } --result "WHERE status = 'active'"
-@example "raw SQL passes through" { sql where-clause "a > 1 OR b" } --result "WHERE a > 1 OR b"
-@example "empty drops the clause" { sql where-clause null } --result null
+@example "raw SQL passes through" { sql where-clause null "a > 1 OR b" } --result "WHERE a > 1 OR b"
+@example "nothing drops the clause" { sql where-clause null } --result null
 export def "where-clause" [
-  value: any              # the `--where` flag value (null/"" → no clause)
+  tokens: any = null      # the `--where` value (null/"" → none)
+  raw: any = null         # the `--where-sql` value (null/"" → none)
   --dialect: record = {}  # {backslash_escapes: bool}
   --ops: list = []        # injected operator table; default → ansi-ops
 ]: nothing -> any {
-  let body = (build-where ($value | default "") --dialect $dialect --ops $ops)
+  let body = (build-where $tokens $raw --dialect $dialect --ops $ops)
   if ($body | is-empty) { null } else { "WHERE " + $body }
 }
 
@@ -460,11 +483,11 @@ export def "where-plan" [
   let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
   let prefix = ($tok | str replace --regex '[^,]*$' '')      # up to & incl. the last comma
   let seg = ($tok | split row "," | last | default "")
-  let siblings = (parse-where ($prefix | str trim --char ",") --ops $ops)   # null ⇒ committed part is raw SQL
+  let siblings = (try { parse-where ($prefix | str trim --char ",") --ops $ops } catch { [] })   # unparsable committed part ⇒ scopes nothing
   let p = (predicate-token $seg --ops $ops)
   if ($p == null) {
     # mid open-in:-list: a bare segment after an in:-valued predicate is a list item, not a column
-    if ($siblings != null) and ($siblings | is-not-empty) and (($siblings | last | get value) | str starts-with "in:") {
+    if ($siblings | is-not-empty) and (($siblings | last | get value) | str starts-with "in:") {
       return {candidates: []}
     }
     if ($seg in $cols) {
@@ -475,7 +498,7 @@ export def "where-plan" [
     return {candidates: ($cols | each {|c| $prefix + $c })}
   }
   if ($p.op not-in ["=" "!="]) or ($p.value | str starts-with "in:") or ($table | is-empty) { return {candidates: []} }
-  let scope = (if ($siblings == null) { [] } else { $siblings | where col != $p.col })
+  let scope = ($siblings | where col != $p.col)
   let scoped = (render-where $scope --dialect $dialect --ops $ops)
   {probe: {
     sql: (assemble [$"SELECT DISTINCT ($p.col) AS v FROM ($table)" (if ($scoped | is-not-empty) { $"WHERE ($scoped)" }) "LIMIT 50"])
@@ -489,8 +512,12 @@ export def "where-plan" [
 # (dir ""); `col:desc`/`col:asc` set the direction explicitly. The no-space grammar
 # keeps the flag a single completable bareword (Nushell can't complete across a
 # space), so a PER-COLUMN direction survives while `--sort-by` still tab-completes.
-# Null when the column part is empty. An unrecognized suffix is treated as implicit
-# ASC (the direction word is dropped).
+# Null for an empty token. The column must be a plain (optionally dotted) identifier —
+# `--sort-by` is the one slot not covered by the token grammar, and a verbatim
+# `id; DROP TABLE t` or `amount desc` would otherwise pass straight into the SQL. A
+# `:desc` with no column and any suffix other than `asc`/`desc` error too — a typo'd
+# `:dsc` must not silently sort ascending, and a dropped term must not silently
+# unsort.
 @category mole-sql
 @example "a bare column sorts ascending" { sql sort-token "created_at" } --result {col: created_at, dir: ""}
 @example "a :desc suffix sets the direction" { sql sort-token "amount:desc" } --result {col: amount, dir: DESC}
@@ -499,11 +526,15 @@ export def "sort-token" [tok: string]: nothing -> any {
   if ($t | is-empty) { return null }
   let parts = ($t | split row ":")
   let col = ($parts | first)
-  if ($col | is-empty) { return null }
-  let dir = (match ($parts | get -o 1 | default "" | str lowercase) {
+  if not ($col =~ '^[a-zA-Z_][a-zA-Z0-9_.]*$') {
+    error make {msg: $"not a sort token: '($t)' — use <col>, <col>:asc or <col>:desc with a plain column name; expression ordering is a raw-query"}
+  }
+  let suffix = ($parts | get -o 1 | default "" | str lowercase)
+  let dir = (match $suffix {
     "desc" => "DESC"
     "asc" => "ASC"
-    _ => ""
+    "" => ""
+    _ => { error make {msg: $"unknown sort direction '($suffix)' in '($t)' — use <col>, <col>:asc or <col>:desc"} }
   })
   {col: $col, dir: $dir}
 }
@@ -522,6 +553,29 @@ export def "build-order" [tokens: list<string>]: nothing -> any {
     if ($s.dir | is-empty) { $s.col } else { $s.col + " " + $s.dir }
   })
   if ($terms | is-empty) { null } else { "ORDER BY " + ($terms | str join ", ") }
+}
+
+# ---- pagination ---------------------------------------------------------------
+
+# Render the `LIMIT n [OFFSET m]` tail from a verb's `--limit`/`--offset` (null = absent),
+# or null when neither is given. Negative values error here — every engine rejects them
+# anyway, but with its own message and only after a round trip. `--offset-first` emits
+# Trino's `OFFSET m LIMIT n` order (the reverse is a syntax error there).
+@category mole-sql
+@example "limit and offset" { sql page-clause 5 10 } --result "LIMIT 5 OFFSET 10"
+@example "Trino's order" { sql page-clause 5 10 --offset-first } --result "OFFSET 10 LIMIT 5"
+@example "nothing drops the clause" { sql page-clause null null } --result null
+export def "page-clause" [
+  limit: any        # LIMIT n, or null
+  offset: any       # OFFSET m, or null
+  --offset-first    # render OFFSET before LIMIT (Trino)
+]: nothing -> any {
+  if ($limit != null) and ($limit < 0) { error make {msg: $"--limit must not be negative \(got ($limit)\)"} }
+  if ($offset != null) and ($offset < 0) { error make {msg: $"--offset must not be negative \(got ($offset)\)"} }
+  let l = (if $limit != null { $"LIMIT ($limit)" })
+  let o = (if $offset != null { $"OFFSET ($offset)" })
+  let parts = (if $offset_first { [$o $l] } else { [$l $o] }) | where {|p| $p | is-not-empty }
+  if ($parts | is-empty) { null } else { $parts | str join " " }
 }
 
 # ---- aggregation (stats) ------------------------------------------------------
@@ -560,9 +614,10 @@ export def "ansi-aggs" []: nothing -> list {
 # Translate a driver's aggregate FLAGS into the ordered `build-aggs` request list by
 # walking the injected `aggs` table: a fieldless aggregate contributes `{fn}` when
 # `flags.<flag>` is true; a field aggregate contributes `{fn, cols}` when it holds a
-# non-empty list. Output order is table order — which IS the SELECT output order. The
-# verb and its result-column completer both call this, so they can't drift. The driver
-# builds `flags` keyed by the aggs' `flag` names: `{count: $count, sum: (complete csv $sum), …}`.
+# non-empty list (repeats dropped — `--sum a,a` would name two columns `sum_a`).
+# Output order is table order — which IS the SELECT output order. The verb and its
+# result-column completer both call this, so they can't drift. The driver builds
+# `flags` keyed by the aggs' `flag` names: `{count: $count, sum: (complete csv $sum), …}`.
 @category mole-sql
 @example "flags to ordered requests" {
   sql agg-requests {count: true, sum: [amount], avg: []}
@@ -577,7 +632,7 @@ export def "agg-requests" [
     if $a.fieldless {
       if $v == true { [{fn: $a.flag}] } else { [] }
     } else if (($v | describe) | str starts-with "list") and ($v | is-not-empty) {
-      [{fn: $a.flag, cols: $v}]
+      [{fn: $a.flag, cols: ($v | uniq)}]
     } else { [] }
   } | flatten
 }
@@ -638,20 +693,34 @@ export def "result-cols" [
 # aggregate EXPRESSION (via the `{name: expr}` map derived from `aggs`) so the HAVING
 # is portable — standard SQL and Postgres reject output aliases in HAVING, MySQL
 # allows them. `count` always resolves to `count(*)` even without `--count`. Null
-# when no tokens. Reuses `predicate-token` + `render-predicate`.
+# when no tokens; errors on a token that doesn't parse (`count >= 10`) — dropping it
+# would run an unfiltered HAVING — and on a column that is neither a `--by` key nor
+# a requested aggregate's alias (`sum_amount>1` without `--sum amount` would render
+# a bare alias the engine rejects, or worse, a real column it silently accepts).
+# Reuses `predicate-token` + `render-predicate`.
 @category mole-sql
 @example "a threshold on an aggregate alias expands to its expression" {
   sql build-having ["sum_amount>=1000"] [{expr: "sum(amount)", name: sum_amount}]
 } --result "HAVING sum(amount) >= 1000"
+@example "a group key filters as itself" {
+  sql build-having ["region=eu"] [] --by [region]
+} --result "HAVING region = 'eu'"
 export def "build-having" [
   tokens: list<string>
   aggs: list = []          # [{expr, name}] from `build-aggs`; aliases expand to exprs
+  --by: list<string> = []  # the GROUP BY keys, allowed as HAVING columns alongside the aliases
   --dialect: record = {}
   --ops: list = []         # injected operator table; default → ansi-ops (so HAVING speaks the dialect's operators too)
 ]: nothing -> any {
   let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
   let aggmap = ($aggs | reduce --fold {count: "count(*)"} {|a, acc| $acc | upsert $a.name $a.expr })
-  let terms = ($tokens | each {|t| predicate-token $t --ops $ops } | where {|p| $p != null } | each {|p|
+  let terms = ($tokens | where {|t| $t | is-not-empty } | each {|t|
+    let p = (predicate-token $t --ops $ops)
+    if ($p == null) { error make {msg: $"not a HAVING predicate: '($t)' — use <col><op><value> with no spaces, e.g. count>=10"} }
+    if ($p.col not-in ($aggmap | columns)) and ($p.col not-in $by) {
+      let known = (($by ++ ($aggmap | columns)) | str join ", ")
+      error make {msg: $"unknown HAVING column '($p.col)' — it must be a --by key or a requested aggregate's alias \(one of: ($known)\)"}
+    }
     render-predicate {col: ($aggmap | get -o $p.col | default $p.col), op: $p.op, value: $p.value} $dialect --ops $ops
   })
   if ($terms | is-empty) { null } else { "HAVING " + ($terms | str join " AND ") }

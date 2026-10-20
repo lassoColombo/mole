@@ -53,7 +53,7 @@ def "dry-run plain select stars all columns" [] {
 @test
 def "dry-run projects filters orders and limits" [] {
   fixture
-  assert equal (mole-psql select id email --from users --where "age > 30" --sort-by age:desc --limit 5 -c postgres-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE age > 30 ORDER BY age DESC LIMIT 5"
+  assert equal (mole-psql select id email --from users --where-sql "age > 30" --sort-by age:desc --limit 5 -c postgres-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE age > 30 ORDER BY age DESC LIMIT 5"
 }
 
 @test
@@ -67,15 +67,18 @@ def "dry-run distinct and distinct on" [] {
 def "dry-run pagination and row locks" [] {
   fixture
   assert equal (mole-psql select --from users --sort-by id --limit 2 --offset 2 -c postgres-local-dev --dry-run | get query) "SELECT * FROM users ORDER BY id LIMIT 2 OFFSET 2"
-  assert equal (mole-psql select --from orders --where "status = 'pending'" --lock update --skip-locked -c postgres-local-dev --dry-run | get query) "SELECT * FROM orders WHERE status = 'pending' FOR UPDATE SKIP LOCKED"
+  assert equal (mole-psql select --from orders --where-sql "status = 'pending'" --lock update --skip-locked -c postgres-local-dev --dry-run | get query) "SELECT * FROM orders WHERE status = 'pending' FOR UPDATE SKIP LOCKED"
   assert equal (mole-psql select --from orders --lock share --lock-of orders --nowait -c postgres-local-dev --dry-run | get query) "SELECT * FROM orders FOR SHARE OF orders NOWAIT"
 }
 
 @test
-def "dry-run where token-list raw fallback and the IN LIKE NULL forms" [] {
+def "dry-run where token-list, raw --where-sql, and the IN LIKE NULL forms" [] {
   fixture
   assert equal (mole-psql select id email --from users --where status=active,age>=30 -c postgres-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE status = 'active' AND age >= 30"
-  assert equal (mole-psql select --from orders --where "total > 0 AND status <> 'void'" -c postgres-local-dev --dry-run | get query) "SELECT * FROM orders WHERE total > 0 AND status <> 'void'"
+  assert equal (mole-psql select --from orders --where-sql "total > 0 AND status <> 'void'" -c postgres-local-dev --dry-run | get query) "SELECT * FROM orders WHERE total > 0 AND status <> 'void'"
+  assert error { mole-psql select --from orders --where "a=1 AND b=2" -c postgres-local-dev --dry-run }   # raw SQL in the token slot errors instead of rendering a = '1 AND b=2'
+  assert error { mole-psql select --from orders --where "id = 42" -c postgres-local-dev --dry-run }
+  assert equal (mole-psql select --from orders --where status=active --where-sql "total > 0 OR legacy" -c postgres-local-dev --dry-run | get query) "SELECT * FROM orders WHERE (status = 'active') AND (total > 0 OR legacy)"
   assert equal (mole-psql select --from users --where role=in:admin,ops,name~%acme%,deleted=null -c postgres-local-dev --dry-run | get query) "SELECT * FROM users WHERE role IN ('admin', 'ops') AND name LIKE '%acme%' AND deleted IS NULL"
   assert equal (mole-psql select --from users --where "name~*%ACME%" -c postgres-local-dev --dry-run | get query) "SELECT * FROM users WHERE name ILIKE '%ACME%'"
 }
@@ -109,6 +112,10 @@ def "select flag guards error" [] {
   assert error { mole-psql select --from orders --lock update --skip-locked --nowait -c postgres-local-dev --dry-run }
   assert error { mole-psql select --from orders --lock-of t -c postgres-local-dev --dry-run }
   assert error { mole-psql select -c postgres-local-dev --dry-run }
+  assert error { mole-psql select --from users --where "a==1" -c postgres-local-dev --dry-run }        # typo'd operator, never `a = '=1'`
+  assert error { mole-psql select --from users --sort-by "id; DROP TABLE t" -c postgres-local-dev --dry-run }
+  assert error { mole-psql select --from users --limit -1 -c postgres-local-dev --dry-run }
+  assert error { mole-psql stats --from orders --by region --having sum_amount>1 -c postgres-local-dev --dry-run }   # no --sum requested
 }
 
 # ---- stats: dry-run SQL assembly ----------------------------------------------
@@ -139,9 +146,9 @@ def "dry-run stats grand total distinct count and the string-agg dialect aggrega
 @test
 def "dry-run update sets filters and returns" [] {
   fixture
-  assert equal (mole-psql update users "status = 'inactive'" --where "last_login < now() - interval '1 year'" -c postgres-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE last_login < now() - interval '1 year'"
+  assert equal (mole-psql update users "status = 'inactive'" --where-sql "last_login < now() - interval '1 year'" -c postgres-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE last_login < now() - interval '1 year'"
   assert equal (mole-psql update users "login_count = login_count + 1" --where id=42 --returning id,login_count -c postgres-local-dev --dry-run | get query) "UPDATE users SET login_count = login_count + 1 WHERE id = 42 RETURNING id, login_count"
-  assert equal (mole-psql update users "status = 'active'" "verified = true" --where "email = 'a@b.c'" -c postgres-local-dev --dry-run | get query) "UPDATE users SET status = 'active', verified = true WHERE email = 'a@b.c'"
+  assert equal (mole-psql update users "status = 'active'" "verified = true" --where-sql "email = 'a@b.c'" -c postgres-local-dev --dry-run | get query) "UPDATE users SET status = 'active', verified = true WHERE email = 'a@b.c'"
   assert equal (mole-psql update users "archived = true" --all -c postgres-local-dev --dry-run | get query) "UPDATE users SET archived = true"
 }
 
@@ -149,8 +156,8 @@ def "dry-run update sets filters and returns" [] {
 def "dry-run delete token-list raw and returning" [] {
   fixture
   assert equal (mole-psql delete sessions --where user_id=7 -c postgres-local-dev --dry-run | get query) "DELETE FROM sessions WHERE user_id = 7"
-  assert equal (mole-psql delete sessions --where "expires_at < now()" -c postgres-local-dev --dry-run | get query) "DELETE FROM sessions WHERE expires_at < now()"
-  assert equal (mole-psql delete sessions --where "user_id = 7" --returning "*" -c postgres-local-dev --dry-run | get query) "DELETE FROM sessions WHERE user_id = 7 RETURNING *"
+  assert equal (mole-psql delete sessions --where-sql "expires_at < now()" -c postgres-local-dev --dry-run | get query) "DELETE FROM sessions WHERE expires_at < now()"
+  assert equal (mole-psql delete sessions --where-sql "user_id = 7" --returning "*" -c postgres-local-dev --dry-run | get query) "DELETE FROM sessions WHERE user_id = 7 RETURNING *"
   assert equal (mole-psql delete staging_rows --all -c postgres-local-dev --dry-run | get query) "DELETE FROM staging_rows"
 }
 
@@ -158,9 +165,12 @@ def "dry-run delete token-list raw and returning" [] {
 def "write verbs refuse unfiltered writes and empty assignments" [] {
   fixture
   assert error { mole-psql update t "x = 1" -c postgres-local-dev --dry-run }
-  assert error { mole-psql update t --where "id = 1" -c postgres-local-dev --dry-run }
+  assert error { mole-psql update t "x = 1" --where " " -c postgres-local-dev --dry-run }   # a blank --where is no filter
+  assert error { mole-psql delete t --where "," -c postgres-local-dev --dry-run }            # nor is a bare comma
+  assert error { mole-psql delete t --where-sql " " -c postgres-local-dev --dry-run }       # nor a blank raw filter
+  assert error { mole-psql update t --where-sql "id = 1" -c postgres-local-dev --dry-run }
   assert error { mole-psql delete t -c postgres-local-dev --dry-run }
-  let c = (mole-psql update t "x = 1" --where "id = 1" -c postgres-local-dev --dry-run | get connection)
+  let c = (mole-psql update t "x = 1" --where-sql "id = 1" -c postgres-local-dev --dry-run | get connection)
   assert equal ($c | columns | any {|x| $x == "password"}) false
 }
 

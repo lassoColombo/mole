@@ -41,17 +41,20 @@ def seed-schema [] {
 def "dry-run select assembly" [] {
   fixture
   assert equal (mole-duckdb select --from users -c duckdb-local-dev --dry-run | get query) "SELECT * FROM users"
-  assert equal (mole-duckdb select id email --from users --where "age > 30" --sort-by age:desc --limit 5 -c duckdb-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE age > 30 ORDER BY age DESC LIMIT 5"
+  assert equal (mole-duckdb select id email --from users --where-sql "age > 30" --sort-by age:desc --limit 5 -c duckdb-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE age > 30 ORDER BY age DESC LIMIT 5"
   assert equal (mole-duckdb select status --distinct --from orders -c duckdb-local-dev --dry-run | get query) "SELECT DISTINCT status FROM orders"
   assert equal (mole-duckdb select user_id status --distinct-on user_id --from orders --sort-by user_id,id:desc -c duckdb-local-dev --dry-run | get query) "SELECT DISTINCT ON (user_id) user_id, status FROM orders ORDER BY user_id, id DESC"
   assert equal (mole-duckdb select --from users --sort-by id --limit 2 --offset 2 -c duckdb-local-dev --dry-run | get query) "SELECT * FROM users ORDER BY id LIMIT 2 OFFSET 2"
 }
 
 @test
-def "dry-run where token-list raw fallback IN LIKE NULL and the regexp_matches operator" [] {
+def "dry-run where token-list, raw --where-sql, IN LIKE NULL and the regexp_matches operator" [] {
   fixture
   assert equal (mole-duckdb select id email --from users --where status=active,age>=30 -c duckdb-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE status = 'active' AND age >= 30"
-  assert equal (mole-duckdb select --from orders --where "total > 0 AND status <> 'void'" -c duckdb-local-dev --dry-run | get query) "SELECT * FROM orders WHERE total > 0 AND status <> 'void'"
+  assert equal (mole-duckdb select --from orders --where-sql "total > 0 AND status <> 'void'" -c duckdb-local-dev --dry-run | get query) "SELECT * FROM orders WHERE total > 0 AND status <> 'void'"
+  assert error { mole-duckdb select --from orders --where "a=1 AND b=2" -c duckdb-local-dev --dry-run }   # raw SQL in the token slot errors instead of rendering a = '1 AND b=2'
+  assert error { mole-duckdb select --from orders --where "id = 42" -c duckdb-local-dev --dry-run }
+  assert equal (mole-duckdb select --from orders --where status=active --where-sql "total > 0 OR legacy" -c duckdb-local-dev --dry-run | get query) "SELECT * FROM orders WHERE (status = 'active') AND (total > 0 OR legacy)"
   assert equal (mole-duckdb select --from users --where role=in:admin,ops,name~%acme%,deleted=null -c duckdb-local-dev --dry-run | get query) "SELECT * FROM users WHERE role IN ('admin', 'ops') AND name LIKE '%acme%' AND deleted IS NULL"
   assert equal (mole-duckdb select --from users --where "name=~^A" -c duckdb-local-dev --dry-run | get query) "SELECT * FROM users WHERE regexp_matches(name, '^A')"
 }
@@ -59,12 +62,12 @@ def "dry-run where token-list raw fallback IN LIKE NULL and the regexp_matches o
 @test
 def "dry-run update and delete assembly" [] {
   fixture
-  assert equal (mole-duckdb update users "status = 'inactive'" --where "id = 5" -c duckdb-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE id = 5"
-  assert equal (mole-duckdb update users "login_count = login_count + 1" --where "id = 42" --returning id,login_count -c duckdb-local-dev --dry-run | get query) "UPDATE users SET login_count = login_count + 1 WHERE id = 42 RETURNING id, login_count"
+  assert equal (mole-duckdb update users "status = 'inactive'" --where-sql "id = 5" -c duckdb-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE id = 5"
+  assert equal (mole-duckdb update users "login_count = login_count + 1" --where-sql "id = 42" --returning id,login_count -c duckdb-local-dev --dry-run | get query) "UPDATE users SET login_count = login_count + 1 WHERE id = 42 RETURNING id, login_count"
   assert equal (mole-duckdb update users "archived = true" --all -c duckdb-local-dev --dry-run | get query) "UPDATE users SET archived = true"
   assert equal (mole-duckdb delete sessions --where user_id=7 -c duckdb-local-dev --dry-run | get query) "DELETE FROM sessions WHERE user_id = 7"
-  assert equal (mole-duckdb delete sessions --where "expires_at < now()" -c duckdb-local-dev --dry-run | get query) "DELETE FROM sessions WHERE expires_at < now()"
-  assert equal (mole-duckdb delete sessions --where "user_id = 7" --returning "*" -c duckdb-local-dev --dry-run | get query) "DELETE FROM sessions WHERE user_id = 7 RETURNING *"
+  assert equal (mole-duckdb delete sessions --where-sql "expires_at < now()" -c duckdb-local-dev --dry-run | get query) "DELETE FROM sessions WHERE expires_at < now()"
+  assert equal (mole-duckdb delete sessions --where-sql "user_id = 7" --returning "*" -c duckdb-local-dev --dry-run | get query) "DELETE FROM sessions WHERE user_id = 7 RETURNING *"
   assert equal (mole-duckdb delete staging_rows --all -c duckdb-local-dev --dry-run | get query) "DELETE FROM staging_rows"
 }
 
@@ -81,9 +84,14 @@ def "connection is tagged path overrides apply and other drivers are rejected" [
 def "guards error" [] {
   fixture
   assert error { mole-duckdb select -c duckdb-local-dev --dry-run }
+  assert error { mole-duckdb select --from t --limit -1 -c duckdb-local-dev --dry-run }           # negative paging is rejected before the round trip
+  assert error { mole-duckdb select --from t --where "a==1" -c duckdb-local-dev --dry-run }      # typo'd operator is an error, not a literal
   assert error { mole-duckdb select --from users --distinct --distinct-on id -c duckdb-local-dev --dry-run }
   assert error { mole-duckdb update t "x = 1" -c duckdb-local-dev --dry-run }
-  assert error { mole-duckdb update t --where "id = 1" -c duckdb-local-dev --dry-run }
+  assert error { mole-duckdb update t "x = 1" --where " " -c duckdb-local-dev --dry-run }   # a blank --where is no filter
+  assert error { mole-duckdb delete t --where "," -c duckdb-local-dev --dry-run }            # nor is a bare comma
+  assert error { mole-duckdb delete t --where-sql " " -c duckdb-local-dev --dry-run }       # nor a blank raw filter
+  assert error { mole-duckdb update t --where-sql "id = 1" -c duckdb-local-dev --dry-run }
   assert error { mole-duckdb delete t -c duckdb-local-dev --dry-run }
   assert error { mole-duckdb schema --include a --exclude b -c duckdb-local-dev }
 }

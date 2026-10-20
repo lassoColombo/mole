@@ -29,7 +29,7 @@ def "dry-run plain select stars all columns" [] {
 @test
 def "dry-run projects filters orders and limits" [] {
   fixture
-  assert equal (mole-mysql select id email --from users --where "age > 30" --sort-by age:desc --limit 5 -c mysql-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE age > 30 ORDER BY age DESC LIMIT 5"
+  assert equal (mole-mysql select id email --from users --where-sql "age > 30" --sort-by age:desc --limit 5 -c mysql-local-dev --dry-run | get query) "SELECT id, email FROM users WHERE age > 30 ORDER BY age DESC LIMIT 5"
 }
 
 @test
@@ -47,7 +47,7 @@ def "dry-run for-update skip-locked" [] {
 @test
 def "dry-run legacy lock in share mode" [] {
   fixture
-  assert equal (mole-mysql select --from orders --where "status = 'pending'" --lock share-mode -c mysql-local-dev --dry-run | get query) "SELECT * FROM orders WHERE status = 'pending' LOCK IN SHARE MODE"
+  assert equal (mole-mysql select --from orders --where-sql "status = 'pending'" --lock share-mode -c mysql-local-dev --dry-run | get query) "SELECT * FROM orders WHERE status = 'pending' LOCK IN SHARE MODE"
 }
 
 @test
@@ -69,9 +69,12 @@ def "dry-run IN LIKE and NULL predicate forms in one where token-list" [] {
 }
 
 @test
-def "dry-run where falls back to raw SQL when it is not a token-list" [] {
+def "dry-run raw SQL goes in --where-sql and the two flags AND-join" [] {
   fixture
-  assert equal (mole-mysql select --from orders --where "total > 0 AND status <> 'void'" -c mysql-local-dev --dry-run | get query) "SELECT * FROM orders WHERE total > 0 AND status <> 'void'"
+  assert equal (mole-mysql select --from orders --where-sql "total > 0 AND status <> 'void'" -c mysql-local-dev --dry-run | get query) "SELECT * FROM orders WHERE total > 0 AND status <> 'void'"
+  assert error { mole-mysql select --from orders --where "a=1 AND b=2" -c mysql-local-dev --dry-run }   # raw SQL in the token slot errors instead of rendering a = '1 AND b=2'
+  assert error { mole-mysql select --from orders --where "id = 42" -c mysql-local-dev --dry-run }
+  assert equal (mole-mysql select --from orders --where status=active --where-sql "total > 0 OR legacy" -c mysql-local-dev --dry-run | get query) "SELECT * FROM orders WHERE (status = 'active') AND (total > 0 OR legacy)"
 }
 
 # ---- connection handling ------------------------------------------------------
@@ -121,19 +124,19 @@ def "from is required" [] {
 @test
 def "dry-run update sets one column filtered" [] {
   fixture
-  assert equal (mole-mysql update users "status = 'inactive'" --where "id = 5" -c mysql-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE id = 5"
+  assert equal (mole-mysql update users "status = 'inactive'" --where-sql "id = 5" -c mysql-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE id = 5"
 }
 
 @test
 def "dry-run update joins several assignments" [] {
   fixture
-  assert equal (mole-mysql update t "a = 1" "b = b + 1" --where "id = 5" -c mysql-local-dev --dry-run | get query) "UPDATE t SET a = 1, b = b + 1 WHERE id = 5"
+  assert equal (mole-mysql update t "a = 1" "b = b + 1" --where-sql "id = 5" -c mysql-local-dev --dry-run | get query) "UPDATE t SET a = 1, b = b + 1 WHERE id = 5"
 }
 
 @test
 def "dry-run update with order-by and limit" [] {
   fixture
-  assert equal (mole-mysql update jobs "priority = priority + 1" --where "queued = 1" --sort-by created_at:asc --limit 100 -c mysql-local-dev --dry-run | get query) "UPDATE jobs SET priority = priority + 1 WHERE queued = 1 ORDER BY created_at ASC LIMIT 100"
+  assert equal (mole-mysql update jobs "priority = priority + 1" --where-sql "queued = 1" --sort-by created_at:asc --limit 100 -c mysql-local-dev --dry-run | get query) "UPDATE jobs SET priority = priority + 1 WHERE queued = 1 ORDER BY created_at ASC LIMIT 100"
 }
 
 @test
@@ -147,13 +150,13 @@ def "dry-run update --all allows an unfiltered write" [] {
 @test
 def "dry-run delete filtered" [] {
   fixture
-  assert equal (mole-mysql delete sessions --where "expires_at < now()" -c mysql-local-dev --dry-run | get query) "DELETE FROM sessions WHERE expires_at < now()"
+  assert equal (mole-mysql delete sessions --where-sql "expires_at < now()" -c mysql-local-dev --dry-run | get query) "DELETE FROM sessions WHERE expires_at < now()"
 }
 
 @test
 def "dry-run delete with order-by and limit" [] {
   fixture
-  assert equal (mole-mysql delete logs --where "level = 'debug'" --sort-by ts:asc --limit 1000 -c mysql-local-dev --dry-run | get query) "DELETE FROM logs WHERE level = 'debug' ORDER BY ts ASC LIMIT 1000"
+  assert equal (mole-mysql delete logs --where-sql "level = 'debug'" --sort-by ts:asc --limit 1000 -c mysql-local-dev --dry-run | get query) "DELETE FROM logs WHERE level = 'debug' ORDER BY ts ASC LIMIT 1000"
 }
 
 @test
@@ -168,7 +171,7 @@ def "dry-run delete builds the filter from predicate tokens" [] {
 @test
 def "dry-run update redacts the password and tags the mysql driver" [] {
   fixture
-  let c = (mole-mysql update t "x = 1" --where "id = 1" -c mysql-local-dev --dry-run | get connection)
+  let c = (mole-mysql update t "x = 1" --where-sql "id = 1" -c mysql-local-dev --dry-run | get connection)
   assert equal ($c | columns | any {|x| $x == "password"}) false
   assert equal $c.driver "mysql"
 }
@@ -176,13 +179,16 @@ def "dry-run update redacts the password and tags the mysql driver" [] {
 @test
 def "update requires at least one assignment" [] {
   fixture
-  assert error { mole-mysql update t --where "id = 1" -c mysql-local-dev --dry-run }
+  assert error { mole-mysql update t --where-sql "id = 1" -c mysql-local-dev --dry-run }
 }
 
 @test
 def "update refuses an unfiltered write without --all" [] {
   fixture
   assert error { mole-mysql update t "x = 1" -c mysql-local-dev --dry-run }
+  assert error { mole-mysql update t "x = 1" --where " " -c mysql-local-dev --dry-run }   # a blank --where is no filter
+  assert error { mole-mysql delete t --where "," -c mysql-local-dev --dry-run }            # nor is a bare comma
+  assert error { mole-mysql delete t --where-sql " " -c mysql-local-dev --dry-run }       # nor a blank raw filter
 }
 
 @test

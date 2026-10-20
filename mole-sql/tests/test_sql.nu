@@ -308,9 +308,19 @@ def "sql-literal quotes by value shape and escapes backslash per dialect" [] {
     assert equal (sql sql-literal "active") "'active'"
     assert equal (sql sql-literal "30") "30"
     assert equal (sql sql-literal "-3.5") "-3.5"
+    assert equal (sql sql-literal "01234") "'01234'"     # leading zero ⇒ a code, not a number
+    assert equal (sql sql-literal "0") "0"
+    assert equal (sql sql-literal "0.5") "0.5"
     assert equal (sql sql-literal "true") "true"
     assert equal (sql sql-literal "False") "false"
     assert equal (sql sql-literal "O'Brien") "'O''Brien'"
+    # signed, scientific and leading-dot numeric forms are numbers too (B3)
+    assert equal (sql sql-literal "+5") "+5"
+    assert equal (sql sql-literal ".5") ".5"
+    assert equal (sql sql-literal "1e5") "1e5"
+    assert equal (sql sql-literal "2.5E-3") "2.5E-3"
+    assert equal (sql sql-literal "+01") "'+01'"      # leading zero still a code
+    assert equal (sql sql-literal "5.") "'5.'"
     # backslash: LITERAL by default (psql/trino/duckdb); DOUBLED where the dialect
     # treats `\` as an escape char (mysql/mariadb). Single-quoted nu strings are raw,
     # so 'a\b' is a,\,b and 'a\\b' is a,\,\,b.
@@ -362,7 +372,7 @@ def "operators are injected: a dialect ops table renders via symbol/keyword/func
     assert equal (sql render-predicate {col: a, op: "<=>", value: b} --ops $ops) "a <=> 'b'"
     assert equal (sql render-predicate {col: a, op: "<=>", value: "null"} --ops $ops) "a <=> NULL"
     assert equal (sql render-predicate {col: name, op: "~", value: acme} --ops $ops) "name LIKE 'acme'"   # base ~ still LIKE
-    # build-where threads the SAME injected ops end-to-end (dual-mode, structured path)
+    # build-where threads the SAME injected ops end-to-end
     assert equal (sql build-where "status=active,name=~^a" --ops $ops) "status = 'active' AND regexp_like(name, '^a')"
 }
 
@@ -381,13 +391,46 @@ def "op-completions offers col<op> with descriptions" [] {
 }
 
 @test
-def "parse-where discriminates token-lists from raw SQL" [] {
+def "parse-where parses a token-list and errors on anything else" [] {
     assert equal (sql parse-where "status=active,age>=30") [{col: status, op: "=", value: active} {col: age, op: ">=", value: "30"}]
     assert equal (sql parse-where "role=in:admin,ops") [{col: role, op: "=", value: "in:admin,ops"}]   # in: list folds back over the comma
     assert equal (sql parse-where "status=active,role=in:a,b,age>=1") [{col: status, op: "=", value: active} {col: role, op: "=", value: "in:a,b"} {col: age, op: ">=", value: "1"}]
-    assert equal (sql parse-where "status = 'active' AND age > 5") null    # spaced operators ⇒ not a token-list ⇒ raw
-    assert equal (sql parse-where "(a OR b) AND c") null                    # leading non-token ⇒ raw
-    assert equal (sql parse-where "") []                                    # empty ⇒ no predicates (still structured)
+    assert equal (sql parse-where "") []                                    # empty ⇒ no predicates
+    assert error { sql parse-where "status = 'active' AND age > 5" }        # raw SQL is not a token-list: it belongs in --where-sql
+    assert error { sql parse-where "(a OR b) AND c" }
+}
+
+@test
+def "render-predicate treats the value as a literal and rejects pasted SQL" [] {
+    # a tight first operator makes raw SQL parse as ONE token; the connective inside the value gives it away
+    assert error { sql build-where "a=1 AND b=2" }                          # used to render a = '1 AND b=2'
+    assert error { sql build-where "id=7 OR 1=1" }                          # used to return row 7 on MySQL
+    assert error { sql build-where "total>0 AND status<>'void'" }
+    assert error { sql build-where "a=1 and b=2" }                          # case-insensitive
+    assert equal (sql build-where "created_at>now()") "created_at > 'now()'"      # the RHS is a literal by definition; a function belongs in --where-sql
+    assert equal (sql build-where "a=b") "a = 'b'"                                 # likewise a column name
+    # quoting the value makes it a literal unconditionally
+    assert equal (sql build-where "status='active'") "status = 'active'"           # not '''active'''
+    assert equal (sql build-where "zip='30'") "zip = '30'"                         # not the bare number 30
+    assert equal (sql build-where "note='a and b'") "note = 'a and b'"             # the connective check is skipped
+    assert equal (sql build-where "note=\"it's\"") "note = 'it''s'"                 # inner quote still doubled
+    assert equal (sql build-where "x='") "x = ''''"                                # a lone quote is a one-char value, not a wrapper
+}
+
+@test
+def "parse-where trims items and drops blank ones" [] {
+    assert equal (sql parse-where "a=1, b=2") (sql parse-where "a=1,b=2")             # a space after the comma starts a new predicate
+    assert equal (sql parse-where "status=active,") (sql parse-where "status=active")  # a trailing comma is not part of the value
+    assert equal (sql parse-where "a=1,,b=2") (sql parse-where "a=1,b=2")              # nor is a doubled one
+    assert equal (sql parse-where ",") []                                               # all blank ⇒ no predicates (the --all guard fires)
+    assert equal (sql parse-where "role=in:a, b") [{col: role, op: "=", value: "in:a,b"}]   # an in: continuation still folds
+    assert error { sql parse-where "name=Smith, John" }                                 # a non-token after a non-in: predicate is an error, not a value
+}
+
+@test
+def "an empty in: list errors instead of rendering an empty IN" [] {
+    assert error { sql build-where "role=in:" }
+    assert error { sql build-where "role!=in:," }
 }
 
 @test
@@ -399,21 +442,21 @@ def "render-where AND-joins predicate records" [] {
 }
 
 @test
-def "build-where is dual-mode: structured tokens or raw SQL verbatim" [] {
-    # structured: parses ⇒ rendered per-dialect (the token grammar)
+def "build-where renders tokens, passes raw SQL verbatim, AND-joins both" [] {
     assert equal (sql build-where "status=active,age>=30") "status = 'active' AND age >= 30"
     assert equal (sql build-where "role=in:admin,ops") "role IN ('admin', 'ops')"
     assert equal (sql build-where "deleted=null") "deleted IS NULL"
     assert equal (sql build-where "name~%John Smith%") "name LIKE '%John Smith%'"   # a space in the VALUE is fine
-    # raw fallback: doesn't parse ⇒ verbatim (idiomatic spaced SQL, functions, parens)
-    assert equal (sql build-where "created_at > now() - interval '1 day'") "created_at > now() - interval '1 day'"
-    assert equal (sql build-where "id = 42") "id = 42"
-    assert equal (sql build-where "(a OR b) AND c") "(a OR b) AND c"
-    assert equal (sql build-where "") null
-    # dual-mode threads INJECTED dialect ops into the structured path (regex → function form)
+    assert equal (sql build-where null "created_at > now() - interval '1 day'") "created_at > now() - interval '1 day'"
+    assert equal (sql build-where "" "id = 42") "id = 42"
+    assert equal (sql build-where "status=active" "a > 1 OR b") "(status = 'active') AND (a > 1 OR b)"
+    assert equal (sql build-where "" "") null
+    assert equal (sql build-where null null) null
+    assert equal (sql build-where "," " ") null                                  # blanks on both sides ⇒ no filter
+    assert error { sql build-where "id = 42" }                                   # raw SQL in the token slot is an error, never a guess
+    # the structured side threads INJECTED dialect ops (regex → function form)
     let ops = (sql ansi-ops | append {token: "=~", desc: "regex", render: {|c, v, lit| sql render-func "regexp_like" $c $v $lit }})
     assert equal (sql build-where "name=~^a" --ops $ops) "regexp_like(name, '^a')"
-    assert equal (sql build-where "name ~ '^a'" --ops $ops) "name ~ '^a'"           # spaced ⇒ raw even with custom ops
 }
 
 @test
@@ -422,6 +465,12 @@ def "sort-token parses col and optional direction" [] {
     assert equal (sql sort-token "amount:desc") {col: "amount", dir: "DESC"}
     assert equal (sql sort-token "name:asc") {col: "name", dir: "ASC"}
     assert equal (sql sort-token "") null
+    assert equal (sql sort-token "amount:DESC") {col: "amount", dir: "DESC"}    # case-insensitive
+    assert error { sql sort-token "amount:dsc" }                                  # a typo must not silently sort ascending
+    assert error { sql sort-token ":desc" }                                       # no column must not silently drop the term
+    assert error { sql sort-token "amount desc" }                                 # raw SQL is not a sort token
+    assert error { sql sort-token "id; DROP TABLE t" }
+    assert equal (sql sort-token "t.col:desc") {col: "t.col", dir: "DESC"}        # dotted identifiers are fine
 }
 
 @test
@@ -470,6 +519,18 @@ def "build-having expands aliases to expressions and count is always available" 
 }
 
 @test
+def "agg-requests drops a repeated column so result names stay unique" [] {
+    assert equal (sql agg-requests {sum: [amount amount b]}) [{fn: sum, cols: [amount b]}]
+    assert equal (sql result-cols [] {sum: [amount amount]}) [sum_amount]
+}
+
+@test
+def "build-having errors on a token it cannot parse" [] {
+    assert error { sql build-having ["count >= 10"] [] }                         # spaced ⇒ not a predicate; dropping it would unfilter
+    assert error { sql build-having ["count>=1" "sum_amount"] [{expr: "sum(amount)", name: "sum_amount"}] }
+}
+
+@test
 def "apply-agg-types coerces aggregate columns by their declared type" [] {
     let table = (sql ansi-aggs | append {flag: "median", fieldless: false, type: "float", render: {|col| $"median\(($col)\)" }})
     let aggs = (sql build-aggs [{fn: "count"} {fn: "avg", cols: [amount]} {fn: "sum", cols: [x]} {fn: "min", cols: [ts]} {fn: "median", cols: [amount]}] $table)
@@ -496,9 +557,10 @@ def "render-predicate and render-where forward the dialect escaping" [] {
 # ---- where-clause / where-plan ------------------------------------------------
 
 @test
-def "where-clause wraps the dual-mode body or drops it" [] {
+def "where-clause wraps the body or drops it" [] {
     assert equal (sql where-clause "status=active,age>=30") "WHERE status = 'active' AND age >= 30"
-    assert equal (sql where-clause "a > 1 OR b") "WHERE a > 1 OR b"
+    assert equal (sql where-clause null "a > 1 OR b") "WHERE a > 1 OR b"
+    assert equal (sql where-clause "status=active" "a > 1 OR b") "WHERE (status = 'active') AND (a > 1 OR b)"
     assert equal (sql where-clause "") null
     assert equal (sql where-clause null) null
 }
@@ -565,4 +627,37 @@ def "agg-requests walks the aggs table in order" [] {
     assert equal (sql agg-requests {}) []
     let aggs = ((sql ansi-aggs) ++ [{flag: "string-agg", fieldless: false, render: {|c| "" }}])
     assert equal (sql agg-requests {"string-agg": [name]} $aggs) [{fn: "string-agg", cols: [name]}]
+}
+
+@test
+def "render-predicate rejects a value that starts with an operator character" [] {
+    # `a==1` / `a=>1` / `a!==1` are typo'd operators, not literals — never `a = '=1'`
+    assert error { sql render-where (sql parse-where "a==1") }
+    assert error { sql render-where (sql parse-where "a=>1") }
+    assert error { sql render-where (sql parse-where "a!==1") }
+    assert error { sql render-where (sql parse-where "name~~x") }
+    # quoting the value means it literally
+    assert equal (sql render-where (sql parse-where "a='=1'")) "a = '=1'"
+}
+
+@test
+def "build-having only accepts group keys and requested aggregate aliases" [] {
+    let aggs = [{expr: "sum(amount)", name: sum_amount}]
+    assert equal (sql build-having ["sum_amount>1"] $aggs --by [region]) "HAVING sum(amount) > 1"
+    assert equal (sql build-having ["region=eu"] $aggs --by [region]) "HAVING region = 'eu'"
+    assert equal (sql build-having ["count>=10"] [] --by [region]) "HAVING count(*) >= 10"   # count is always available
+    assert error { sql build-having ["avg_amount>1"] $aggs --by [region] }                  # no --avg was requested
+    assert error { sql build-having ["amount>1"] $aggs --by [region] }                      # a source column is not a result column
+}
+
+@test
+def "page-clause renders validated LIMIT and OFFSET" [] {
+    assert equal (sql page-clause 5 10) "LIMIT 5 OFFSET 10"
+    assert equal (sql page-clause 5 10 --offset-first) "OFFSET 10 LIMIT 5"
+    assert equal (sql page-clause 5 null) "LIMIT 5"
+    assert equal (sql page-clause null 10) "OFFSET 10"
+    assert equal (sql page-clause null null) null
+    assert equal (sql page-clause 0 0) "LIMIT 0 OFFSET 0"
+    assert error { sql page-clause (-1) null }
+    assert error { sql page-clause 5 (-1) }
 }
