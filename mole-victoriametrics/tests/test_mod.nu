@@ -59,6 +59,27 @@ def "select guards error" [] {
   assert error { mole-victoriametrics select up hello world -c victoriametrics-local-dev --dry-run }                     # a bare non-matcher token
 }
 
+@test
+def "select validates every part instead of guessing" [] {
+  fixture
+  assert equal (mole-victoriametrics select up --func rate -c victoriametrics-local-dev --dry-run | get query) "rate(up)"   # MetricsQL: implicit window, no range check
+  assert equal (mole-victoriametrics select up --func rate --range 5min -c victoriametrics-local-dev --dry-run | get query) "rate(up[300s])"   # a Nushell duration spelling renders
+  assert error { mole-victoriametrics select up --func rate --range 5 -c victoriametrics-local-dev --dry-run }                # a unit-less window
+  assert error { mole-victoriametrics select up --agg topk -c victoriametrics-local-dev --dry-run }                           # a parametric aggregator needs --param
+  assert equal (mole-victoriametrics select up --agg topk --param 5 --by job -c victoriametrics-local-dev --dry-run | get query) "topk by (job) (5, up)"
+  assert error { mole-victoriametrics select up job=api,env=prod -c victoriametrics-local-dev --dry-run }                     # one matcher per positional, never a comma list
+  assert equal (mole-victoriametrics select up 'path="a\\"b"' -c victoriametrics-local-dev --dry-run | get query) 'up{path="a\\"b"}'   # a quoted value is raw PromQL, not re-escaped
+  assert error { mole-victoriametrics select up --time 2026-01-01T00:00:00Z --last 1hr -c victoriametrics-local-dev --dry-run }   # --time is instant-only
+}
+
+@test
+def "raw-query-range needs a window and label-values needs a label" [] {
+  fixture
+  assert error { mole-victoriametrics raw-query-range up -c victoriametrics-local-dev }                                       # no window at all
+  assert error { mole-victoriametrics label-values job=api -c victoriametrics-local-dev --dry-run }                           # a matcher where the label goes
+  assert equal (mole-victoriametrics label-values job --metric up env=prod -c victoriametrics-local-dev --dry-run | get query) 'up{env="prod"}'
+}
+
 # ---- enumeration verbs: dry-run selector assembly -----------------------------
 
 @test

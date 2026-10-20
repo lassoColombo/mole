@@ -78,10 +78,16 @@ export def "ts" [dt: any]: nothing -> any {
   if ($dt | is-empty) { null } else { (($dt - 1970-01-01T00:00:00Z) / 1sec) | into string }
 }
 
-# A duration → the Prometheus step string (integer seconds, e.g. `15s`).
+# A duration → the Prometheus step string: whole seconds as `15s`, anything finer in
+# milliseconds (`500ms`) — truncating to seconds would send `0s`, which is rejected.
+# A zero, negative or sub-millisecond duration is an error here, not a server rejection later.
 @category mole-promql
 @example "duration to step string" { promql step 1min } --result "60s"
-export def "step" [d: duration]: nothing -> string { $"(($d / 1sec) | into int)s" }
+@example "sub-second steps keep their milliseconds" { promql step 1500ms } --result "1500ms"
+export def "step" [d: duration]: nothing -> string {
+  if $d < 1ms { error make {msg: $"step must be at least 1ms, got ($d)"} }
+  if ($d mod 1sec) == 0sec { $"(($d / 1sec) | into int)s" } else { $"(($d / 1ms) | into int)ms" }
+}
 
 # ---- result normalization -----------------------------------------------------
 
@@ -96,13 +102,25 @@ export def "relabel" [m: record]: nothing -> record {
   if ($name | is-empty) { $rest } else { {metric: $name} | merge $rest }
 }
 
-# instant `vector` result → one row per series: {..labels, value, timestamp}.
+# One sample `[ts, v]` → {timestamp, value}. A float sample's `v` is the wire string
+# (→ `num`); a NATIVE HISTOGRAM sample's `v` is a record ({count, sum, buckets}) and
+# is carried as-is — Prometheus ≥ 2.40 returns those under `histogram`/`histograms`
+# instead of `value`/`values`, and one such series must not sink the whole result.
+def sample [p: list]: nothing -> record {
+  let v = ($p | get 1)
+  {timestamp: (time ($p | get 0)), value: (if (($v | describe) =~ '^record') { $v } else { num $v })}
+}
+
+# instant `vector` result → one row per series: {..labels, timestamp, value} — the
+# same column order as `matrix`, so a query's shape doesn't change with its mode.
 @category mole-promql
 @example "a one-series vector" {
   promql vector [{metric: {__name__: up, job: api}, value: [1700000000, "1"]}]
-} --result [{metric: up, job: api, value: 1.0, timestamp: 2023-11-14T22:13:20Z}]
+} --result [{metric: up, job: api, timestamp: 2023-11-14T22:13:20Z, value: 1.0}]
 export def "vector" [result: list]: nothing -> table {
-  $result | each {|s| (relabel $s.metric) | merge {value: (num $s.value.1), timestamp: (time $s.value.0)} }
+  $result | each {|s|
+    (relabel ($s | get -o metric | default {})) | merge (sample ($s | get -o value | default ($s | get -o histogram | default [0 null])))
+  }
 }
 
 # range `matrix` result → tidy rows: one per (series, point) {..labels, timestamp, value}.
@@ -112,8 +130,8 @@ export def "vector" [result: list]: nothing -> table {
 } --result [{metric: up, timestamp: 1970-01-01T00:00:00Z, value: 1.0}, {metric: up, timestamp: 1970-01-01T00:01:00Z, value: 0.0}]
 export def "matrix" [result: list]: nothing -> table {
   $result | each {|s|
-    let labels = (relabel $s.metric)
-    $s.values | each {|p| $labels | merge {timestamp: (time $p.0), value: (num $p.1)} }
+    let labels = (relabel ($s | get -o metric | default {}))
+    ($s | get -o values | default ($s | get -o histograms | default [])) | each {|p| $labels | merge (sample $p) }
   } | flatten
 }
 
@@ -129,7 +147,7 @@ export def "scalar" [result: list]: nothing -> table {
 @category mole-promql
 @example "dispatch on a vector payload" {
   promql normalize {resultType: vector, result: [{metric: {__name__: up}, value: [0, "1"]}]}
-} --result [{metric: up, value: 1.0, timestamp: 1970-01-01T00:00:00Z}]
+} --result [{metric: up, timestamp: 1970-01-01T00:00:00Z, value: 1.0}]
 export def "normalize" [data: any]: nothing -> any {
   if (($data | describe) !~ '^record') { return $data }
   match ($data | get -o resultType) {
@@ -196,47 +214,102 @@ export def "matcher-token" [token: string]: nothing -> any {
 }
 
 # Assemble the `{...}` matcher block from operator-carrying tokens (`job=api`,
-# `status=~5..`, `env!=dev`). Each value is quoted and escaped (via `esc`). An empty
-# list → "". Errors on a non-empty token that carries no operator — silently
-# dropping it would run a wrongly-unfiltered query, the worst failure for a metrics
-# tool. Each token names its own operator, so ONE list carries every matcher kind.
+# `status=~5..`, `env!=dev`). A bare value is quoted and escaped (via `esc`); a value
+# wrapped in one pair of quotes (`job="api"`, `path="a\"b"`) is ALREADY a PromQL
+# string literal and is kept verbatim inside the quotes — re-quoting would match the
+# literal `"api"`, re-escaping would double its backslashes. An empty list → "".
+# Errors on a non-empty token that carries no operator — silently dropping it would
+# run a wrongly-unfiltered query, the worst failure for a metrics tool — and on an
+# unquoted comma in a value (`job=api,env=prod`): matchers are one per positional,
+# not a comma list like the SQL flags, and `{job="api,env=prod"}` matches nothing.
+# Each token names its own operator, so ONE list carries every matcher kind.
 @category mole-promql
 @example "mixed operators compose in order" {
   promql matchers-tokens ["job=api" "status=~5.." "env!=dev"]
 } --result '{job="api", status=~"5..", env!="dev"}'
+@example "a quoted value is raw PromQL, kept as typed" {
+  promql matchers-tokens ['path="a\"b"']
+} --result '{path="a\"b"}'
 @example "no tokens → empty string" { promql matchers-tokens [] } --result ""
 export def "matchers-tokens" [tokens: list<string>]: nothing -> string {
-  let parts = ($tokens | where {|t| $t | is-not-empty } | each {|t|
+  let toks = ($tokens | where {|t| $t | is-not-empty })
+  # validate in a plain loop: an `error make` inside `each` surfaces as a bare
+  # "Eval block failed" and loses the message.
+  for t in $toks {
     let p = (matcher-token $t)
     if ($p == null) { error make {msg: $"not a matcher: '($t)' — use label=value | label!=value | label=~value | label!~value; single-quote a value with spaces"} }
-    $p.label + $p.op + '"' + (esc $p.value) + '"'
+    if ((unquote $p.value) == $p.value) and ($p.value | str contains ",") {
+      error make {msg: $"matcher '($t)' holds a comma — one matcher per positional \(job=api env=prod\), or quote the value to mean it literally"}
+    }
+  }
+  let parts = ($toks | each {|t|
+    let p = (matcher-token $t)
+    let stripped = (unquote $p.value)
+    $p.label + $p.op + '"' + (if ($stripped != $p.value) { $stripped } else { esc $p.value }) + '"'
   })
   if ($parts | is-empty) { "" } else { "{" + ($parts | str join ", ") + "}" }
 }
 
+# A `--range` window → its PromQL duration text. A string must already be PromQL
+# (`5m`, `1h30m`); a Nushell duration (`5min`) renders via `step`. A string that is
+# not PromQL but parses as a Nushell duration is rendered too (`5min` → `300s`) —
+# the one spelling a Nushell user types by reflex. Anything else is an error.
+def range-text [range: any]: nothing -> string {
+  if (($range | describe) == "duration") { return (step $range) }
+  let r = ($range | into string | str trim)
+  if ($r =~ '^(\d+(ms|s|m|h|d|w|y))+$') { return $r }
+  let d = (if ($r =~ '[a-zA-Z]$') { try { $r | into duration } catch { null } } else { null })   # a bare number is nanoseconds to `into duration`, never a window
+  if ($d == null) { error make {msg: $"not a range window: '($r)' — use PromQL units \(5m, 1h30m\) or a Nushell duration \(5min\)"} }
+  step $d
+}
+
 # Assemble a PromQL query from parts (pure):
-#   [agg [by/without (labels)]] ( [func] ( metric{matchers}[range] ) )
-# MetricsQL and every PromQL superset accept this syntax unchanged, so the builder
-# needs no dialect injection.
+#   [agg [by/without (labels)]] ( [param,] [func] ( metric{matchers}[range] ) )
+# Every part is VALIDATED, never guessed: the metric and the grouping labels must be
+# identifiers, `--range` a duration (see `range-text`), a range-vector function needs
+# a `--range`, and a parametric aggregator (`topk`, `quantile`, …) needs `--param`.
+# MetricsQL is a superset that accepts `rate(up)` with an implicit window, so BOTH
+# vocab checks are dialect-injected: a driver passes its own `--range-funcs` /
+# `--param-aggs` lists (defaults: `range-funcs` / `param-aggs`; `[]` disables).
 @category mole-promql
 @example "a rate wrapped in a sum-by" {
   promql build "http_requests_total" --matchers '{job="api"}' --range 5m --func rate --agg sum --by [job]
 } --result 'sum by (job) (rate(http_requests_total{job="api"}[5m]))'
+@example "a parametric aggregator takes its parameter first" {
+  promql build "up" --agg topk --param 5
+} --result 'topk (5, up)'
 @example "just a metric with matchers" {
   promql build "up" --matchers '{job="api"}'
 } --result 'up{job="api"}'
 export def "build" [
   metric: string
   --matchers: string = ""       # the {...} block (from `matchers`)
-  --range: string = ""          # range window, e.g. "5m" → [5m]
+  --range: any = ""             # range window: PromQL text ("5m") or a Nushell duration → [5m]
   --func: string = ""           # wrap the selector in this function
   --agg: string = ""            # aggregation operator
+  --param: string = ""          # the aggregator's parameter (topk's k, quantile's φ, …)
   --by: list<string> = []       # by (labels)
   --without: list<string> = []  # without (labels)
+  --range-funcs: any = null     # functions that REQUIRE --range; default `range-funcs`, [] to disable
+  --param-aggs: any = null      # aggregators that REQUIRE --param; default `param-aggs`, [] to disable
 ]: nothing -> string {
   if ($metric | is-empty) { error make {msg: "promql build: a metric is required"} }
+  if ($metric !~ '^[a-zA-Z_:][a-zA-Z0-9_:]*$') { error make {msg: $"not a metric name: '($metric)' — a raw expression goes in raw-query"} }
+  for l in ($by ++ $without) {
+    if ($l !~ '^[a-zA-Z_][a-zA-Z0-9_]*$') { error make {msg: $"not a label name: '($l)' — --by/--without take a comma-separated list of labels"} }
+  }
+  let needs_range = ($range_funcs | default (range-funcs))
+  let needs_param = ($param_aggs | default (param-aggs))
+  let window = (if ($range | is-empty) { "" } else { range-text $range })
+  if ($func | is-not-empty) and ($func in $needs_range) and ($window | is-empty) {
+    error make {msg: $"($func)\(\) needs a range window — pass --range \(e.g. --range 5m\)"}
+  }
+  if ($agg | is-not-empty) and ($agg in $needs_param) and ($param | is-empty) {
+    error make {msg: $"($agg) needs its parameter — pass --param \(e.g. --agg topk --param 5\)"}
+  }
+  if ($param | is-not-empty) and ($agg | is-empty) { error make {msg: "--param needs --agg"} }
   mut e = ($metric + $matchers)
-  if ($range | is-not-empty) { $e = ($e + "[" + $range + "]") }
+  if ($window | is-not-empty) { $e = ($e + "[" + $window + "]") }
   if ($func | is-not-empty) { $e = ($func + "(" + $e + ")") }
   if ($agg | is-not-empty) {
     let grp = if ($by | is-not-empty) {
@@ -244,7 +317,8 @@ export def "build" [
     } else if ($without | is-not-empty) {
       " without (" + ($without | str join ", ") + ")"
     } else { "" }
-    $e = ($agg + $grp + " (" + $e + ")")
+    let head = (if ($param | is-empty) { "" } else { $param + ", " })
+    $e = ($agg + $grp + " (" + $head + $e + ")")
   }
   $e
 }
@@ -267,6 +341,19 @@ export def "funcs" []: nothing -> list<string> {
 export def "aggs" []: nothing -> list<string> {
   [sum avg min max count count_values group stddev stdvar topk bottomk quantile]
 }
+
+# The functions that take a RANGE vector — `build` rejects them without `--range`.
+# Strict PromQL; MetricsQL allows an implicit window, so its driver passes `[]`.
+@category mole-promql
+@example "rate needs a window" { "rate" in (promql range-funcs) } --result true
+export def "range-funcs" []: nothing -> list<string> {
+  [rate irate increase delta idelta deriv predict_linear] ++ (funcs | where {|f| $f | str ends-with "_over_time" })
+}
+
+# The aggregators that take a PARAMETER — `build` rejects them without `--param`.
+@category mole-promql
+@example "topk needs k" { "topk" in (promql param-aggs) } --result true
+export def "param-aggs" []: nothing -> list<string> { [topk bottomk quantile count_values] }
 
 # Suggested range-vector windows.
 @category mole-promql
@@ -328,23 +415,37 @@ def unquote [s: string]: nothing -> string {
 # ---- time range (clock injected, so the library stays pure) -------------------
 
 # Resolve --last / --start / --end into a {start, end} of datetimes (either may be
-# null = unbounded). Explicit --start/--end win; --last is "now minus dur",
-# defaulting the missing end to now. The clock is passed IN as `now` (the plugin
+# null = unbounded). Explicit --start/--end win; --last is a window ending at the
+# END — the explicit `--end` when given, else `now` — so `--last 1hr --end <t>` is
+# the hour before `<t>`, not the hour before now. `--closed` is for endpoints that
+# need BOTH bounds (`/query_range`): a `--start` with no end then ends at `now`
+# instead of staying open. A window whose start is after its end is an error here,
+# not an empty result on the server. The clock is passed IN as `now` (the plugin
 # supplies `(date now)`), so this stays pure and deterministic to test.
 @category mole-promql
 @example "a --last window resolves against the injected now" {
   promql resolve-range 1min null null 2023-11-14T22:13:20Z
 } --result {start: 2023-11-14T22:12:20Z, end: 2023-11-14T22:13:20Z}
+@example "--last anchors on an explicit --end" {
+  promql resolve-range 1min null 2023-11-14T20:00:00Z 2023-11-14T22:13:20Z
+} --result {start: 2023-11-14T19:59:00Z, end: 2023-11-14T20:00:00Z}
+@example "--closed turns a start-only window into start..now" {
+  promql resolve-range null 2023-11-14T20:00:00Z null 2023-11-14T22:13:20Z --closed
+} --result {start: 2023-11-14T20:00:00Z, end: 2023-11-14T22:13:20Z}
 @example "no window is unbounded" {
   promql resolve-range null null null 2023-11-14T22:13:20Z
 } --result {start: null, end: null}
 export def "resolve-range" [
-  last: any        # a duration (window ending at `now`), or null
+  last: any        # a duration (window ending at `end`, else at `now`), or null
   start: any       # explicit start datetime (wins over --last), or null
-  end: any         # explicit end datetime (wins over --last's now), or null
+  end: any         # explicit end datetime, or null
   now: datetime    # the current instant, injected by the caller
+  --closed         # a start without an end ends at `now` (for endpoints needing both bounds)
 ]: nothing -> record {
-  let e = if ($end | is-not-empty) { $end } else if ($last | is-not-empty) { $now } else { null }
-  let s = if ($start | is-not-empty) { $start } else if ($last | is-not-empty) { $now - $last } else { null }
+  let e = if ($end | is-not-empty) { $end } else if ($last | is-not-empty) or ($closed and ($start | is-not-empty)) { $now } else { null }
+  let s = if ($start | is-not-empty) { $start } else if ($last | is-not-empty) { $e - $last } else { null }
+  if ($s != null) and ($e != null) and ($s > $e) {
+    error make {msg: $"time window is empty: start ($s) is after end ($e)"}
+  }
   {start: $s, end: $e}
 }

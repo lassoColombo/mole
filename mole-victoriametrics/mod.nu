@@ -9,7 +9,7 @@
 #
 # CLOSE PORT OF mole-prometheus: VictoriaMetrics is Prometheus-querying-API
 # compatible — same `/api/v1` endpoints, same request params, same response
-# envelopes — so the verb shapes, result typing (promql.nu), and completion
+# envelopes — so the verb shapes, result typing (mole-promql), and completion
 # catalog are shared. The differences are: `driver` = `victoriametrics`,
 # the default server port 8428 (single-node), the query language is MetricsQL (a
 # PromQL superset, passed through as an opaque string), and the two VM-only reads.
@@ -39,7 +39,8 @@ use mole/lib/cache.nu
 use mole/lib/query.nu
 use mole/lib/complete.nu
 use ./client.nu
-use ./promql.nu
+use mole-promql/promql.nu
+use ./vmexport.nu
 
 export-env {
   conn register "victoriametrics"
@@ -66,6 +67,20 @@ def vm-base [conf: record]: nothing -> string {
 def vm-token [conf: record]: nothing -> string { $conf | get -o token | default "" }
 def vm-insecure [conf: record]: nothing -> bool { $conf | get -o insecure | default false }
 
+# The client's connection flags, as ONE record spread into every call
+# (`client … ...(vm-client-args $conf)`), so the base/token/TLS triple is bound once.
+def vm-client-args [conf: record]: nothing -> record {
+  {"base-url": (vm-base $conf), token: (vm-token $conf), insecure: (vm-insecure $conf)}
+}
+
+# Surface the envelope's `warnings`/`infos` (a 200 can still carry "rate() applied to
+# a non-counter" and the like) on stderr, so they are not lost unless `--full`.
+def vm-notices [resp: any]: nothing -> nothing {
+  for k in [warnings infos] {
+    for w in ($resp | get -o $k | default []) { print -e $"(ansi yellow)($k | str trim --right --char s): ($w)(ansi reset)" }
+  }
+}
+
 # ---- time range ---------------------------------------------------------------
 # `promql resolve-range` owns the --last/--start/--end logic (pure); the plugin
 # injects the clock, so `promql resolve-range $last $start $end (date now)` is the
@@ -78,11 +93,9 @@ def vm-insecure [conf: record]: nothing -> bool { $conf | get -o insecure | defa
 # catalog calls are short-timeout and only power tab-completion.
 def vm-catalog-load [conf: record, --refresh]: nothing -> record {
   cache fetch (cache path "victoriametrics" ($conf | get -o name | default "_")) 1day --refresh=$refresh {||
-    let base = (vm-base $conf)
-    let tok = (vm-token $conf)
-    let ins = (vm-insecure $conf)
-    let metrics = (client label-values get "__name__" --base-url $base --token $tok --insecure=$ins --max-time 10sec | get -o data | default [])
-    let labels = (client labels get --base-url $base --token $tok --insecure=$ins --max-time 10sec | get -o data | default [])
+    let args = (vm-client-args $conf)
+    let metrics = (client label-values get "__name__" ...$args --max-time 10sec | get -o data | default [])
+    let labels = (client labels get ...$args --max-time 10sec | get -o data | default [])
     {meta: {connection: ($conf | get -o name), driver: "victoriametrics"}, metrics: $metrics, labels: $labels}
   }
 }
@@ -123,15 +136,11 @@ def vm-ctx-metric [context: string]: nothing -> any {
   promql split-tokens (complete positionals $context) | get metric
 }
 
-# The sibling matcher tokens already typed (the operator-bearing positionals); the
-# metric and any <label> positional are operator-free, so they drop out naturally.
-def vm-ctx-siblings [context: string]: nothing -> list<string> {
-  promql split-tokens (complete positionals $context) | get matchers
-}
-
-# The selector the line implies (metric + siblings), for scoping live lookups.
+# The selector the line implies — the metric + the sibling matcher tokens already
+# typed (the operator-bearing positionals; the metric and any <label> positional
+# are operator-free, so they drop out) — for scoping live lookups.
 def vm-ctx-selector [context: string]: nothing -> string {
-  try { promql scope (vm-ctx-metric $context) (vm-ctx-siblings $context) } catch { "" }
+  try { promql scope (vm-ctx-metric $context) (promql split-tokens (complete positionals $context) | get matchers) } catch { "" }
 }
 
 # The {start, end} window implied by the --last/--start/--end flags on the line
@@ -150,7 +159,6 @@ def vm-catalog-ctx [context: string]: nothing -> record {
 # the cheapest useful suggestion is a metric name. (Label-name completion is
 # `vm-mlabel`, which scopes to the metric on the line.)
 def "vm-metric" [context: string]: nothing -> list<string> { vm-catalog-ctx $context | get -o metrics | default [] }
-def "vm-expr" [context: string]: nothing -> list<string> { vm-metric $context }
 
 # Metric-scoped label NAMES for completion. `__name__` is dropped — the metric
 # positional is how you pin it.
@@ -172,7 +180,7 @@ def "vm-mlabel" [context: string]: nothing -> list<string> {
   let r = (vm-range-ctx $context)
   try {
     (client labels get --qp-match [$sel] --start (promql ts $r.start) --end (promql ts $r.end)
-      --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf) --max-time 3sec
+      ...(vm-client-args $conf) --max-time 3sec
       | get -o data | default [] | where {|l| $l != "__name__" })
   } catch { [] }
 }
@@ -198,7 +206,7 @@ def "vm-matcher" [context: string]: nothing -> list<string> {
     try {
       (client label-values get $parsed.label --qp-match $match
         --start (promql ts $r.start) --end (promql ts $r.end)
-        --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf) --max-time 3sec
+        ...(vm-client-args $conf) --max-time 3sec
       | get -o data | default []
       | each {|v| $parsed.label + $parsed.op + $v })
     } catch { [] }
@@ -250,7 +258,7 @@ def "vm-window" [context: string]: nothing -> list<string> { promql windows }
 @example "a saved query against a named connection" { mole-victoriametrics raw-query --file dashboards/errors.mql -c prod }
 @example "query text piped via stdin" { mole query show dashboards/errors.mql | mole-victoriametrics raw-query -c prod }
 export def "raw-query" [
-  expr?: string@"vm-expr"                          # MetricsQL expression (else --file, else stdin, else $EDITOR)
+  expr?: string@"vm-metric"                          # MetricsQL expression (else --file, else stdin, else $EDITOR)
   --file(-f): string@"complete queryfile"          # saved query file (relative to the query dir)
   --time(-t): datetime                             # evaluation instant (default: server now)
   --limit(-l): int                                 # max number of series to return
@@ -265,9 +273,10 @@ export def "raw-query" [
   let conf = (vm-conf $connection $url $token $set)
   let q = ($in | query resolve $expr --file $file --suffix ".mql")
   let resp = (client query list --query $q --time (promql ts $time) --limit $limit --timeout $timeout
-    --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf))
+    ...(vm-client-args $conf))
   vm-warm $conf
   if $full { return $resp }
+  vm-notices $resp
   let data = ($resp | get -o data)
   if $raw { $data } else { promql normalize $data }
 }
@@ -283,11 +292,11 @@ export def "raw-query" [
 @example "last hour of a rate, at 1-minute resolution" { mole-victoriametrics raw-query-range "rate(http_requests_total[5m])" --last 1hr --step 1min }
 @example "an explicit window" { mole-victoriametrics raw-query-range "up" --start 2026-07-26T00:00:00Z --end 2026-07-26T06:00:00Z --step 5min }
 export def "raw-query-range" [
-  expr?: string@"vm-expr"                          # MetricsQL expression (else --file, else stdin, else $EDITOR)
+  expr?: string@"vm-metric"                          # MetricsQL expression (else --file, else stdin, else $EDITOR)
   --file(-f): string@"complete queryfile"          # saved query file (relative to the query dir)
-  --last(-L): duration                             # window ending now (shorthand for --start (now - dur))
-  --start(-a): datetime                            # window start (overrides --last)
-  --end(-b): datetime                              # window end (default: now when --last is given)
+  --last(-L): duration                             # window ending at --end, else now (shorthand for --start (end - dur))
+  --start(-a): datetime                            # window start (overrides --last); alone, the window runs to now
+  --end(-b): datetime                              # window end (default: now)
   --step(-s): duration = 15sec                     # query resolution step
   --limit(-l): int                                 # max number of series to return
   --timeout: string                                # per-query evaluation timeout (e.g. "30s")
@@ -300,14 +309,16 @@ export def "raw-query-range" [
 ] {
   let conf = (vm-conf $connection $url $token $set)
   let q = ($in | query resolve $expr --file $file --suffix ".mql")
-  let range = (promql resolve-range $last $start $end (date now))
+  # --closed: a lone --start ends at now — /query_range needs BOTH bounds.
+  let range = (promql resolve-range $last $start $end (date now) --closed)
   if ($range.start | is-empty) { error make {msg: "raw-query-range needs a window: pass --last, or --start/--end"} }
   let resp = (client query-range list --query $q
     --start (promql ts $range.start) --end (promql ts $range.end) --step (promql step $step)
     --limit $limit --timeout $timeout
-    --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf))
+    ...(vm-client-args $conf))
   vm-warm $conf
   if $full { return $resp }
+  vm-notices $resp
   let data = ($resp | get -o data)
   if $raw { $data } else { promql normalize $data }
 }
@@ -327,7 +338,11 @@ export def "raw-query-range" [
 # window). A matcher token is `label=value` (→ `label="value"`), `label!=value`,
 # `label=~value` (regex) or `label!~value`; the value is quoted for you, so type
 # `code=~5..`, NOT `code=~"5.."`, and single-quote a value with spaces
-# (`'msg=hello world'`). `--func`/`--agg` complete from the MetricsQL
+# (`'msg=hello world'`); a value you DO quote is raw PromQL, kept as typed. One
+# matcher per token — a comma inside a bare value is an error, not a list.
+# Every part is validated: a range function (`rate`, `*_over_time`) needs `--range`
+# and a parametric aggregator (`topk`, `quantile`, …) needs `--param` — except
+# that MetricsQL allows an implicit window, so `--func rate` alone is accepted here. `--func`/`--agg` complete from the MetricsQL
 # function/aggregation sets (PromQL + VM extras); `--by`/`--without` are
 # comma-separated lists of the metric's labels. Results are typed exactly as
 # `raw-query`/`raw-query-range`.
@@ -347,10 +362,11 @@ export def "select" [
   --range(-r): string@"vm-window"                  # range-vector window, e.g. 5m → [5m] (for rate/increase/…)
   --func: string@"vm-func"                         # wrap the selector in this function (rate, rollup, …)
   --agg: string@"vm-agg"                           # aggregate with this operator (sum, avg, topk, …)
+  --param(-k): string                              # the aggregator's parameter: topk/bottomk's k, quantile's φ, count_values' "label"
   --by: string@"vm-by"                             # aggregation grouping: by (labels), comma-separated — needs --agg
   --without: string@"vm-by"                        # aggregation grouping: without (labels), comma-separated — needs --agg
-  --time(-t): datetime                             # instant to evaluate at (default: server now)
-  --last(-L): duration                             # range mode: window ending now
+  --time(-t): datetime                             # instant to evaluate at (default: server now); instant mode only
+  --last(-L): duration                             # range mode: window ending at --end, else now
   --start(-a): datetime                            # range mode: window start
   --end(-b): datetime                              # range mode: window end
   --step(-s): duration = 15sec                     # range mode: resolution step
@@ -374,15 +390,21 @@ export def "select" [
   if ($by | is-not-empty) and ($without | is-not-empty) {
     error make {msg: "select: --by and --without are mutually exclusive"}
   }
+  let ranged = (($last | is-not-empty) or ($start | is-not-empty) or ($end | is-not-empty))
+  if $ranged and ($time | is-not-empty) {
+    error make {msg: "select: --time is instant-only — drop it, or drop --last/--start/--end"}
+  }
   let expr = (promql build $metric
     --matchers (promql matchers-tokens $matchers)
     --range ($range | default "")
     --func ($func | default "")
     --agg ($agg | default "")
+    --param ($param | default "")
     --by $by
-    --without $without)
+    --without $without
+    --range-funcs [])   # MetricsQL: rate(up) has an implicit window, so no range check
   if $dry_run { return {connection: (vm-conf $connection $url $token $set | conn redact), query: $expr} }
-  if (($last | is-not-empty) or ($start | is-not-empty) or ($end | is-not-empty)) {
+  if $ranged {
     raw-query-range $expr --last $last --start $start --end $end --step $step --limit $limit --connection $connection --url $url --token $token --set $set --raw=$raw --full=$full
   } else {
     raw-query $expr --time $time --limit $limit --connection $connection --url $url --token $token --set $set --raw=$raw --full=$full
@@ -419,7 +441,7 @@ export def "series" [
   if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let range = (promql resolve-range $last $start $end (date now))
   (client series get --qp-match [$sel] --start (promql ts $range.start) --end (promql ts $range.end) --limit $limit
-    --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf))
+    ...(vm-client-args $conf))
   | get -o data | default []
   | each {|r| promql relabel $r }   # surface __name__ as `metric`, as raw-query/raw-query-range do
 }
@@ -452,7 +474,7 @@ export def "labels" [
   let range = (promql resolve-range $last $start $end (date now))
   let match = (if ($sel | is-empty) { null } else { [$sel] })
   (client labels get --qp-match $match --start (promql ts $range.start) --end (promql ts $range.end) --limit $limit
-    --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf))
+    ...(vm-client-args $conf))
   | get -o data | default []
 }
 
@@ -483,13 +505,16 @@ export def "label-values" [
   --set: record = {}
   --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
+  if ((promql matcher-token $label) != null) {
+    error make {msg: $"label-values: '($label)' is a matcher, not a label name — put matchers after the label \(label-values job env=prod\)"}
+  }
   let conf = (vm-conf $connection $url $token $set)
   let sel = (promql scope $metric $matchers)
   if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let range = (promql resolve-range $last $start $end (date now))
   let match = (if ($sel | is-empty) { null } else { [$sel] })
   (client label-values get $label --qp-match $match --start (promql ts $range.start) --end (promql ts $range.end) --limit $limit
-    --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf))
+    ...(vm-client-args $conf))
   | get -o data | default []
 }
 
@@ -511,7 +536,7 @@ export def "metrics" [
 ] {
   let conf = (vm-conf $connection $url $token $set)
   (client metadata get --metric $metric --limit $limit --limit-per-metric $limit_per_metric
-    --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf))
+    ...(vm-client-args $conf))
   | get -o data | default {} | promql metadata $in
 }
 
@@ -530,7 +555,7 @@ export def "tsdb-status" [
   metric?: string@"vm-metric"                      # metric to scope the stats by
   ...matchers: string@"vm-matcher"                 # label matchers to further scope the stats
   --date: string                                   # day (YYYY-MM-DD) to report stats for
-  --topN(-t): int                                  # cap each breakdown to N entries
+  --topN(-N): int                                  # cap each breakdown to N entries
   --connection(-c): string@complete-connection
   --url: string
   --token: string
@@ -543,7 +568,7 @@ export def "tsdb-status" [
   if $dry_run { return {connection: ($conf | conn redact), query: $sel} }
   let match = (if ($sel | is-empty) { null } else { [$sel] })
   let resp = (client status-tsdb get --date $date --topN $topN --match $match
-    --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf))
+    ...(vm-client-args $conf))
   if $full { $resp } else { $resp | get -o data | default {} }
 }
 
@@ -583,9 +608,9 @@ export def "export-samples" [
   # non-empty line as its own JSON object.
   let text = (client export get --match [$sel] --start (promql ts $range.start) --end (promql ts $range.end)
     --max-rows-per-line $max_rows_per_line
-    --base-url (vm-base $conf) --token (vm-token $conf) --insecure=(vm-insecure $conf) --raw)
+    ...(vm-client-args $conf) --raw)
   let lines = ($text | lines | where {|l| $l | str trim | is-not-empty } | each {|l| $l | from json })
-  if $raw { $lines } else { promql export-lines $lines }
+  if $raw { $lines } else { vmexport export-lines $lines }
 }
 
 # Make a victoriametrics connection the current one for this driver.

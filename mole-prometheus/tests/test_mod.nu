@@ -59,6 +59,27 @@ def "select guards error" [] {
   assert error { mole-prometheus select up hello world -c prometheus-local-dev --dry-run }                     # a bare non-matcher token
 }
 
+@test
+def "select validates every part instead of guessing" [] {
+  fixture
+  assert error { mole-prometheus select up --func rate -c prometheus-local-dev --dry-run }                          # a range function needs --range
+  assert equal (mole-prometheus select up --func rate --range 5min -c prometheus-local-dev --dry-run | get query) "rate(up[300s])"   # a Nushell duration spelling renders
+  assert error { mole-prometheus select up --func rate --range 5 -c prometheus-local-dev --dry-run }                # a unit-less window
+  assert error { mole-prometheus select up --agg topk -c prometheus-local-dev --dry-run }                           # a parametric aggregator needs --param
+  assert equal (mole-prometheus select up --agg topk --param 5 --by job -c prometheus-local-dev --dry-run | get query) "topk by (job) (5, up)"
+  assert error { mole-prometheus select up job=api,env=prod -c prometheus-local-dev --dry-run }                     # one matcher per positional, never a comma list
+  assert equal (mole-prometheus select up 'path="a\\"b"' -c prometheus-local-dev --dry-run | get query) 'up{path="a\\"b"}'   # a quoted value is raw PromQL, not re-escaped
+  assert error { mole-prometheus select up --time 2026-01-01T00:00:00Z --last 1hr -c prometheus-local-dev --dry-run }   # --time is instant-only
+}
+
+@test
+def "raw-query-range needs a window and label-values needs a label" [] {
+  fixture
+  assert error { mole-prometheus raw-query-range up -c prometheus-local-dev }                                       # no window at all
+  assert error { mole-prometheus label-values job=api -c prometheus-local-dev --dry-run }                           # a matcher where the label goes
+  assert equal (mole-prometheus label-values job --metric up env=prod -c prometheus-local-dev --dry-run | get query) 'up{env="prod"}'
+}
+
 # ---- enumeration verbs: dry-run selector assembly -----------------------------
 
 @test

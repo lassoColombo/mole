@@ -6,7 +6,9 @@
 #      GET operations tagged query/series/labels/metadata (structurally read-only).
 #   2. Trim to the exact endpoints the wrapper uses — the tag filter also pulls in
 #      a few extra query/label operations and their enum completers; drop those.
-#   3. Relax each command's `-> record<status: ...>` return type to `-> any`.
+#   3. Relax each command's `-> record<status: ...>` return type to `-> any`, and
+#      make `match[]` serialize as a repeated param (the spec's array is rendered
+#      comma-joined by the generator; the API wants `match[]=a&match[]=b`).
 #      Prometheus omits `warnings`/`infos` on ordinary responses, and Nushell
 #      RUNTIME-ENFORCES declared output types, so the precise generated type would
 #      reject nearly every real response. The wrapper (mod.nu) does the real typing.
@@ -69,7 +71,10 @@ def main [
   # left alone.
   let final = ($kept
     | str join "\n\n"
-    | str replace --all --regex '(?m)-> record<status:.*> \{$' '-> any {')
+    | str replace --all --regex '(?m)-> record<status:.*> \{$' '-> any {'
+    # `match[]` is a REPEATABLE param (`match[]=a&match[]=b`): the generator renders
+    # the spec's array as one comma-joined value, which the server rejects.
+    | str replace --all '"match[]" $qp_match "csv"' '"match[]" $qp_match "multi"')
 
   $final | save -f $out
   rm -f $tmp

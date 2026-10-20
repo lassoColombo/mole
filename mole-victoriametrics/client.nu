@@ -199,7 +199,7 @@ export def "labels get" [
 ]: nothing -> any {
   let auth = (build-auth $token ($auth_scheme | default "bearer"))
   let base = ($base_url | default $BASE_URL)
-  let qp = [(serialize-qp "start" $start "scalar") (serialize-qp "end" $end "scalar") (serialize-qp "match[]" $qp_match "csv") (serialize-qp "limit" $limit "scalar")] | flatten | str join "&"
+  let qp = [(serialize-qp "start" $start "scalar") (serialize-qp "end" $end "scalar") (serialize-qp "match[]" $qp_match "multi") (serialize-qp "limit" $limit "scalar")] | flatten | str join "&"
   let full_url = (build-url $base "/labels" $qp $auth.query)
   let accept_val = "application/json"
   let auth = ($auth | update headers ($auth.headers | merge {Accept: $accept_val}))
@@ -240,7 +240,7 @@ export def "label-values get" [
   let auth = (build-auth $token ($auth_scheme | default "bearer"))
   let base = ($base_url | default $BASE_URL)
   if ($name | is-empty) { error make --unspanned { msg: "path parameter 'name' must be non-empty" } }
-  let qp = [(serialize-qp "start" $start "scalar") (serialize-qp "end" $end "scalar") (serialize-qp "match[]" $qp_match "csv") (serialize-qp "limit" $limit "scalar")] | flatten | str join "&"
+  let qp = [(serialize-qp "start" $start "scalar") (serialize-qp "end" $end "scalar") (serialize-qp "match[]" $qp_match "multi") (serialize-qp "limit" $limit "scalar")] | flatten | str join "&"
   let full_url = (build-url $base ({name: (encode-path-segment $name)} | format pattern "/label/{name}/values") $qp $auth.query)
   let accept_val = "application/json"
   let auth = ($auth | update headers ($auth.headers | merge {Accept: $accept_val}))
@@ -279,7 +279,7 @@ export def "series get" [
 ]: nothing -> any {
   let auth = (build-auth $token ($auth_scheme | default "bearer"))
   let base = ($base_url | default $BASE_URL)
-  let qp = [(serialize-qp "start" $start "scalar") (serialize-qp "end" $end "scalar") (serialize-qp "match[]" $qp_match "csv") (serialize-qp "limit" $limit "scalar")] | flatten | str join "&"
+  let qp = [(serialize-qp "start" $start "scalar") (serialize-qp "end" $end "scalar") (serialize-qp "match[]" $qp_match "multi") (serialize-qp "limit" $limit "scalar")] | flatten | str join "&"
   let full_url = (build-url $base "/series" $qp $auth.query)
   let accept_val = "application/json"
   let auth = ($auth | update headers ($auth.headers | merge {Accept: $accept_val}))
@@ -357,7 +357,7 @@ export def "status-tsdb get" [
 ]: nothing -> any {
   let auth = (build-auth $token ($auth_scheme | default "bearer"))
   let base = ($base_url | default $BASE_URL)
-  let qp = [(serialize-qp "date" $date "scalar") (serialize-qp "topN" $topN "scalar") (serialize-qp "match[]" $match "csv")] | flatten | str join "&"
+  let qp = [(serialize-qp "date" $date "scalar") (serialize-qp "topN" $topN "scalar") (serialize-qp "match[]" $match "multi")] | flatten | str join "&"
   let full_url = (build-url $base "/status/tsdb" $qp $auth.query)
   let accept_val = "application/json"
   let auth = ($auth | update headers ($auth.headers | merge {Accept: $accept_val}))
@@ -398,7 +398,7 @@ export def "export get" [
 ]: nothing -> any {
   let auth = (build-auth $token ($auth_scheme | default "bearer"))
   let base = ($base_url | default $BASE_URL)
-  let qp = [(serialize-qp "match[]" $match "csv") (serialize-qp "start" $start "scalar") (serialize-qp "end" $end "scalar") (serialize-qp "max_rows_per_line" $max_rows_per_line "scalar") (serialize-qp "reduce_mem_usage" $reduce_mem_usage "scalar")] | flatten | str join "&"
+  let qp = [(serialize-qp "match[]" $match "multi") (serialize-qp "start" $start "scalar") (serialize-qp "end" $end "scalar") (serialize-qp "max_rows_per_line" $max_rows_per_line "scalar") (serialize-qp "reduce_mem_usage" $reduce_mem_usage "scalar")] | flatten | str join "&"
   let full_url = (build-url $base "/export" $qp $auth.query)
   let accept_val = "application/json"
   let auth = ($auth | update headers ($auth.headers | merge {Accept: $accept_val}))

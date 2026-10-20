@@ -16,7 +16,9 @@
 #      tagged query/series/labels/metadata (structurally read-only).
 #   2. Trim to the exact endpoints the wrapper uses — the tag filter also pulls in
 #      a few extra query/label operations and their enum completers; drop those.
-#   3. Relax each command's `-> record<status: ...>` return type to `-> any`. The
+#   3. Relax each command's `-> record<status: ...>` return type to `-> any`, and
+#      make `match[]` serialize as a repeated param (the spec's array is rendered
+#      comma-joined by the generator; the API wants `match[]=a&match[]=b`). The
 #      API omits `warnings`/`infos` on ordinary responses, and Nushell RUNTIME-
 #      ENFORCES declared output types, so the precise generated type would reject
 #      nearly every real response. The wrapper (mod.nu) does the real typing.
@@ -70,7 +72,7 @@ export def "status-tsdb get" [
 ]: nothing -> any {
   let auth = (build-auth $token ($auth_scheme | default "bearer"))
   let base = ($base_url | default $BASE_URL)
-  let qp = [(serialize-qp "date" $date "scalar") (serialize-qp "topN" $topN "scalar") (serialize-qp "match[]" $match "csv")] | flatten | str join "&"
+  let qp = [(serialize-qp "date" $date "scalar") (serialize-qp "topN" $topN "scalar") (serialize-qp "match[]" $match "multi")] | flatten | str join "&"
   let full_url = (build-url $base "/status/tsdb" $qp $auth.query)
   let accept_val = "application/json"
   let auth = ($auth | update headers ($auth.headers | merge {Accept: $accept_val}))
@@ -111,7 +113,7 @@ export def "export get" [
 ]: nothing -> any {
   let auth = (build-auth $token ($auth_scheme | default "bearer"))
   let base = ($base_url | default $BASE_URL)
-  let qp = [(serialize-qp "match[]" $match "csv") (serialize-qp "start" $start "scalar") (serialize-qp "end" $end "scalar") (serialize-qp "max_rows_per_line" $max_rows_per_line "scalar") (serialize-qp "reduce_mem_usage" $reduce_mem_usage "scalar")] | flatten | str join "&"
+  let qp = [(serialize-qp "match[]" $match "multi") (serialize-qp "start" $start "scalar") (serialize-qp "end" $end "scalar") (serialize-qp "max_rows_per_line" $max_rows_per_line "scalar") (serialize-qp "reduce_mem_usage" $reduce_mem_usage "scalar")] | flatten | str join "&"
   let full_url = (build-url $base "/export" $qp $auth.query)
   let accept_val = "application/json"
   let auth = ($auth | update headers ($auth.headers | merge {Accept: $accept_val}))
@@ -168,7 +170,10 @@ def main [
   # left alone.
   let relaxed = ($kept
     | str join "\n\n"
-    | str replace --all --regex '(?m)-> record<status:.*> \{$' '-> any {')
+    | str replace --all --regex '(?m)-> record<status:.*> \{$' '-> any {'
+    # `match[]` is a REPEATABLE param (`match[]=a&match[]=b`): the generator renders
+    # the spec's array as one comma-joined value, which the server rejects.
+    | str replace --all '"match[]" $qp_match "csv"' '"match[]" $qp_match "multi"')
 
   # Append the hand-written VM-specific GET endpoints.
   let final = ($relaxed ++ $VM_EXTRA)
