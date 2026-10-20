@@ -3,20 +3,7 @@ use std/testing *
 use ../logsql.nu
 
 # ---- scalar coercions ---------------------------------------------------------
-
-@test
-def "num coerces stats sample-value strings" [] {
-    assert equal (logsql num "3.14") 3.14
-    assert equal (logsql num "0") 0.0
-    assert equal (logsql num "NaN") null          # Nushell has no NaN literal
-    assert equal (logsql num 5) 5                  # non-strings pass through untouched
-}
-
-@test
-def "epoch converts unix seconds to datetime" [] {
-    assert equal (logsql epoch 0) 1970-01-01T00:00:00Z
-    assert equal (logsql epoch 1704067200) 2024-01-01T00:00:00Z
-}
+# (`num`/`time` come from mole-promql and are tested there.)
 
 @test
 def "rfc3339 parses a string to datetime, keeping unparseable input" [] {
@@ -36,6 +23,9 @@ def "step renders integer seconds, null-safe" [] {
     assert equal (logsql step 30min) "1800s"
     assert equal (logsql step 15sec) "15s"
     assert equal (logsql step null) null
+    assert equal (logsql step 500ms) "500ms"     # never truncated to `0s`
+    assert error { logsql step 0sec }            # the server would reject it, less clearly
+    assert error { logsql step (0sec - 1sec) }
 }
 
 # ---- query (JSONL) ------------------------------------------------------------
@@ -59,6 +49,9 @@ def "col-kind infers a column type all-or-nothing" [] {
     assert equal (logsql col-kind ["5" "12.5"]) "float"                      # int + decimal → float
     assert equal (logsql col-kind ["true" "false"]) "bool"
     assert equal (logsql col-kind ["2026-08-10T10:00:00Z" "2026-08-10T11:00:00Z"]) "datetime"
+    assert equal (logsql col-kind ["2026-08-10T10:00:00+02:00"]) "datetime"           # an offset is a zone too
+    assert equal (logsql col-kind ["2026-08-10" "2026-08-11"]) "string"               # zoneless → would shift to local time
+    assert equal (logsql col-kind ["2026-08-10T10:00:00"]) "string"
     assert equal (logsql col-kind ["[1,2]" "[3]"]) "json"
     assert equal (logsql col-kind ["500" "n/a"]) "string"                    # one misfit
     assert equal (logsql col-kind []) "string"                              # no evidence
@@ -214,7 +207,8 @@ def "facets renames field_name and field_value to the tidy shape" [] {
 def "lit leaves bare-safe words alone and quotes the rest" [] {
     assert equal (logsql lit "error") "error"
     assert equal (logsql lit "web-1.host") "web-1.host"
-    assert equal (logsql lit "*") "*"
+    assert equal (logsql lit "*") '"*"'              # bare, a star is a wildcard — a picked value means itself
+    assert equal (logsql lit "a*b") '"a*b"'
     assert equal (logsql lit "web server") '"web server"'
     assert equal (logsql lit 'say "hi"') '"say \"hi\""'
 }
@@ -228,6 +222,32 @@ def "has-pipe detects only top-level pipes, not quoted ones" [] {
     assert equal (logsql has-pipe '_msg:`a|b`') false                # backtick-quoted phrase
     assert equal (logsql has-pipe 'app:~"api|web" | stats count()') true   # a quoted pipe AND a real one
     assert equal (logsql has-pipe '_msg:"say \"hi\" | bye"') false    # escaped quotes inside; pipe is data
+}
+
+@test
+def "bare-range flags a comparison missing its field colon" [] {
+    assert equal (logsql bare-range "status>=500") true
+    assert equal (logsql bare-range "latency<0.5") true
+    assert equal (logsql bare-range "-status>=500") true       # negated forms are the same word filter
+    assert equal (logsql bare-range "!status>=500") true
+    assert equal (logsql bare-range "NOT status>=500") true
+    assert equal (logsql bare-range "not status>=500") true
+    assert equal (logsql bare-range "-status:>=500") false     # negated LogsQL spelling is fine
+    assert equal (logsql bare-range "status:>=500") false      # the LogsQL spelling
+    assert equal (logsql bare-range "user=alice") false        # a word search in logfmt logs
+    assert equal (logsql bare-range '"a>b"') false              # a quoted phrase
+    assert equal (logsql bare-range "level:error OR status:>500") false
+}
+
+@test
+def "compose-filter AND-joins tokens and rejects what would silently mismatch" [] {
+    assert equal (logsql compose-filter []) "*"
+    assert equal (logsql compose-filter ["" "   "]) "*"                              # blank tokens are dropped
+    assert equal (logsql compose-filter [level:error "  " status:>=500]) "level:error status:>=500"
+    assert equal (logsql compose-filter [timeout 'app:~"api|web"']) 'timeout app:~"api|web"'   # a quoted pipe is data
+    assert error { logsql compose-filter ["status>=500"] }                            # bare range → word filter
+    assert error { logsql compose-filter ["-status>=500"] }                           # … negated too
+    assert error { logsql compose-filter ["level:error | stats count()"] }            # a smuggled stage
 }
 
 @test
@@ -248,10 +268,14 @@ def "build-pipeline assembles filter plus stages in order" [] {
     # stream_context: either side alone, or both
     assert equal (logsql build-pipeline "error" --context-after 2) "error | stream_context after 2"
     assert equal (logsql build-pipeline "error" --context-before 1 --context-after 2) "error | stream_context before 1 after 2"
-    # full stage order: filter | stream_context | fields | delete | sort | limit
+    # full stage order: filter | stream_context | fields | delete | sort | offset | limit
     assert equal (
-        logsql build-pipeline "level:error" --context-after 1 --fields [_time _msg host] --sort-by [_time] --desc --limit 5
-    ) "level:error | stream_context after 1 | fields _time, _msg, host | sort by (_time) desc | limit 5"
+        logsql build-pipeline "level:error" --context-after 1 --fields [_time _msg host] --sort-by [_time] --desc --offset 20 --limit 5
+    ) "level:error | stream_context after 1 | fields _time, _msg, host | sort by (_time) desc | offset 20 | limit 5"
+    # paging is in the pipeline (an HTTP offset would page the already-limited result)
+    assert equal (logsql build-pipeline "*" --offset 10) "* | offset 10"
+    assert error { logsql build-pipeline "*" --limit -5 }
+    assert error { logsql build-pipeline "*" --offset -1 }
 }
 
 # ---- stats building (composable `stats`) --------------------------------------
@@ -281,6 +305,17 @@ def "build-stats puts the by-clause before the functions" [] {
     assert equal (
         logsql build-stats "*" --by ["_time:1h" level] --aggs [{expr: "count()", name: "count"}]
     ) "* | stats by (_time:1h, level) count() as count"
+    assert error { logsql build-stats "*" --limit -1 }
+}
+
+@test
+def "build-stats rejects duplicate or clashing result columns" [] {
+    # `--sum bytes,bytes` would name two columns sum_bytes
+    assert error { logsql build-stats "*" --aggs [{expr: "sum(bytes)", name: "sum_bytes"} {expr: "sum(bytes)", name: "sum_bytes"}] }
+    # `--by count --count` would be two columns called count
+    assert error { logsql build-stats "*" --by [count] --aggs [{expr: "count()", name: "count"}] }
+    # a bucketed by-field clashes by its bare name
+    assert error { logsql build-stats "*" --by ["count:10"] --aggs [{expr: "count()", name: "count"}] }
 }
 
 @test

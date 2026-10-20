@@ -56,18 +56,15 @@ export def "headers" [conf: record]: nothing -> record {
 }
 
 # POST a form-urlencoded request to <path>, returning the raw response body as
-# text. Params with null/empty values are dropped; the rest are stringified and
-# handed to `http post` as a record, which form-encodes them. Raises on non-2xx
-# with the server's error body. `--timeout` overrides the default (completers
-# pass a short one). `--insecure` from the connection skips TLS verification.
+# text. Params with null/empty values are dropped; the rest are form-encoded into
+# the body here (not by handing `http post` a record: that cannot repeat a key, and
+# VictoriaLogs' `field` param is repeatable — a LIST value renders as one `k=v` pair
+# per item). Raises on non-2xx with the server's error body. `--timeout` overrides
+# the default (completers pass a short one). `--insecure` from the connection skips
+# TLS verification.
 export def "request" [conf: record, path: string, params: record, --timeout: duration]: nothing -> string {
   let url = $"(base-url $conf)($path)"
-  let form = (
-    $params
-    | items {|k, v| {k: $k, v: $v} }
-    | where {|it| $it.v | is-not-empty }
-    | reduce --fold {} {|it, acc| $acc | insert $it.k ($it.v | into string) }
-  )
+  let form = (form-body $params)
   let insecure = ($conf | get -o insecure | default false)
   let resp = (
     http post
@@ -82,6 +79,20 @@ export def "request" [conf: record, path: string, params: record, --timeout: dur
     error make --unspanned {msg: $"VictoriaLogs HTTP ($resp.status) at ($path): ($resp.body)"}
   }
   $resp.body
+}
+
+# The `application/x-www-form-urlencoded` body for a params record: null/empty
+# values dropped, a list value repeated as one pair per item, everything
+# percent-encoded. Pure, so the encoding is unit-testable without a server.
+export def "form-body" [params: record]: nothing -> string {
+  $params
+  | items {|k, v| {k: $k, v: $v} }
+  | where {|it| $it.v | is-not-empty }
+  | each {|it|
+      let vals = (if (($it.v | describe) | str starts-with "list") { $it.v } else { [$it.v] })
+      $vals | where {|v| $v | is-not-empty } | each {|v| ($it.k | url encode --all) + "=" + ($v | into string | url encode --all) }
+    }
+  | flatten | str join "&"
 }
 
 # ---- endpoints ---------------------------------------------------------------
@@ -100,18 +111,18 @@ export def "query" [
   request $conf "/select/logsql/query" { query: $query, start: $start, end: $end, limit: $limit, offset: $offset }
 }
 
-# Per-bucket hit counts over time. Returns the `{hits: [...]}` record.
+# Per-bucket hit counts over time. Returns the `{hits: [...]}` record. `--field`
+# is the API's repeatable `field` param: one group field per item.
 export def "hits" [
   conf: record
   query: string
   --start: string
   --end: string
   --step: string
-  --field: string
-  --offset: string
+  --field: list<string> = []
 ] {
   request $conf "/select/logsql/hits" {
-    query: $query, start: $start, end: $end, step: $step, field: $field, offset: $offset
+    query: $query, start: $start, end: $end, step: $step, field: $field
   } | from json
 }
 
@@ -175,20 +186,6 @@ export def "stream-field-names" [
   request $conf "/select/logsql/stream_field_names" { query: $query, start: $start, end: $end } --timeout $timeout | from json
 }
 
-# Distinct values of stream label <field>. Returns `{values: [...]}`.
-export def "stream-field-values" [
-  conf: record
-  query: string
-  field: string
-  --start: string
-  --end: string
-  --limit: int
-] {
-  request $conf "/select/logsql/stream_field_values" {
-    query: $query, field: $field, start: $start, end: $end, limit: $limit
-  } | from json
-}
-
 # Active streams matching the query, with hit counts. Returns `{values: [...]}`,
 # each `value` a stream selector like `{host="h1",app="foo"}`.
 export def "streams" [
@@ -199,17 +196,6 @@ export def "streams" [
   --limit: int
 ] {
   request $conf "/select/logsql/streams" { query: $query, start: $start, end: $end, limit: $limit } | from json
-}
-
-# Stream ids matching the query, with hit counts. Returns `{values: [...]}`.
-export def "stream-ids" [
-  conf: record
-  query: string
-  --start: string
-  --end: string
-  --limit: int
-] {
-  request $conf "/select/logsql/stream_ids" { query: $query, start: $start, end: $end, limit: $limit } | from json
 }
 
 # Most frequent field values grouped by field. Returns the `{facets: [...]}` record.

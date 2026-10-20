@@ -34,6 +34,7 @@ def "complete-connection" []: nothing -> list<string> { conn names "victorialogs
 use mole/lib/cache.nu
 use mole/lib/query.nu
 use mole/lib/complete.nu
+use mole-promql/promql.nu
 use ./client.nu
 use ./logsql.nu
 
@@ -52,15 +53,12 @@ def vl-conf [connection: any, url: any, token: any, set: record]: nothing -> rec
 }
 
 # ---- time range ---------------------------------------------------------------
-# (Pure time/duration formatting lives in logsql.nu; only this reads the clock.)
-
-# Resolve --last / --start / --end into a {start, end} of datetimes (either may be
-# null = unbounded). Explicit --start/--end win; --last is "now minus dur",
-# defaulting the missing end to now.
+# `promql resolve-range` owns the --last/--start/--end logic (pure, shared with the
+# metrics drivers — `--last` anchors on an explicit `--end`, an inverted window
+# errors); only this reads the clock. Every VictoriaLogs endpoint defaults a
+# missing `end` to now server-side, so the window stays open-ended here.
 def vl-range [last: any, start: any, end: any]: nothing -> record {
-  let e = if ($end | is-not-empty) { $end } else if ($last | is-not-empty) { (date now) } else { null }
-  let s = if ($start | is-not-empty) { $start } else if ($last | is-not-empty) { (date now) - $last } else { null }
-  {start: $s, end: $e}
+  promql resolve-range $last $start $end (date now)
 }
 
 # ---- completion catalog (field names) -----------------------------------------
@@ -106,13 +104,6 @@ def vl-range-ctx [context: string]: nothing -> record {
   vl-range $f.last $f.start $f.end
 }
 
-# The cached catalog for whatever connection the command line names (or the current
-# one). Cache-only — the instant fallback that `vl-field` drops back to when its live
-# scoped lookup is empty or errors.
-def vl-catalog-ctx [context: string]: nothing -> record {
-  complete catalog-ctx $context victorialogs
-}
-
 # Field-name suggestions, scoped to the filters + window already on the line: a LIVE
 # `field_names` ∪ `stream_field_names` (short timeout) reflecting what actually exists
 # in the current query. This hits the network per tab. An UNSCOPED line (`*`, no
@@ -120,7 +111,8 @@ def vl-catalog-ctx [context: string]: nothing -> record {
 # live call is empty or fails; a SCOPED lookup is authoritative — empty or errored →
 # [] rather than the global catalog, which would offer fields the scope does not have.
 def "vl-field" [context: string]: nothing -> list<string> {
-  let cached = (vl-catalog-ctx $context | get -o fields | default [])
+  # the cached catalog of the connection the line names: the instant fallback below
+  let cached = (complete catalog-ctx $context victorialogs | get -o fields | default [])
   let conf = (complete conn-ctx $context victorialogs)
   if ($conf | is-empty) { return $cached }
   let filter = (vl-filters-ctx $context)
@@ -230,29 +222,16 @@ def "vl-stat-cols" [context: string]: nothing -> list<string> {
 }
 
 # ---- execution ----------------------------------------------------------------
-
-# Compose a LogsQL *filter* from AND-joined filter tokens. LogsQL ANDs
-# space-separated filters, so the tokens are space-joined; an empty result becomes
-# `*` (match everything). A top-level `|` pipe is rejected — a filter token may not
-# smuggle its own pipeline stage; `raw-query` is the escape hatch for that. The check
-# is quote-aware (`logsql has-pipe`), so a `|` inside a quoted regex/phrase (e.g.
-# `app:~"api|web"`) is allowed. Shared by `select` and the enumeration verbs
-# (`fields`/`field-values`/`streams`/`facets`), which all take completing filter
-# tokens instead of a raw query string. Raw filter syntax (regex, `OR`, ranges) is
-# just a quoted token — there is no separate `--where`.
-def vl-compose-filter [filters: list<string>]: nothing -> string {
-  let filter = ($filters | where {|p| $p | is-not-empty } | str join " ")
-  if (logsql has-pipe $filter) {
-    error make {msg: "a '|' pipe isn't allowed in a filter token — use `raw-query` for a full LogsQL pipeline"}
-  }
-  if ($filter | is-empty) { "*" } else { $filter }
-}
+# The filter every composing verb takes is `...filters` tokens, AND-joined by the
+# pure `logsql compose-filter` (blank tokens dropped, a bare range comparison or a
+# smuggled `|` pipe rejected, nothing → `*`).
 
 # Fetch a resolved LogsQL query, warm the catalog, and return typed rows projected
 # to the `output` verbosity. Shared by `raw-query` and `select` — they differ only in
 # how `$q` is produced. `raw` skips the `_time` datetime coercion; `output` is one
-# of compact/wide/full (see `logsql shape`). (`limit`/`offset` are `any` so a null
-# passes straight through to the client's int flags.)
+# of compact/wide/full (see `logsql shape`). `limit`/`offset` are the HTTP params,
+# which page the query's RESULT — `raw-query` uses them; `select` pages inside its
+# pipeline instead and passes null (`any` so a null reaches the client's int flags).
 def vl-run [conf: record, q: string, range: record, limit: any, offset: any, raw: bool, output: string]: nothing -> any {
   let body = (client query $conf $q
     --start (logsql vl-time $range.start) --end (logsql vl-time $range.end) --limit $limit --offset $offset)
@@ -315,8 +294,9 @@ export def "raw-query" [
 # `'app:~"api-.*"'`. `--select` projects columns (`| fields …`, completing) and
 # `--drop` removes them (`| delete …`, completing) — the inverse; `--sort-by` is a
 # completing comma-list of fields (`| sort by (…)`), ascending unless `--desc`;
-# `--limit` caps; `--before`/`--after` pull N surrounding log lines around each
-# match (`| stream_context`). Rows come back typed like `raw-query` (`--raw` keeps the
+# `--offset`/`--limit` page (`| offset N | limit N`, after the sort); `--before`/`--after`
+# pull N surrounding log lines around each match (`| stream_context`). Rows come back
+# typed like `raw-query` (`--raw` keeps the
 # raw strings), and `--output` sets the column verbosity (compact | wide | full).
 # The window and connection flags are exactly `raw-query`'s. Single-stage on purpose —
 # a `|` in a filter token is rejected; reach for `raw-query` for an arbitrary pipeline
@@ -338,6 +318,9 @@ export def "raw-query" [
 @example "no filters matches everything" {
   mole-victorialogs select --limit 10 --dry-run | get query
 } --result "* | limit 10"
+@example "page two, newest first" {
+  mole-victorialogs select level:error --sort-by _time --desc --offset 10 --limit 10 --dry-run | get query
+} --result "level:error | sort by (_time) desc | offset 10 | limit 10"
 @example "newest first against a named connection" {
   mole-victorialogs select level:error --sort-by _time --desc --last 1hr -c prod
 }
@@ -348,12 +331,12 @@ export def "select" [
   --sort-by(-s): string@"vl-proj-csv"              # sort fields, comma-separated → `| sort by (...)`
   --desc(-d)                                       # sort descending (default: ascending)
   --limit(-l): int                                 # `| limit N`
+  --offset(-o): int                                # `| offset N` — skip N entries (pagination, before the limit)
   --before: int                                    # stream_context: N log lines before each match
   --after: int                                     # stream_context: N log lines after each match
   --last(-L): duration                             # window ending now (shorthand for --start (now - dur))
   --start(-a): datetime                            # window start (overrides --last)
   --end(-b): datetime                              # window end (default: now when --last is given)
-  --offset(-o): int                                # skip N entries (pagination)
   --output(-O): string@"vl-output" = "compact"     # column verbosity: compact | wide | full
   --connection(-c): string@complete-connection   # named connection (default: current)
   --url: string                                    # override the connection URL
@@ -364,15 +347,16 @@ export def "select" [
 ] {
   let conf = (vl-conf $connection $url $token $set)
   # Single-stage by design: a filter token may not smuggle its own pipe (enforced
-  # by vl-compose-filter). `raw-query` is the escape hatch for a full LogsQL pipeline.
-  let filter = (vl-compose-filter $filters)
+  # by `logsql compose-filter`). `raw-query` is the escape hatch for a full LogsQL pipeline.
+  let filter = (logsql compose-filter $filters)
   let q = (logsql build-pipeline $filter
     --fields (complete csv $select) --drop (complete csv $drop)
-    --sort-by (complete csv $sort_by) --desc=$desc --limit $limit
+    --sort-by (complete csv $sort_by) --desc=$desc --offset $offset --limit $limit
     --context-before $before --context-after $after)
   if $dry_run { return {connection: ($conf | conn redact), query: $q} }
-  # Limit rides the `| limit` pipe in $q (so it applies after the sort), not the client param.
-  vl-run $conf $q (vl-range $last $start $end) null $offset $raw $output
+  # Paging rides the `| offset` / `| limit` pipes in $q (after the sort, over the
+  # whole match set) — never the HTTP params, which would page the already-limited result.
+  vl-run $conf $q (vl-range $last $start $end) null null $raw $output
 }
 
 # Per-bucket hit counts over time. Returns tidy `{time, <group>, hits}` rows.
@@ -380,12 +364,12 @@ export def "select" [
 # Like `select`, the log set is composed from `...filters` — LogsQL filter tokens
 # (`level:error`, `status:>=500`) AND-joined and tab-completing field → value (a raw
 # regex/`OR` filter is just a quoted token); no filters counts everything. `--step`
-# sets the bucket width (server default is auto); `--field` groups the counts by that
-# field's values, so each row carries the group columns. The window is `--last` or
-# `--start`/`--end`.
+# sets the bucket width (server default is auto); `--field` groups the counts by the
+# values of those fields (comma-separated), so each row carries the group columns.
+# The window is `--last` or `--start`/`--end`.
 @category mole-victorialogs
 @example "hourly error counts over a day" { mole-victorialogs hits level:error --last 1day --step 1hr }
-@example "counts grouped by level" { mole-victorialogs hits --last 6hr --step 30min --field level }
+@example "counts grouped by level and host" { mole-victorialogs hits --last 6hr --step 30min --field level,host }
 @example "inspect the composed filter without running" { mole-victorialogs hits level:error --dry-run | get query } --result "level:error"
 export def "hits" [
   ...filters: string@"vl-filter"                   # LogsQL filter tokens (AND-joined): error  level:error  status:>=500
@@ -393,7 +377,7 @@ export def "hits" [
   --start(-a): datetime
   --end(-b): datetime
   --step(-s): duration                             # bucket width (default: server auto)
-  --field(-F): string@"vl-field"                   # group counts by this field's values
+  --field(-F): string@"vl-fields-csv"              # group counts by these fields' values, comma-separated
   --connection(-c): string@complete-connection
   --url: string
   --token: string
@@ -401,12 +385,12 @@ export def "hits" [
   --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vl-conf $connection $url $token $set)
-  let filter = (vl-compose-filter $filters)
+  let filter = (logsql compose-filter $filters)
   if $dry_run { return {connection: ($conf | conn redact), query: $filter} }
   let range = (vl-range $last $start $end)
   (client hits $conf $filter
     --start (logsql vl-time $range.start) --end (logsql vl-time $range.end)
-    --step (logsql step $step) --field $field)
+    --step (logsql step $step) --field (complete csv $field))
   | logsql hits $in
 }
 
@@ -513,7 +497,7 @@ export def "stats" [
   --dry-run(-n)                                     # return {connection, query} instead of running
 ] {
   let conf = (vl-conf $connection $url $token $set)
-  let filter = (vl-compose-filter $filters)
+  let filter = (logsql compose-filter $filters)
   let by = (complete csv $by)
   let aggs = (vl-aggs $count $count_uniq $sum $avg $min $max $median $p90 $p95 $p99)
   let q = (logsql build-stats $filter --aggs $aggs --by $by
@@ -559,7 +543,7 @@ export def "fields" [
   --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vl-conf $connection $url $token $set)
-  let filter = (vl-compose-filter $filters)
+  let filter = (logsql compose-filter $filters)
   if $dry_run { return {connection: ($conf | conn redact), query: $filter} }
   let range = (vl-range $last $start $end)
   (client field-names $conf $filter
@@ -591,7 +575,7 @@ export def "field-values" [
   --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vl-conf $connection $url $token $set)
-  let filter = (vl-compose-filter $filters)
+  let filter = (logsql compose-filter $filters)
   if $dry_run { return {connection: ($conf | conn redact), query: $filter} }
   let range = (vl-range $last $start $end)
   (client field-values $conf $filter $field
@@ -622,7 +606,7 @@ export def "streams" [
   --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vl-conf $connection $url $token $set)
-  let filter = (vl-compose-filter $filters)
+  let filter = (logsql compose-filter $filters)
   if $dry_run { return {connection: ($conf | conn redact), query: $filter} }
   let range = (vl-range $last $start $end)
   (client streams $conf $filter
@@ -653,7 +637,7 @@ export def "facets" [
   --dry-run(-n)                                    # return {connection, query} instead of running
 ] {
   let conf = (vl-conf $connection $url $token $set)
-  let filter = (vl-compose-filter $filters)
+  let filter = (logsql compose-filter $filters)
   if $dry_run { return {connection: ($conf | conn redact), query: $filter} }
   let range = (vl-range $last $start $end)
   (client facets $conf $filter

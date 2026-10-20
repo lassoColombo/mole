@@ -6,7 +6,10 @@
 # LAYERING: mod.nu imports this PRIVATELY (`use ./logsql.nu`) and the tests
 # import it directly; nothing here is re-exported into `use mole-victorialogs`.
 # Keeping the transforms pure is what makes them unit-testable (see
-# tests/test_logsql.nu).
+# tests/test_logsql.nu). It imports ONE other pure library, `mole-promql/promql.nu`,
+# for the Prometheus-shaped bits VictoriaLogs' stats endpoints share with the
+# metrics family (sample-value / epoch coercion, the --last/--start/--end window),
+# so that logic exists once.
 #
 # VictoriaLogs stores every field as a string, so `/query` rows arrive with all
 # values as strings; these helpers infer a type per column (see `type-rows`). The Prometheus-shaped
@@ -19,26 +22,12 @@
 # through the alias — so `shape`'s projection keeps working after import.
 alias core-select = select
 
+use mole-promql/promql.nu
+
 # ---- scalar coercions ---------------------------------------------------------
-
-# A stats sample-value string → a real number. `NaN` becomes null (Nushell has no
-# NaN literal); a non-string passes through untouched, and anything `into float`
-# can't parse is kept as-is.
-@category mole-victorialogs
-@example "a numeric string becomes a float" { logsql num "3.14" } --result 3.14
-@example "NaN becomes null" { logsql num "NaN" } --result null
-export def "num" [v: any]: nothing -> any {
-  if ($v | describe) != "string" { return $v }
-  if $v == "NaN" { return null }
-  try { $v | into float } catch { $v }
-}
-
-# A Unix timestamp (int/float seconds) → datetime. Used by the Prometheus-shaped
-# stats endpoints, whose timestamps are epoch seconds.
-@category mole-victorialogs
-@example "epoch seconds to datetime" { logsql epoch 0 } --result 1970-01-01T00:00:00Z
-@example "epoch seconds to datetime" { logsql epoch 1704067200 } --result 2024-01-01T00:00:00Z
-export def "epoch" [ts: any]: nothing -> datetime { 1970-01-01T00:00:00Z + (($ts | into float) * 1sec) }
+# The Prometheus-shaped stats endpoints encode sample values as strings and
+# timestamps as epoch seconds exactly like Prometheus does, so `promql num` /
+# `promql time` serve them; only the VictoriaLogs-specific spellings live here.
 
 # An RFC3339 string → datetime. VictoriaLogs `_time` and `/hits` timestamps are
 # RFC3339 strings; a value `into datetime` can't parse is kept as-is (so a query
@@ -58,27 +47,34 @@ export def "vl-time" [dt: any]: nothing -> any {
   if ($dt | is-empty) { null } else { $dt | date to-timezone UTC | format date "%Y-%m-%dT%H:%M:%S.%fZ" }
 }
 
-# A duration → the VictoriaLogs step string (integer seconds, e.g. `3600s`).
+# A duration → the VictoriaLogs step string: whole seconds as `3600s`, anything finer
+# in milliseconds (`500ms`) rather than truncated to `0s`. A zero or negative step
+# is an error here — the server would reject it anyway, less clearly.
 @category mole-victorialogs
 @example "duration to step string" { logsql step 1hr } --result "3600s"
+@example "sub-second steps keep their milliseconds" { logsql step 500ms } --result "500ms"
 @example "null stays null" { logsql step null } --result null
 export def "step" [d: any]: nothing -> any {
-  if ($d | is-empty) { null } else { $"(($d / 1sec) | into int)s" }
+  if ($d | is-empty) { return null }
+  if $d <= 0sec { error make {msg: $"step must be positive, got ($d)"} }
+  if ($d mod 1sec) == 0sec { $"(($d / 1sec) | into int)s" } else { $"(($d / 1ms) | into int)ms" }
 }
 
 # ---- query building (pure; mirror of mole-sql's `build-select`) ---------------
 # Render a LogsQL string from structured parts for the composable `search` verb.
 # No I/O — mod.nu resolves the connection/window and runs the result.
 
-# Render a LogsQL value literal. A bare-safe word (letters, digits, `_ . - *`) is
-# left as-is so wildcards and plain tokens stay readable; anything else is
-# double-quoted with `\` and `"` escaped, which is what VictoriaLogs needs for
-# values carrying spaces or punctuation.
+# Render a LogsQL value literal — a value the user PICKED, to be matched exactly. A
+# bare-safe word (letters, digits, `_ . -`) is left as-is so plain tokens stay
+# readable; anything else is double-quoted with `\` and `"` escaped, which is what
+# VictoriaLogs needs for values carrying spaces or punctuation. `*` is NOT bare-safe:
+# bare, it is a wildcard, so a completed value `a*b` must be quoted to mean itself.
 @category mole-victorialogs
 @example "a plain word stays bare" { logsql lit "error" } --result "error"
 @example "a value with a space is quoted" { logsql lit "web server" } --result "\"web server\""
+@example "a star is quoted, else it would be a wildcard" { logsql lit "a*b" } --result "\"a*b\""
 export def "lit" [v: string]: nothing -> string {
-  if ($v =~ '^[\w.*-]+$') { $v } else {
+  if ($v =~ '^[\w.-]+$') { $v } else {
     '"' + ($v | str replace --all '\' '\\' | str replace --all '"' '\"') + '"'
   }
 }
@@ -102,12 +98,67 @@ export def "has-pipe" [filter: string]: nothing -> bool {
   ) | str contains "|"
 }
 
+# Is a filter token a range comparison missing its `field:` colon (`status>=500`)?
+# LogsQL spells it `status:>=500`; the bare form is a word filter on the literal
+# text, so it silently matches nothing — negated or not (`-status>=500`,
+# `!status>=500`, `NOT status>=500` are the same word filter, negated). `=`/`!=` are
+# left alone (`user=alice` is a fair word search in logfmt logs), and a quoted token
+# stays a phrase search.
+@category mole-victorialogs
+@example "a bare comparison is flagged" { logsql bare-range "status>=500" } --result true
+@example "so is its negation" { logsql bare-range "-status>=500" } --result true
+@example "the LogsQL spelling is fine" { logsql bare-range "status:>=500" } --result false
+export def "bare-range" [tok: string]: nothing -> bool {
+  $tok =~ '^(?:-|!|(?i:NOT)\s+)?[A-Za-z_][\w.]*(?:>=|<=|>|<)'
+}
+
+# Compose a LogsQL *filter* from AND-joined filter tokens — the shared front door of
+# every composing verb (`select`, `hits`, `stats`, the enumeration verbs). LogsQL
+# ANDs space-separated filters, so the tokens are space-joined; blank tokens are
+# dropped and an empty result becomes `*` (match everything). Two things are
+# rejected rather than guessed: a bare range comparison (`bare-range`, a word filter
+# that matches nothing) and a top-level `|` pipe (`has-pipe`) — a filter token may
+# not smuggle its own pipeline stage; `raw-query` is the escape hatch. Raw filter
+# syntax (regex, `OR`, ranges) is just a quoted token.
+@category mole-victorialogs
+@example "tokens AND-join by juxtaposition" { logsql compose-filter [level:error status:>=500] } --result "level:error status:>=500"
+@example "nothing matches everything" { logsql compose-filter ["" "  "] } --result "*"
+export def "compose-filter" [filters: list<string>]: nothing -> string {
+  let toks = ($filters | where {|p| $p | str trim | is-not-empty })
+  let bare = ($toks | where {|p| bare-range $p })
+  if ($bare | is-not-empty) {
+    error make {msg: $"'($bare | first)' is not a LogsQL range filter — write it field:>=value, e.g. status:>=500"}
+  }
+  let filter = ($toks | str join " ")
+  if (has-pipe $filter) {
+    error make {msg: "a '|' pipe isn't allowed in a filter token — use `raw-query` for a full LogsQL pipeline"}
+  }
+  if ($filter | is-empty) { "*" } else { $filter }
+}
+
+# The post-stage tail every read pipeline ends with, in the one valid order:
+# `| sort by (a, b) [desc]` → `| offset N` → `| limit N`. Shared by `build-pipeline`
+# and `build-stats`. A negative offset/limit is an error (the server rejects it).
+def tail-stages [sort_by: list<string>, desc: bool, offset: any, limit: any]: nothing -> list<string> {
+  if ($offset != null) and ($offset < 0) { error make {msg: $"offset cannot be negative, got ($offset)"} }
+  if ($limit != null) and ($limit < 0) { error make {msg: $"limit cannot be negative, got ($limit)"} }
+  [
+    (if ($sort_by | is-not-empty) { "| sort by (" + ($sort_by | str join ", ") + ")" + (if $desc { " desc" } else { "" }) })
+    (if $offset != null { $"| offset ($offset)" })
+    (if $limit != null { $"| limit ($limit)" })
+  ] | where {|x| $x | is-not-empty }
+}
+
 # Assemble a read pipeline: a filter followed by optional stages in fixed order
 # (so the result is always valid LogsQL): `stream_context` (surrounding lines) →
-# `fields` (keep) → `delete` (drop) → `sort by` → `limit`. An empty filter becomes
-# `*` (match everything); empty stages are dropped. `--sort-by` is a list of fields
-# rendered `| sort by (a, b)`, ascending unless `--desc`. Mirrors mole-sql's
-# `build-select`, which likewise takes an already-rendered filter.
+# `fields` (keep) → `delete` (drop) → `sort by` → `offset` → `limit`. An empty
+# filter becomes `*` (match everything); empty stages are dropped. `--sort-by` is a
+# list of fields rendered `| sort by (a, b)`, ascending unless `--desc`. Paging is
+# `| offset N | limit N` IN the pipeline — not the HTTP `offset`/`limit` params,
+# which page the query's RESULT: with `| limit 10` in the query that result is ten
+# rows, so an HTTP offset of 10 would skip all of them and page two would always be
+# empty. Mirrors mole-sql's `build-select`, which likewise takes an already-rendered
+# filter.
 @category mole-victorialogs
 @example "a bare filter" {
   logsql build-pipeline "level:error"
@@ -127,12 +178,16 @@ export def "has-pipe" [filter: string]: nothing -> bool {
 @example "an empty filter matches everything" {
   logsql build-pipeline "" --limit 10
 } --result "* | limit 10"
+@example "paging is an offset pipe before the limit" {
+  logsql build-pipeline "level:error" --sort-by [_time] --offset 20 --limit 10
+} --result "level:error | sort by (_time) | offset 20 | limit 10"
 export def "build-pipeline" [
   filter: string                 # the LogsQL filter (empty → `*`)
   --fields: list<string> = []    # projection → `| fields a, b`
   --drop: list<string> = []      # removal → `| delete a, b` (inverse of --fields)
   --sort-by: list<string> = []   # sort fields → `| sort by (a, b)`
   --desc                         # sort descending (default: ascending)
+  --offset: int                  # `| offset N` (pagination; before the limit)
   --limit: int                   # `| limit N`
   --context-before: int          # stream_context: N log lines before each match
   --context-after: int           # stream_context: N log lines after each match
@@ -148,9 +203,8 @@ export def "build-pipeline" [
     })
     (if ($fields | is-not-empty) { "| fields " + ($fields | str join ", ") })
     (if ($drop | is-not-empty) { "| delete " + ($drop | str join ", ") })
-    (if ($sort_by | is-not-empty) { "| sort by (" + ($sort_by | str join ", ") + ")" + (if $desc { " desc" } else { "" }) })
-    (if $limit != null { $"| limit ($limit)" })
-  ] | where {|x| $x | is-not-empty } | str join " "
+  ] ++ (tail-stages $sort_by $desc $offset $limit)
+  | where {|x| $x | is-not-empty } | str join " "
 }
 
 # ---- stats building (pure; the aggregation sibling of `build-pipeline`) --------
@@ -173,7 +227,9 @@ export def "stat-alias" [field: string]: nothing -> string {
 # `by (...)` clause comes BEFORE the functions — the order this VictoriaLogs build
 # requires (`stats by (level) count()`, not `stats count() by (level)`). The
 # post-stats sort/limit runs over the RESULT columns (server-side top-N). An empty
-# filter becomes `*`; empty stages are dropped. Mirrors `build-pipeline`.
+# filter becomes `*`; empty stages are dropped. Mirrors `build-pipeline`. Result
+# names must be distinct and must not reuse a `by` field (`stats by (count) count()
+# as count` is two columns called `count`): both are errors, not a surprise.
 @category mole-victorialogs
 @example "a bare count" {
   logsql build-stats "*" --aggs [{expr: "count()", name: "count"}]
@@ -192,6 +248,16 @@ export def "build-stats" [
   --desc                         # sort descending (default: ascending)
   --limit: int                   # post-stats `| limit N`
 ]: nothing -> string {
+  let names = ($aggs | each {|a| $a.name })
+  let dupes = ($names | uniq --repeated)
+  if ($dupes | is-not-empty) {
+    error make {msg: $"duplicate stats result column '($dupes | first)' — each aggregation must name a distinct column"}
+  }
+  let keys = ($by | each {|b| $b | split row ":" | first | str trim })   # `_time:1h` groups by `_time`
+  let clash = ($names | where {|n| $n in $keys })
+  if ($clash | is-not-empty) {
+    error make {msg: $"stats result column '($clash | first)' clashes with a --by field of the same name"}
+  }
   let stats = ([
     "| stats"
     (if ($by | is-not-empty) { "by (" + ($by | str join ", ") + ")" })
@@ -200,9 +266,8 @@ export def "build-stats" [
   [
     (if ($filter | is-empty) { "*" } else { $filter })
     $stats
-    (if ($sort_by | is-not-empty) { "| sort by (" + ($sort_by | str join ", ") + ")" + (if $desc { " desc" } else { "" }) })
-    (if $limit != null { $"| limit ($limit)" })
-  ] | where {|x| $x | is-not-empty } | str join " "
+  ] ++ (tail-stages $sort_by $desc null $limit)
+  | where {|x| $x | is-not-empty } | str join " "
 }
 
 # ---- query (JSONL) ------------------------------------------------------------
@@ -229,7 +294,9 @@ export def "jsonl" [body: string]: nothing -> table {
 # fit keeps the whole column a string. Integer-looking values that carry a leading
 # zero ("007") or overflow a 64-bit int stay strings — they are identifiers, not
 # numbers — caught by a round-trip check, since `into int` silently saturates on
-# overflow (a plain try/catch would not notice).
+# overflow (a plain try/catch would not notice). A datetime column must carry a
+# zone (`Z` or `±hh:mm`) on every value: a zoneless `2024-01-01` would be parsed in
+# the LOCAL zone and shift by the machine's offset, so it stays a string.
 @category mole-victorialogs
 @example "a clean integer column" { logsql col-kind ["500" "200" "0"] } --result "int"
 @example "leading zeros are identifiers, not ints" { logsql col-kind ["007" "012"] } --result "string"
@@ -237,6 +304,7 @@ export def "jsonl" [body: string]: nothing -> table {
 @example "decimals are floats" { logsql col-kind ["12.5" "0.4"] } --result "float"
 @example "booleans" { logsql col-kind ["true" "false"] } --result "bool"
 @example "rfc3339 timestamps" { logsql col-kind ["2026-08-10T10:00:00Z"] } --result "datetime"
+@example "a zoneless date is not a datetime (it would shift to local time)" { logsql col-kind ["2026-08-10"] } --result "string"
 @example "json arrays / objects" { logsql col-kind ["[1,2]" "[3]"] } --result "json"
 @example "one misfit keeps the column a string" { logsql col-kind ["500" "n/a"] } --result "string"
 @example "no evidence → string" { logsql col-kind [] } --result "string"
@@ -251,7 +319,8 @@ export def "col-kind" [vals: list<string>]: nothing -> string {
     let safe = (not ($vals | any {|v| $v =~ '^-?0[0-9]' }))       # no leading-zero integer part
     if $safe and ($vals | all {|v| (try { ($v | into float | into string) not-in ["inf" "-inf" "NaN"] } catch { false }) }) { "float" } else { "string" }
   } else if (do $check '^\d{4}-\d{2}-\d{2}') {
-    if ($vals | all {|v| (try { $v | into datetime; true } catch { false }) }) { "datetime" } else { "string" }
+    let zoned = (do $check '(?:Z|[+-]\d{2}:?\d{2})$')
+    if $zoned and ($vals | all {|v| (try { $v | into datetime; true } catch { false }) }) { "datetime" } else { "string" }
   } else if (do $check '^\s*[\[{]') {
     if ($vals | all {|v| (try { $v | from json; true } catch { false }) }) { "json" } else { "string" }
   } else { "string" }
@@ -406,7 +475,7 @@ export def "relabel" [m: record]: nothing -> record {
   logsql stats-vector [{metric: {__name__: "count(*)", level: info}, value: [1704153600, "42"]}]
 } --result [{level: info, metric: "count(*)", value: 42.0}]
 export def "stats-vector" [result: list]: nothing -> table {
-  $result | each {|r| (relabel $r.metric) | insert value (num $r.value.1) }
+  $result | each {|r| (relabel $r.metric) | insert value (promql num $r.value.1) }
 }
 
 # A range stats (`resultType: matrix`) result → tidy rows: one per (series, point),
@@ -418,7 +487,7 @@ export def "stats-vector" [result: list]: nothing -> table {
 export def "stats-matrix" [result: list]: nothing -> table {
   $result | each {|r|
     let labels = (relabel $r.metric)
-    ($r | get -o values | default []) | each {|p| $labels | insert time (epoch $p.0) | insert value (num $p.1) }
+    ($r | get -o values | default []) | each {|p| $labels | insert time (promql time $p.0) | insert value (promql num $p.1) }
   } | flatten
 }
 
