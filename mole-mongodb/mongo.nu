@@ -24,21 +24,25 @@
 
 # ---- JS literals ---------------------------------------------------------------
 
-# Render a string as a JS/JSON double-quoted string literal (backslash then quote
-# escaped). Field keys are always emitted through this, so dotted/hyphenated keys
-# like `address.city` stay valid.
+# Render a string as a JS/JSON double-quoted string literal — `to json` escapes the
+# quote, the backslash AND control characters (a raw newline would end the JS string
+# early). Field keys are always emitted through this, so dotted/hyphenated keys like
+# `address.city` stay valid.
 @category mole-mongodb
 @example "a plain word" { mongo lit "active" } --result "\"active\""
 @example "a dotted key is quoted" { mongo lit "address.city" } --result "\"address.city\""
 export def "lit" [v: string]: nothing -> string {
-  '"' + ($v | str replace --all '\' '\\' | str replace --all '"' '\"') + '"'
+  $v | to json --raw
 }
 
 # A bare filter-token value → a typed JS literal. Clean integers and floats become
 # numeric literals; `true`/`false`/`null` pass through; an ISO-8601 date-shaped
 # value becomes `ISODate("…")`; everything else is a quoted string. Conservative
 # like VictoriaLogs' `col-kind`: a leading-zero (`007`) or 64-bit-overflowing
-# integer is an identifier, so it stays a quoted string (round-trip check).
+# integer is an identifier, so it stays a quoted string (round-trip check). An
+# integer past ±2^53 becomes `NumberLong("…")` — a JS number would round it. An
+# impossible date (`2026-13-45`, `2026-02-30`) errors. Only the ISO `T` separator is
+# a date: mongosh's `ISODate` rejects a lowercase `t` that `into datetime` accepts.
 @category mole-mongodb
 @example "an integer" { mongo coerce-scalar "30" } --result "30"
 @example "a leading-zero id stays a string" { mongo coerce-scalar "007" } --result "\"007\""
@@ -51,12 +55,23 @@ export def "coerce-scalar" [v: string]: nothing -> string {
   if $v in ["true" "false"] { return $v }
   if ($v =~ '^-?\d+$') and (not ($v =~ '^-?0\d')) {
     # round-trips iff clean: rejects silent i64 overflow (into int saturates)
-    if (try { ($v | into int | into string) == $v } catch { false }) { return $v }
+    if (try { ($v | into int | into string) == $v } catch { false }) {
+      let n = ($v | into int)
+      if ($n > 9007199254740992) or ($n < -9007199254740992) { return ("NumberLong(" + (lit $v) + ")") }
+      return $v
+    }
   }
   if ($v =~ '^-?(?:\d+\.\d*|\.\d+|\d+[eE][+-]?\d+|\d+\.\d+[eE][+-]?\d+)$') and (not ($v =~ '^-?0\d')) {
     return $v
   }
-  if ($v =~ '^\d{4}-\d{2}-\d{2}([Tt].*)?$') { return ("ISODate(" + (lit $v) + ")") }
+  if ($v =~ '^\d{4}-\d{2}-\d{2}') {
+    # the strict `--format` parse catches what plain `into datetime` rolls over (02-30);
+    # a date-shaped value that is not a valid ISO date (lowercase `t`, bad time) errors
+    # rather than quietly becoming a string equality
+    let valid = ($v =~ '^\d{4}-\d{2}-\d{2}(T.*)?$') and (try { $v | str substring 0..<10 | into datetime --format '%Y-%m-%d' | ignore; $v | into datetime | ignore; true } catch { false })
+    if not $valid { error make {msg: $"not a valid ISO date: '($v)'"} }
+    return ("ISODate(" + (lit $v) + ")")
+  }
   lit $v
 }
 
@@ -76,7 +91,14 @@ def cmp-op [s: string]: nothing -> any {
 #   field:in:a,b    → {"field": {$in: [<coerced>,…]}}
 #   field:~/re/i    → {"field": {$regex: "re", $options: "i"}}
 #   field:~pat      → {"field": {$regex: "pat"}}
-# The field key is always quoted so dotted paths work. Empty token → "".
+# The field key is always quoted so dotted paths work. Empty token → "". A bare
+# token carrying an operator (`age>=30`, another grammar's spelling) errors rather
+# than filtering on a field that can't exist; the value after `:` is trimmed. So do
+# the degenerate shapes that would otherwise run a wrong filter without a word: an
+# empty field (`:admin`), an empty value (`role:`, `age:>=`, `name:~`, `role:in:`),
+# and a `=` where the grammar wants a bare value (`age:=5`). `--flat` maps the field
+# through `stat-alias` — for `aggregate`'s RESULT columns, where a dotted `--by` key
+# was flattened (`address.city` → `address_city`) and the user types either spelling.
 @category mole-mongodb
 @example "equality" { mongo parse-filter-token "role:admin" } --result "{\"role\": \"admin\"}"
 @example "bare field is truthy" { mongo parse-filter-token "active" } --result "{\"active\": true}"
@@ -84,20 +106,31 @@ def cmp-op [s: string]: nothing -> any {
 @example "an in-list" { mongo parse-filter-token "role:in:admin,ops" } --result "{\"role\": {$in: [\"admin\", \"ops\"]}}"
 @example "a regex with flags" { mongo parse-filter-token "name:~/^a/i" } --result "{\"name\": {$regex: \"^a\", $options: \"i\"}}"
 @example "a raw json token is verbatim" { mongo parse-filter-token "{$expr: {$gt: [\"$a\", \"$b\"]}}" } --result "{$expr: {$gt: [\"$a\", \"$b\"]}}"
-export def "parse-filter-token" [tok: string]: nothing -> string {
+export def "parse-filter-token" [
+  tok: string
+  --flat     # map the field through `stat-alias` (aggregate result columns)
+]: nothing -> string {
   let t = ($tok | str trim)
   if ($t | is-empty) { return "" }
   if ($t | str starts-with "{") { return $t }                       # raw escape
-  if not ($t | str contains ":") { return ("{" + (lit $t) + ": true}") }
+  if not ($t | str contains ":") {
+    if ($t =~ '[<>=!~]') { error make {msg: $"not a filter token: '($t)' — use field:value, field:>=value or field:~regex; a bare field means truthy"} }
+    return ("{" + (lit (if $flat { stat-alias $t } else { $t })) + ": true}")
+  }
   let idx = ($t | str index-of ":")
-  let field = ($t | str substring 0..<$idx)
-  let rest = ($t | str substring ($idx + 1)..)
-  let key = (lit $field)
+  let field = ($t | str substring 0..<$idx | str trim)
+  let rest = ($t | str substring ($idx + 1).. | str trim)
+  if ($field | is-empty) { error make {msg: $"filter token '($t)' has no field — use field:value"} }
+  if ($rest | is-empty) { error make {msg: $"filter token '($t)' has no value — use field:value, or a bare field to mean truthy"} }
+  if ($rest | str starts-with "=") { error make {msg: $"filter token '($t)': equality is field:value, without the '='"} }
+  let key = (lit (if $flat { stat-alias $field } else { $field }))
   if ($rest | str starts-with "in:") {
-    let vals = ($rest | str substring 3.. | split row "," | each {|x| coerce-scalar ($x | str trim) })
+    let vals = ($rest | str substring 3.. | split row "," | str trim | where {|x| $x | is-not-empty } | each {|x| coerce-scalar $x })
+    if ($vals | is-empty) { error make {msg: $"empty in: list in '($t)' — give at least one value, e.g. ($field):in:a,b"} }
     "{" + $key + ": {$in: [" + ($vals | str join ", ") + "]}}"
   } else if ($rest | str starts-with "~") {
     let pat = ($rest | str substring 1..)
+    if ($pat | is-empty) { error make {msg: $"empty regex in '($t)' — use ($field):~pattern or ($field):~/pattern/flags"} }
     let m = ($pat | parse --regex '^/(?<p>.*)/(?<o>[a-zA-Z]*)$')
     if ($m | is-not-empty) {
       let g = ($m | first)
@@ -110,8 +143,9 @@ export def "parse-filter-token" [tok: string]: nothing -> string {
     let op1 = ($rest | str substring 0..<1)
     let op = if (cmp-op $op2) != null { $op2 } else if (cmp-op $op1) != null { $op1 } else { null }
     if $op != null {
-      let val = (coerce-scalar ($rest | str substring ($op | str length).. | str trim))
-      "{" + $key + ": {" + (cmp-op $op) + ": " + $val + "}}"
+      let raw = ($rest | str substring ($op | str length).. | str trim)
+      if ($raw | is-empty) { error make {msg: $"filter token '($t)' has no value after '($op)'"} }
+      "{" + $key + ": {" + (cmp-op $op) + ": " + (coerce-scalar $raw) + "}}"
     } else {
       "{" + $key + ": " + (coerce-scalar $rest) + "}"
     }
@@ -120,15 +154,16 @@ export def "parse-filter-token" [tok: string]: nothing -> string {
 
 # AND-join filter tokens into one Mongo filter JS object. No tokens → `{}` (match
 # all); one token → that object; many → `{$and: [ … ]}` (always correct, including
-# two constraints on the same field). Empty/blank tokens are dropped.
+# two constraints on the same field). Empty/blank tokens are dropped. `--flat` is
+# forwarded to `parse-filter-token` (aggregate result columns).
 @category mole-mongodb
 @example "no tokens match everything" { mongo build-filter [] } --result "{}"
 @example "a single token" { mongo build-filter ["role:admin"] } --result "{\"role\": \"admin\"}"
 @example "many tokens are AND-joined" {
   mongo build-filter ["role:admin" "age:>=30"]
 } --result "{$and: [{\"role\": \"admin\"}, {\"age\": {$gte: 30}}]}"
-export def "build-filter" [tokens: list<string>]: nothing -> string {
-  let frags = ($tokens | each {|t| parse-filter-token $t } | where {|f| $f | is-not-empty })
+export def "build-filter" [tokens: list<string>, --flat]: nothing -> string {
+  let frags = ($tokens | each {|t| parse-filter-token $t --flat=$flat } | where {|f| $f | is-not-empty })
   if ($frags | is-empty) { "{}" } else if (($frags | length) == 1) { $frags | first } else {
     "{$and: [" + ($frags | str join ", ") + "]}"
   }
@@ -138,8 +173,9 @@ export def "build-filter" [tokens: list<string>]: nothing -> string {
 
 # A `find` projection object from included / excluded field lists, or null when
 # both are empty (omit the projection argument). Includes add `"_id": 0` unless
-# `_id` is explicitly projected; excludes are a plain `{f: 0, …}`. (Mongo forbids
-# mixing include and exclude except for `_id`; the wrapper passes only one.)
+# `_id` is explicitly projected; excludes are a plain `{f: 0, …}`. Mongo forbids
+# mixing include and exclude (except for `_id`), so both non-empty is an error here
+# rather than one list silently winning.
 @category mole-mongodb
 @example "include projects those fields, dropping _id" {
   mongo projection-spec [name email] []
@@ -147,6 +183,9 @@ export def "build-filter" [tokens: list<string>]: nothing -> string {
 @example "exclude" { mongo projection-spec [] [_stream_id bytes] } --result "{\"_stream_id\": 0, \"bytes\": 0}"
 @example "neither → null" { mongo projection-spec [] [] } --result null
 export def "projection-spec" [fields: list<string>, exclude: list<string>]: nothing -> any {
+  if ($fields | is-not-empty) and ($exclude | is-not-empty) {
+    error make {msg: "--select and --exclude are mutually exclusive (Mongo can't mix an include and an exclude projection)"}
+  }
   if ($fields | is-not-empty) {
     let incl = ($fields | each {|f| (lit $f) + ": 1" })
     let incl = if ("_id" in $fields) { $incl } else { $incl ++ [((lit "_id") + ": 0")] }
@@ -156,21 +195,24 @@ export def "projection-spec" [fields: list<string>, exclude: list<string>]: noth
   } else { null }
 }
 
-# A `sort` object from comma/space `"field [asc|desc]"` terms, or null when empty.
-# Ascending (1) unless the term ends in `desc` → -1.
+# A `sort` object from `"field [asc|desc]"` terms, or null when empty. `field:desc`
+# (the SQL drivers' spelling) reads the same as `field desc`. Ascending (1) unless
+# the direction is `desc` → -1; any other direction word errors. `--flat` maps each
+# field through `stat-alias` (aggregate result columns, see `parse-filter-token`).
 @category mole-mongodb
 @example "ascending by default" { mongo sort-spec ["age"] } --result "{\"age\": 1}"
 @example "descending, multi-key" {
   mongo sort-spec ["age desc" "name"]
 } --result "{\"age\": -1, \"name\": 1}"
 @example "empty → null" { mongo sort-spec [] } --result null
-export def "sort-spec" [terms: list<string>]: nothing -> any {
+export def "sort-spec" [terms: list<string>, --flat]: nothing -> any {
   if ($terms | is-empty) { return null }
   let pairs = ($terms | where {|t| $t | is-not-empty } | each {|term|
-    let toks = ($term | str trim | split row --regex '\s+')
+    let toks = ($term | str trim | str replace --regex ':(\w+)$' ' ${1}' | split row --regex '\s+')
+    let dir = ($toks | get -o 1 | default "asc" | str lowercase)
+    if ($dir not-in [asc desc]) or (($toks | length) > 2) { error make {msg: $"bad sort term '($term)' — use field, field:desc or 'field desc'"} }
     let field = ($toks | first)
-    let dir = if (($toks | length) > 1) and (($toks | last | str lowercase) == "desc") { "-1" } else { "1" }
-    (lit $field) + ": " + $dir
+    (lit (if $flat { stat-alias $field } else { $field })) + ": " + (if $dir == "desc" { "-1" } else { "1" })
   })
   if ($pairs | is-empty) { null } else { "{" + ($pairs | str join ", ") + "}" }
 }
@@ -202,16 +244,17 @@ export def "build-find" [
   $e + ".toArray()"
 }
 
-# ---- completion helper ---------------------------------------------------------
-
-
 # ---- safety --------------------------------------------------------------------
 
-# The dangerous-operation regex: write/DDL mongosh methods and the pipeline write
-# stages `$out`/`$merge`. Case-insensitive. `mod.nu` passes it to `query is-dangerous`.
+# The dangerous-operation regex: write/DDL mongosh methods (including the legacy
+# `insert`/`update`/`remove`, which mongosh still executes), command-level writes
+# (`runCommand`/`adminCommand` can do anything), user/role admin, and the pipeline
+# write stages `$out`/`$merge`. Case-insensitive. `mod.nu` passes it to
+# `query is-dangerous` for the raw verbs AND the composed verbs, since a raw `{…}`
+# filter token is verbatim JS.
 @category mole-mongodb
 export def "mongo-danger" []: nothing -> string {
-  '(?i)\.(insertone|insertmany|updateone|updatemany|replaceone|deleteone|deletemany|remove|save|bulkwrite|findandmodify|findoneandupdate|findoneandreplace|findoneanddelete|drop|dropdatabase|createindex|createindexes|dropindex|dropindexes|createcollection|renamecollection)\b|\$out\b|\$merge\b'
+  '(?i)\.(insert|insertone|insertmany|update|updateone|updatemany|replaceone|deleteone|deletemany|remove|save|bulkwrite|findandmodify|findoneandupdate|findoneandreplace|findoneanddelete|drop|dropdatabase|createindex|createindexes|dropindex|dropindexes|createcollection|createview|renamecollection|runcommand|admincommand|createuser|updateuser|dropuser|dropallusers|createrole|updaterole|droprole|dropallroles)\b|\$out\b|\$merge\b'
 }
 
 # ---- aggregate building --------------------------------------------------------
@@ -233,30 +276,42 @@ export def "stat-alias" [field: string]: nothing -> string {
 }
 
 # The JS `$group` accumulator expression for one function over a field. `count` is
-# `{$sum: 1}` (universal); the field accumulators are `{$fn: "$field"}`; the N-arg
-# ones are `{$fn: {input, n}}`; `percentile`/`median` are `{$fn: {input, p?, method}}`.
-# An unknown function errors, pointing at `raw-aggregate`.
+# `{$sum: 1}` (universal, takes no field); the field accumulators are `{$fn: "$field"}`;
+# the N-arg ones are `{$fn: {input, n}}`; `percentile`/`median` are `{$fn: {input, p?,
+# method}}`. The param is spliced into JS, so it must BE a number (an int N, a float
+# p) — anything else errors; a param on a function that takes none errors too, as
+# does a field on `count`. An unknown function errors, pointing at `raw-aggregate`.
 def acc-js [fn: string, field: any, param: any]: nothing -> string {
   let fref = if ($field | is-not-empty) { lit ("$" + $field) } else { null }
   let need_field = {|| if ($fref == null) { error make {msg: $"aggregation '($fn)' needs a field: ($fn):<field>"} } }
+  let no_param = {|| if ($param | is-not-empty) { error make {msg: $"aggregation '($fn)' takes no parameter: ($fn):<field>"} } }
   match $fn {
-    "count" => "{$sum: 1}"
+    "count" => {
+      if ($fref != null) { error make {msg: "count takes no field (it counts documents) — use count, or sum:<field>"} }
+      do $no_param
+      "{$sum: 1}"
+    }
     "sum" | "avg" | "min" | "max" | "first" | "last" | "push" | "addToSet" | "stdDevPop" | "stdDevSamp" | "mergeObjects" => {
       do $need_field
+      do $no_param
       "{$" + $fn + ": " + $fref + "}"
     }
     "firstN" | "lastN" | "minN" | "maxN" => {
       do $need_field
       if ($param | is-empty) { error make {msg: $"aggregation '($fn)' needs N: ($fn):<field>:<N>"} }
-      "{$" + $fn + ": {input: " + $fref + ", n: " + ($param | into string) + "}}"
+      let n = (try { $param | into int } catch { error make {msg: $"aggregation '($fn)': N must be an integer, got '($param)'"} })
+      "{$" + $fn + ": {input: " + $fref + ", n: " + ($n | into string) + "}}"
     }
     "percentile" => {
       do $need_field
       if ($param | is-empty) { error make {msg: "percentile needs p: percentile:<field>:<p> (e.g. 0.95)"} }
-      "{$percentile: {input: " + $fref + ", p: [" + ($param | into string) + "], method: \"approximate\"}}"
+      let p = (try { $param | into float } catch { error make {msg: $"percentile: p must be a number in 0..1, got '($param)'"} })
+      if ($p < 0) or ($p > 1) { error make {msg: $"percentile: p must be in 0..1, got '($param)'"} }
+      "{$percentile: {input: " + $fref + ", p: [" + ($p | into string) + "], method: \"approximate\"}}"
     }
     "median" => {
       do $need_field
+      do $no_param
       "{$median: {input: " + $fref + ", method: \"approximate\"}}"
     }
     _ => { error make {msg: $"unknown aggregation '($fn)' — use raw-aggregate for top/bottomN, \\$accumulator, or window functions"} }
@@ -265,7 +320,8 @@ def acc-js [fn: string, field: any, param: any]: nothing -> string {
 
 # Parse one `fn:field[:param][=alias]` accumulator token into `{alias, accumulator}`.
 # The default alias is `count` for count, else `<fn>_<sanitized-field>`; `=alias`
-# overrides it.
+# overrides it. More than three `:`-parts is an error (a fourth would be silently
+# dropped otherwise); the field/param rules live in `acc-js`.
 @category mole-mongodb
 @example "a bare count" { mongo parse-agg-token "count" } --result {alias: count, accumulator: "{$sum: 1}"}
 @example "sum over a field" { mongo parse-agg-token "sum:amount" } --result {alias: sum_amount, accumulator: "{$sum: \"$amount\"}"}
@@ -278,6 +334,7 @@ export def "parse-agg-token" [tok: string]: nothing -> record {
   let body = if $eq >= 0 { $t | str substring 0..<$eq } else { $t }
   let alias_override = if $eq >= 0 { $t | str substring ($eq + 1).. } else { null }
   let parts = ($body | split row ":")
+  if (($parts | length) > 3) { error make {msg: $"bad accumulator token '($t)' — use fn:field[:param][=alias]"} }
   let fn = ($parts | first)
   let field = ($parts | get -o 1)
   let param = ($parts | get -o 2)
@@ -289,27 +346,51 @@ export def "parse-agg-token" [tok: string]: nothing -> record {
 
 # The `$group` `_id` spec from group-by fields plus an optional `field:unit` date
 # bucket, and the flat list of key names it introduces. No keys → `_id: null`
-# (group everything). A date bucket renders `{$dateTrunc: {date, unit}}`.
+# (group everything). A date bucket renders `{$dateTrunc: {date, unit}}`. A key is
+# named by `stat-alias` (`address.city` → `address_city`): `_id` field names may not
+# contain a dot, and the flat name matches the accumulator aliases.
 def id-spec [by: list<string>, date_bucket: any]: nothing -> record {
   mut pairs = []
   mut keys = []
   for k in ($by | where {|x| $x | is-not-empty }) {
-    $pairs = ($pairs | append ((lit $k) + ": " + (lit ("$" + $k))))
-    $keys = ($keys | append $k)
+    let a = (stat-alias $k)
+    $pairs = ($pairs | append ((lit $a) + ": " + (lit ("$" + $k))))
+    $keys = ($keys | append $a)
   }
   if ($date_bucket | is-not-empty) {
     let dp = ($date_bucket | split row ":")
     let dfield = ($dp | first)
     let unit = ($dp | get -o 1 | default "day")
-    $pairs = ($pairs | append ((lit $dfield) + ": {$dateTrunc: {date: " + (lit ("$" + $dfield)) + ", unit: " + (lit $unit) + "}}"))
-    $keys = ($keys | append $dfield)
+    let a = (stat-alias $dfield)
+    $pairs = ($pairs | append ((lit $a) + ": {$dateTrunc: {date: " + (lit ("$" + $dfield)) + ", unit: " + (lit $unit) + "}}"))
+    $keys = ($keys | append $a)
   }
   {js: (if ($pairs | is-empty) { "null" } else { "{" + ($pairs | str join ", ") + "}" }), keys: $keys}
 }
 
+# The RESULT columns an `aggregate` produces, in output order: the flattened group
+# keys (`--by`, then the `--date-bucket` field, as `id-spec` names them) followed by
+# the accumulator aliases in `--agg` order. The ONE naming path — the verb reorders
+# its rows by it and the `--having`/`--sort-by` completers offer it, so the two can't
+# drift. Lenient on an accumulator token that doesn't parse (skipped: a half-typed
+# `--agg` must still complete the rest) — `build-pipeline` is where it errors.
+@category mole-mongodb
+@example "keys first, then aliases" {
+  mongo result-cols [address.city] "created:day" ["count" "sum:amount=total"]
+} --result [address_city, created, count, total]
+export def "result-cols" [
+  by: list<string>          # $group key fields
+  date_bucket: any          # "field:unit", or null
+  aggs: list<string>        # fn:field[:param][=alias] accumulator tokens
+]: nothing -> list<string> {
+  let keys = (id-spec $by $date_bucket | get keys)
+  $keys ++ ($aggs | each {|t| try { (parse-agg-token $t).alias } catch { null } } | compact)
+}
+
 # Build an `aggregate` mongosh expression from structured parts. Every clause is
 # added only when present, so the pipeline is always valid. Group keys are lifted
-# to top-level by the trailing `$project` (flat wide rows).
+# to top-level by the trailing `$project` (flat wide rows). A result column named
+# twice — or named `_id`, which the `$group` doc already uses for the keys — errors.
 @category mole-mongodb
 @example "a bare grouped count" {
   mongo build-pipeline "orders" --by [customer] --agg ["count"]
@@ -331,6 +412,10 @@ export def "build-pipeline" [
 ]: nothing -> string {
   let id = (id-spec $by $date_bucket)
   let accs = ($agg | where {|a| $a | is-not-empty } | each {|a| parse-agg-token $a })
+  let names = ($id.keys ++ ($accs | each {|a| $a.alias }))
+  let clash = ($names | uniq --repeated)
+  if ($clash | is-not-empty) { error make {msg: $"duplicate result column '($clash | first)' — rename an accumulator with =alias"} }
+  if ("_id" in $names) { error make {msg: "a result column can't be named '_id' (it holds the group keys) — rename it with =alias"} }
   let accjs = ($accs | each {|a| (lit $a.alias) + ": " + $a.accumulator })
   let groupdoc = "{_id: " + $id.js + (if ($accjs | is-empty) { "" } else { ", " + ($accjs | str join ", ") }) + "}"
   let projpairs = (["\"_id\": 0"]

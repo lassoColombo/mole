@@ -10,6 +10,7 @@ def "lit quotes and escapes" [] {
     assert equal (mongo lit "address.city") '"address.city"'
     assert equal (mongo lit 'a"b') '"a\"b"'
     assert equal (mongo lit 'a\b') '"a\\b"'
+    assert equal (mongo lit "a\nb") '"a\nb"'      # a control char is escaped, never a raw newline inside the JS string
 }
 
 @test
@@ -28,6 +29,18 @@ def "coerce-scalar types bare values" [] {
     assert equal (mongo coerce-scalar "admin") '"admin"'
 }
 
+@test
+def "coerce-scalar keeps big integers exact and rejects impossible dates" [] {
+    assert equal (mongo coerce-scalar "9007199254740992") "9007199254740992"                        # 2^53 is still exact as a JS number
+    assert equal (mongo coerce-scalar "9007199254740993") 'NumberLong("9007199254740993")'
+    assert equal (mongo coerce-scalar "-9007199254740993") 'NumberLong("-9007199254740993")'
+    assert error { mongo coerce-scalar "2026-13-45" }
+    assert error { mongo coerce-scalar "2026-02-30" }                                                # plain `into datetime` would roll this to 02-28
+    assert error { mongo coerce-scalar "2026-01-02T25:00:00Z" }
+    assert equal (mongo coerce-scalar "2028-02-29") 'ISODate("2028-02-29")'                         # leap day is fine
+    assert error { mongo coerce-scalar "2026-01-02t03:04:05Z" }                                      # mongosh's ISODate rejects a lowercase t
+}
+
 # ---- filter tokens -------------------------------------------------------------
 
 @test
@@ -36,6 +49,36 @@ def "parse-filter-token equality and bare" [] {
     assert equal (mongo parse-filter-token "age:30") '{"age": 30}'
     assert equal (mongo parse-filter-token "active") '{"active": true}'
     assert equal (mongo parse-filter-token "") ""
+    assert equal (mongo parse-filter-token "age: 30") '{"age": 30}'      # the value after the colon is trimmed
+}
+
+@test
+def "parse-filter-token rejects an operator on a bare token" [] {
+    assert error { mongo parse-filter-token "age>=30" }    # SQL/PromQL spelling, not field:>=value
+    assert error { mongo parse-filter-token "status=done" }
+    assert error { mongo build-filter ["sum_amount>=100"] }   # the aggregate --having path too
+}
+
+@test
+def "parse-filter-token rejects degenerate tokens instead of filtering on nothing" [] {
+    assert error { mongo parse-filter-token "role:" }        # the completer offers `role:` — Enter there must not filter on ""
+    assert error { mongo parse-filter-token ":admin" }       # no field
+    assert error { mongo parse-filter-token "role:in:" }     # empty in-list
+    assert error { mongo parse-filter-token "role:in:," }
+    assert error { mongo parse-filter-token "age:>=" }       # operator, no value
+    assert error { mongo parse-filter-token "name:~" }       # empty regex would match everything
+    assert error { mongo parse-filter-token "age:=5" }       # equality has no '='
+    assert equal (mongo parse-filter-token "role:in:a,,b") '{"role": {$in: ["a", "b"]}}'   # blank items dropped
+}
+
+@test
+def "parse-filter-token and sort-spec flatten dotted fields with --flat" [] {
+    assert equal (mongo parse-filter-token "address.city:x" --flat) '{"address_city": "x"}'
+    assert equal (mongo parse-filter-token "address.city" --flat) '{"address_city": true}'
+    assert equal (mongo build-filter ["address.city:x" "count:>=3"] --flat) '{$and: [{"address_city": "x"}, {"count": {$gte: 3}}]}'
+    assert equal (mongo build-filter ['{"address.city": 1}'] --flat) '{"address.city": 1}'   # a raw token is verbatim
+    assert equal (mongo sort-spec ["address.city desc" "count"] --flat) '{"address_city": -1, "count": 1}'
+    assert equal (mongo sort-spec ["address.city"]) '{"address.city": 1}'                   # find keeps dotted paths
 }
 
 @test
@@ -75,6 +118,7 @@ def "projection-spec include drops _id unless asked" [] {
     assert equal (mongo projection-spec [_id name] []) '{"_id": 1, "name": 1}'
     assert equal (mongo projection-spec [] [bytes _stream_id]) '{"bytes": 0, "_stream_id": 0}'
     assert equal (mongo projection-spec [] []) null
+    assert error { mongo projection-spec [name] [bytes] }   # Mongo can't mix include and exclude; neither may silently win
 }
 
 @test
@@ -83,6 +127,10 @@ def "sort-spec renders directions" [] {
     assert equal (mongo sort-spec ["age desc" "name"]) '{"age": -1, "name": 1}'
     assert equal (mongo sort-spec ["age ASC"]) '{"age": 1}'
     assert equal (mongo sort-spec []) null
+    assert equal (mongo sort-spec ["age:desc" "name:asc"]) '{"age": -1, "name": 1}'   # the SQL drivers' spelling works too
+    assert equal (mongo sort-spec ["address.city:DESC"]) '{"address.city": -1}'
+    assert error { mongo sort-spec ["age:dsc"] }                                       # a typo must not silently sort ascending
+    assert error { mongo sort-spec ["age dsc"] }
 }
 
 # ---- find builder --------------------------------------------------------------
@@ -94,8 +142,6 @@ def "build-find composes clauses" [] {
         mongo build-find "users" '{"age": {$gte: 30}}' --project '{"name": 1, "_id": 0}' --sort '{"age": -1}' --limit 5 --skip 10
     ) 'db.getCollection("users").find({"age": {$gte: 30}}, {"name": 1, "_id": 0}).sort({"age": -1}).skip(10).limit(5).toArray()'
 }
-
-# ---- completion helper ---------------------------------------------------------
 
 # ---- safety --------------------------------------------------------------------
 
@@ -110,6 +156,13 @@ def "mongo-danger flags write ops, not reads" [] {
     assert equal ("db.orders.aggregate([{$out: 'copy'}])" =~ $re) true
     assert equal ("db.users.find({})" =~ $re) false
     assert equal ("db.users.countDocuments({})" =~ $re) false
+    # the legacy write methods mongosh still executes, and command-level / admin writes
+    assert equal ("db.users.insert({a:1})" =~ $re) true
+    assert equal ("db.users.update({}, {$set: {a: 1}})" =~ $re) true
+    assert equal ('db.runCommand({drop: "users"})' =~ $re) true
+    assert equal ('db.adminCommand({shutdown: 1})' =~ $re) true
+    assert equal ('db.createUser({user: "x"})' =~ $re) true
+    assert equal ('db.dropUser("x")' =~ $re) true
 }
 
 # ---- aggregate building --------------------------------------------------------
@@ -139,6 +192,25 @@ def "parse-agg-token rejects unknown functions and missing args" [] {
 }
 
 @test
+def "parse-agg-token rejects what it would otherwise silently drop or splice raw" [] {
+    assert error {|| mongo parse-agg-token "count:amount" }         # count takes no field (would count everything)
+    assert error {|| mongo parse-agg-token "sum:amount:5" }         # sum takes no param
+    assert error {|| mongo parse-agg-token "median:x:0.5" }
+    assert error {|| mongo parse-agg-token "maxN:amount:abc" }      # N is spliced into JS: must be an int
+    assert error {|| mongo parse-agg-token "maxN:amount:5}}]).toArray();db.dropDatabase();[]//" }
+    assert error {|| mongo parse-agg-token "percentile:latency:abc" }
+    assert error {|| mongo parse-agg-token "percentile:latency:95" }  # p is a fraction
+    assert error {|| mongo parse-agg-token "maxN:amount:5:extra" }  # a fourth part
+}
+
+@test
+def "result-cols names keys then aliases, in order, like the pipeline" [] {
+    assert equal (mongo result-cols [address.city] "created:day" ["count" "sum:amount=total"]) [address_city created count total]
+    assert equal (mongo result-cols [] null []) []
+    assert equal (mongo result-cols [status] null ["count" "bogus:x"]) [status count]   # lenient: a half-typed agg still completes
+}
+
+@test
 def "build-pipeline composes group, project, having, sort" [] {
     assert equal (
         mongo build-pipeline "orders" --by [customer] --agg ["count"]
@@ -164,12 +236,32 @@ def "build-pipeline supports by-only, unwind and date buckets" [] {
     # unwind before group
     assert equal (
         mongo build-pipeline "orders" --unwind items --by [items.sku] --agg ["count"]
-    ) 'db.getCollection("orders").aggregate([{$unwind: "$items"}, {$group: {_id: {"items.sku": "$items.sku"}, "count": {$sum: 1}}}, {$project: {"_id": 0, "items.sku": "$_id.items.sku", "count": 1}}]).toArray()'
+    ) 'db.getCollection("orders").aggregate([{$unwind: "$items"}, {$group: {_id: {"items_sku": "$items.sku"}, "count": {$sum: 1}}}, {$project: {"_id": 0, "items_sku": "$_id.items_sku", "count": 1}}]).toArray()'
 
     # date bucket
     assert equal (
         mongo build-pipeline "events" --date-bucket "created:hour" --agg ["count"]
     ) 'db.getCollection("events").aggregate([{$group: {_id: {"created": {$dateTrunc: {date: "$created", unit: "hour"}}}, "count": {$sum: 1}}}, {$project: {"_id": 0, "created": "$_id.created", "count": 1}}]).toArray()'
+}
+
+@test
+def "build-pipeline flattens dotted group keys" [] {
+    # `_id` field names may not contain a dot; the key is named like an accumulator alias
+    assert equal (
+        mongo build-pipeline "users" --by [address.city] --agg ["count"]
+    ) 'db.getCollection("users").aggregate([{$group: {_id: {"address_city": "$address.city"}, "count": {$sum: 1}}}, {$project: {"_id": 0, "address_city": "$_id.address_city", "count": 1}}]).toArray()'
+    assert equal (
+        mongo build-pipeline "events" --date-bucket "meta.created:day"
+    ) 'db.getCollection("events").aggregate([{$group: {_id: {"meta_created": {$dateTrunc: {date: "$meta.created", unit: "day"}}}}}, {$project: {"_id": 0, "meta_created": "$_id.meta_created"}}]).toArray()'
+    assert error { mongo build-pipeline "users" --by [address.city] --agg ["count=address_city"] }   # the flat name is what clashes
+}
+
+@test
+def "build-pipeline rejects a result column defined twice" [] {
+    assert error { mongo build-pipeline "orders" --by [status] --agg ["count=status"] }   # alias would overwrite the group key
+    assert error { mongo build-pipeline "orders" --agg ["sum:amount" "sum:amount"] }
+    assert error { mongo build-pipeline "orders" --agg ["count" "sum:amount=count"] }
+    assert error { mongo build-pipeline "orders" --by [status] --agg ["count=_id"] }      # `_id` holds the keys; JS last-key-wins would drop them
 }
 
 # ---- Extended JSON decode ------------------------------------------------------

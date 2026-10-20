@@ -14,8 +14,10 @@
 #   - mod.nu   — THIS wrapper. Owns policy: connection→mongosh invocation, the
 #     lazy three-tier completion catalog (cheap skeleton + per-collection sampled
 #     schema + a metadata sweep, each cached a day — see the catalog section), and
-#     turning payloads into typed rows. Read-oriented is structural; only the two
-#     raw verbs can carry writes, so only they are danger-gated.
+#     turning payloads into typed rows. Read-oriented is structural, but a raw `{…}`
+#     filter token is verbatim JS, so EVERY verb that runs composed JS is danger-gated
+#     (`query is-dangerous` over the final expression, skipped by `--yes`), not just
+#     the two raw ones.
 #
 # All completers scope to the `--collection`/`--connection` already on the command
 # line (via `complete flag`); `aggregate`'s `--having`/`--sort-by` even complete
@@ -265,13 +267,10 @@ def mongo-fields-for [ctx: string]: nothing -> list<string> {
 
 # The result columns an `aggregate` produces, derived from the `--by`/`--date-bucket`
 # group keys and the `--agg` accumulator aliases ALREADY on the line — so `--having`
-# and `--sort-by` complete columns that don't exist until the aggs are typed.
+# and `--sort-by` complete columns that don't exist until the aggs are typed. The
+# same pure `mongo result-cols` the verb reorders its rows by, so they can't drift.
 def mongo-result-cols [ctx: string]: nothing -> list<string> {
-  let by = (complete csv (complete flag $ctx ["--by" "-b"]))
-  let dbk = (complete flag $ctx ["--date-bucket"])
-  let bydate = if ($dbk | is-not-empty) { [($dbk | split row ":" | first)] } else { [] }
-  let aliases = (complete csv (complete flag $ctx ["--agg" "-a"]) | each {|t| try { (mongo parse-agg-token $t).alias } catch { null } } | where {|x| $x != null })
-  $by ++ $bydate ++ $aliases
+  mongo result-cols (complete csv (complete flag $ctx ["--by" "-b"])) (complete flag $ctx ["--date-bucket"]) (complete csv (complete flag $ctx ["--agg" "-a"]))
 }
 
 # --- the completers (attached to flags/positional via @"name") ---
@@ -332,7 +331,8 @@ def "mongo-agg" [ctx: string]: nothing -> list<string> {
 }
 
 # `--having` completes result-column tokens (`<col>:`), scoped to the sibling
-# `--by`/`--agg` (see mongo-result-cols).
+# `--by`/`--agg` (see mongo-result-cols). The flag is ONE filter token (its value may
+# itself hold commas — an `in:` list, a regex quantifier), so no comma-list extension.
 def "mongo-having" [ctx: string]: nothing -> list<string> {
   let tok = (complete token $ctx)
   if not ($tok | str contains ":") { mongo-result-cols $ctx | each {|c| $"($c):" } } else { [] }
@@ -416,7 +416,9 @@ export def "raw-query" [
 # lists, completing), `--sort-by` orders (`"field [asc|desc]"`, comma-list),
 # `--limit`/`--skip` paginate. Rows are typed like `raw-query` (`--raw` keeps the
 # wrappers). `--dry-run` returns `{connection, query}` — the resolved connection
-# (secrets dropped) and the composed JS — without running it.
+# (secrets dropped) and the composed JS — without running it. A raw `{…}` token is
+# verbatim JS, so the composed expression is danger-gated like `raw-query` (`--yes`
+# skips the prompt).
 @category mole-mongodb
 @example "filter, project, order, limit" {
   mole-mongodb find role:admin age:>=30 -C users --select name,email --sort-by "age desc" --limit 5 -c mongodb-local-dev
@@ -443,6 +445,7 @@ export def "find" [
   --set: record = {}
   --raw(-R)
   --dry-run(-n)
+  --yes(-y)                                        # skip the dangerous-op prompt (a raw {…} token can carry JS)
 ] {
   if ($collection | is-empty) { error make {msg: "find: --collection <name> is required"} }
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
@@ -451,6 +454,7 @@ export def "find" [
   let sort = (mongo sort-spec (complete csv $sort_by))
   let js = (mongo build-find $collection $filter --project $proj --sort $sort --limit $limit --skip $skip)
   if $dry_run { return {connection: ($conf | conn redact), query: $js} }
+  if (query is-dangerous $js (mongo mongo-danger)) and (not (query confirm "This may modify data. Run it?" --yes=$yes)) { return }
   let rows = (mongo-run $conf $js $raw)
   mongo-warm $conf
   $rows
@@ -462,12 +466,16 @@ export def "find" [
 # keys (comma-list); `--date-bucket field:unit` groups a datetime into buckets.
 # `--agg` is a comma-list of `fn:field[:param][=alias]` accumulators — count, sum,
 # avg, min, max, first, last, push, addToSet, stdDevPop, stdDevSamp, mergeObjects,
-# firstN/lastN/minN/maxN (param N), percentile (param p), median. `--having` filters
-# result columns (post-group), `--sort-by`/`--limit`/`--skip` order and paginate over
-# them. Group keys are lifted to top-level columns (keys first), so results read like
-# a GROUP BY. `--raw` keeps EJSON wrappers; `--dry-run` returns `{connection, query}`.
-# For top/bottomN with a sort spec, `$accumulator`, or window functions, use
-# `raw-aggregate`.
+# firstN/lastN/minN/maxN (param N), percentile (param p), median. `--having` is ONE
+# filter token over the result columns (post-group; `count:>=100`, `region:in:eu,us`
+# — its value may hold commas, so it is not a comma-list; AND several with a raw
+# `{$and: […]}`), `--sort-by`/`--limit`/`--skip` order and paginate over them. Group
+# keys are lifted to top-level columns (keys first), so results read like a GROUP BY;
+# a dotted key is flattened (`--by address.city` → column `address_city`), and
+# `--having`/`--sort-by` accept either spelling. `--raw` keeps EJSON wrappers;
+# `--dry-run` returns `{connection, query}`; the composed JS is danger-gated like
+# `raw-aggregate` (`--yes` skips). For top/bottomN with a sort spec, `$accumulator`,
+# or window functions, use `raw-aggregate`.
 @category mole-mongodb
 @example "count and revenue per customer, biggest first" {
   mole-mongodb aggregate active -C orders --by customer --agg count,sum:amount --sort-by "sum_amount desc" --limit 10 -c mongodb-local-dev
@@ -485,7 +493,7 @@ export def "aggregate" [
   --by(-b): string@"mongo-fields-csv"             # $group key fields, comma-separated
   --date-bucket: string@"mongo-datebucket"        # field:unit → a $dateTrunc group key
   --agg(-a): string@"mongo-agg"                   # accumulators, comma-separated: fn:field[:param][=alias]
-  --having: string@"mongo-having"                 # post-group filter tokens over result columns, comma-separated
+  --having: string@"mongo-having"                 # post-group filter: ONE field:value token over the result columns
   --sort-by(-s): string@"mongo-result-sort-csv"   # sort over result columns: "col [asc|desc]", comma-separated
   --limit(-l): int@"mongo-int-limit"
   --skip(-k): int@"mongo-int-skip"
@@ -500,6 +508,7 @@ export def "aggregate" [
   --set: record = {}
   --raw(-R)
   --dry-run(-n)
+  --yes(-y)                                        # skip the dangerous-op prompt (a raw {…} token can carry JS)
 ] {
   if ($collection | is-empty) { error make {msg: "aggregate: --collection <name> is required"} }
   let by = (complete csv $by)
@@ -508,20 +517,22 @@ export def "aggregate" [
     error make {msg: "aggregate: need at least --by, --date-bucket or --agg (use `find` for plain queries)"}
   }
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
+  # --having/--sort-by name RESULT columns: `--flat` lets a dotted --by key be typed as-is.
   let js = (mongo build-pipeline $collection
     --match (mongo build-filter $match)
     --unwind $unwind --by $by --date-bucket $date_bucket --agg $aggs
-    --having (mongo build-filter (complete csv $having))
-    --sort (mongo sort-spec (complete csv $sort_by))
+    --having (mongo build-filter [($having | default "")] --flat)
+    --sort (mongo sort-spec (complete csv $sort_by) --flat)
     --limit $limit --skip $skip)
   if $dry_run { return {connection: ($conf | conn redact), query: $js} }
+  if (query is-dangerous $js (mongo mongo-danger)) and (not (query confirm "This may modify data. Run it?" --yes=$yes)) { return }
   let rows = (mongo-run $conf $js $raw)
   mongo-warm $conf
   if $raw { return $rows }
   # Mongo's $project returns lifted group keys LAST; reorder to keys-first for the
-  # SQL-GROUP-BY shape (keys in --by order, then accumulators in --agg order).
-  let keys = ($by ++ (if ($date_bucket | is-empty) { [] } else { [($date_bucket | split row ":" | first)] }))
-  let order = ($keys ++ ($aggs | each {|t| (mongo parse-agg-token $t).alias }))
+  # SQL-GROUP-BY shape (keys in --by order, then accumulators in --agg order), via the
+  # same `result-cols` the completers use.
+  let order = (mongo result-cols $by $date_bucket $aggs)
   $rows | each {|r| $r | select --optional ...$order }
 }
 
@@ -562,7 +573,8 @@ export def "raw-aggregate" [
 }
 
 # Count documents matching `find`-style filter tokens. `--dry-run` returns
-# `{connection, query}` — the composed `countDocuments(...)` — without running.
+# `{connection, query}` — the composed `countDocuments(...)` — without running; the
+# composed JS is danger-gated like `find` (`--yes` skips).
 @category mole-mongodb
 @example "how many active admins" { mole-mongodb count active role:admin -C users -c mongodb-local-dev }
 export def "count" [
@@ -578,11 +590,13 @@ export def "count" [
   --uri: string
   --set: record = {}
   --dry-run(-n)
+  --yes(-y)                                        # skip the dangerous-op prompt (a raw {…} token can carry JS)
 ] {
   if ($collection | is-empty) { error make {msg: "count: --collection <name> is required"} }
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
   let js = "db.getCollection(" + (mongo lit $collection) + ").countDocuments(" + (mongo build-filter $filters) + ")"
   if $dry_run { return {connection: ($conf | conn redact), query: $js} }
+  if (query is-dangerous $js (mongo mongo-danger)) and (not (query confirm "This may modify data. Run it?" --yes=$yes)) { return }
   let n = (mongo-run $conf $js false)
   mongo-warm $conf
   $n
@@ -592,7 +606,8 @@ export def "count" [
 #
 # Composed from `find`-style `...filters`; `--limit` caps the number of values.
 # Returns a `{value, count}` table (like VictoriaLogs' `field-values`). `--dry-run`
-# returns `{connection, query}` without running.
+# returns `{connection, query}` without running; the composed JS is danger-gated like
+# `find` (`--yes` skips).
 @category mole-mongodb
 @example "which roles exist, and how common" { mole-mongodb distinct role -C users -c mongodb-local-dev }
 @example "top regions among paid orders" { mole-mongodb distinct region status:paid -C orders --limit 10 -c mongodb-local-dev }
@@ -611,6 +626,7 @@ export def "distinct" [
   --uri: string
   --set: record = {}
   --dry-run(-n)
+  --yes(-y)                                        # skip the dangerous-op prompt (a raw {…} token can carry JS)
 ] {
   if ($collection | is-empty) { error make {msg: "distinct: --collection <name> is required"} }
   let conf = (mongo-conf $connection $host $port $user $password $database $auth_source $uri $set)
@@ -626,6 +642,7 @@ export def "distinct" [
   $stages = ($stages | append "{$project: {_id: 0, value: \"$_id\", count: 1}}")
   let js = "db.getCollection(" + (mongo lit $collection) + ").aggregate([" + ($stages | str join ", ") + "]).toArray()"
   if $dry_run { return {connection: ($conf | conn redact), query: $js} }
+  if (query is-dangerous $js (mongo mongo-danger)) and (not (query confirm "This may modify data. Run it?" --yes=$yes)) { return }
   let rows = (mongo-run $conf $js false)
   mongo-warm $conf
   $rows
