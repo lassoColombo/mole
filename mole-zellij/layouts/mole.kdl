@@ -17,7 +17,6 @@
 // MANAGED FILE: `mole-zellij dev`/`install` keep this identical to the shipped
 // version and will overwrite local edits — customise via the mole layouts/ source.
 layout {
-    cwd "/Users/colombos/"
     tab name="mole" focus=true {
         pane size=1 borderless=true {
             plugin location="zellij:tab-bar"

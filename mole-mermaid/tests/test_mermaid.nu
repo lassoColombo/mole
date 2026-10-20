@@ -78,15 +78,47 @@ def "display_type falls back to data_type then unknown" [] {
 # ---- identifiers & comments (Mermaid whitespace-safety) -----------------------
 
 @test
-def "table and column names are squeezed to safe identifiers" [] {
+def "an odd table name is quoted, an odd column name is squeezed" [] {
   let data = {
     tables: [{schema: public, name: "my table!", type: "BASE TABLE", comment: null, row_estimate: 0}]
     columns: [{schema: public, table: "my table!", name: "weird name", position: 1, display_type: text, nullable: true, comment: null}]
     constraints: []
   }
   let out = ($data | mermaid er-diagram)
-  assert str contains $out "    my_table {"
+  assert str contains $out "    \"my table!\" {"
   assert str contains $out "text weird_name"
+}
+
+@test
+def "tables whose names squeeze alike stay distinct entities" [] {
+  let data = {
+    tables: [
+      {schema: public, name: "my table", type: "BASE TABLE", comment: null, row_estimate: 0}
+      {schema: public, name: my_table, type: "BASE TABLE", comment: null, row_estimate: 0}
+    ]
+    columns: []
+    constraints: []
+  }
+  let out = ($data | mermaid er-diagram)
+  assert str contains $out "    \"my table\" {}"
+  assert str contains $out "    my_table {}"
+}
+
+@test
+def "attribute types keep their parentheses and brackets" [] {
+  let data = {
+    tables: [{schema: public, name: t, type: "BASE TABLE", comment: null, row_estimate: 0}]
+    columns: [
+      {schema: public, table: t, name: a, position: 1, display_type: "varchar(255)", nullable: true, comment: null}
+      {schema: public, table: t, name: b, position: 2, display_type: "int[]", nullable: true, comment: null}
+      {schema: public, table: t, name: c, position: 3, display_type: "timestamp with time zone", nullable: true, comment: null}
+    ]
+    constraints: []
+  }
+  let out = ($data | mermaid er-diagram)
+  assert str contains $out "varchar(255) a"
+  assert str contains $out "int[] b"
+  assert str contains $out "timestamp_with_time_zone c"
 }
 
 @test
@@ -122,8 +154,24 @@ def "entity ids are schema-qualified across multiple schemas" [] {
     constraints: []
   }
   let out = ($data | mermaid er-diagram)
-  assert str contains $out "    public_users {}"
-  assert str contains $out "    audit_users {}"
+  assert str contains $out "    \"public.users\" {}"
+  assert str contains $out "    \"audit.users\" {}"
+}
+
+@test
+def "schema-qualified ids cannot collide" [] {
+  # `a_b`.`c` and `a`.`b_c` would both squeeze to a_b_c
+  let data = {
+    tables: [
+      {schema: a_b, name: c, type: "BASE TABLE", comment: null, row_estimate: 0}
+      {schema: a, name: b_c, type: "BASE TABLE", comment: null, row_estimate: 0}
+    ]
+    columns: []
+    constraints: []
+  }
+  let out = ($data | mermaid er-diagram)
+  assert str contains $out "    \"a_b.c\" {}"
+  assert str contains $out "    \"a.b_c\" {}"
 }
 
 # ---- foreign-key relationships ------------------------------------------------
@@ -160,6 +208,33 @@ def "a nullable FK is an optional relationship" [] {
 @test
 def "the FK column carries an FK marker" [] {
   assert str contains (fk-sample false | mermaid er-diagram) "int4 user_id FK"
+}
+
+@test
+def "a FK whose columns are unique draws a one-to-one" [] {
+  let base = (fk-sample false)
+  let uk = {schema: public, table: orders, name: orders_user_uk, type: "UNIQUE", columns: [user_id], ref_schema: null, ref_table: null, ref_columns: null}
+  let out = ($base | update constraints ($base.constraints | append $uk) | mermaid er-diagram)
+  assert str contains $out "    users ||--o| orders : \"orders_user_fk\""
+  # a composite unique key that merely CONTAINS the FK column is not a one-to-one
+  let wide = {schema: public, table: orders, name: orders_wide_uk, type: "UNIQUE", columns: [user_id id], ref_schema: null, ref_table: null, ref_columns: null}
+  let out2 = ($base | update constraints ($base.constraints | append $wide) | mermaid er-diagram)
+  assert str contains $out2 "    users ||--o{ orders : \"orders_user_fk\""
+}
+
+@test
+def "a FK with no ref_schema finds the referenced table by name across schemas" [] {
+  let data = {
+    tables: [
+      {schema: a, name: users, type: "BASE TABLE", comment: null, row_estimate: 0}
+      {schema: b, name: orders, type: "BASE TABLE", comment: null, row_estimate: 0}
+    ]
+    columns: [{schema: b, table: orders, name: user_id, position: 1, display_type: int4, nullable: false, comment: null}]
+    constraints: [{schema: b, table: orders, name: fk, type: "FOREIGN KEY", columns: [user_id], ref_schema: null, ref_table: users, ref_columns: [id]}]
+  }
+  let out = ($data | mermaid er-diagram)
+  assert str contains $out "    \"a.users\" ||--o{ \"b.orders\" : \"fk\""
+  assert (not ($out | str contains "b.users"))   # no phantom entity in the child's schema
 }
 
 @test

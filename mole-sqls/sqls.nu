@@ -35,10 +35,11 @@
 # The top-level config is {lowercaseKeywords: bool, connections: [entry, ...]}.
 #
 # BASE MAPPING (mole field → sqls field): name→alias, driver→driver (via `drivers`),
-# password→passwd, database→dbName, user/host/port verbatim, and proto defaults to
-# "tcp". Only drivers sqls actually implements are translatable — `drivers` is the
-# authoritative map. `config` silently DROPS connections of any other driver
-# (duckdb, trino, …); `entry` ERRORS on them (an explicit single-record contract).
+# password→passwd, database→dbName, user/host verbatim, port coerced to an int, and
+# proto defaults to "tcp". Only drivers sqls actually implements are translatable —
+# `drivers` is the authoritative map. `config` silently DROPS connections of any
+# other driver (duckdb, trino, …); `entry` ERRORS on them (an explicit
+# single-record contract).
 #
 # ENRICHMENT OVERLAY: a mole connection's optional `sqls: {...}` sub-record is
 # merged OVER the base entry (its sqls-native keys win). That is how extra sqls
@@ -48,29 +49,27 @@
 
 # The mole-driver → sqls-driver name map. The single source of truth for which
 # mole drivers sqls can talk to (its KEYS are the supported set) and what each is
-# called in a sqls entry's `driver:` field. It lists EVERY driver sqls implements
-# (mysql|postgresql|sqlite3|mssql|h2|vertica|oracle|clickhouse, from `entry`'s
-# schema note above): the KEY is the mole connections.yaml section name — by
-# convention the driver's CLI binary (postgresql→`psql`, sqlite3→`sqlite3`,
-# mssql→`sqlcmd`, vertica→`vsql`, oracle→`sqlplus`; `h2` has no CLI so it keys on
-# its own name) — and the VALUE is the sqls `driver:` string. A section here that
-# has no mole query submodule yet still translates fine: mole-sqls only needs the
-# connection record, not the submodule. NOTE: `entry` builds a tcp/host/port DSN,
-# so a file-based driver (sqlite3, h2) is only correct if its connection carries
-# an `sqls: {dataSourceName: "…"}` overlay.
+# called in a sqls entry's `driver:` field. The KEY is a mole connections.yaml
+# section name (a driver mole actually ships), the VALUE the sqls `driver:` string.
+# MariaDB speaks the MySQL protocol, so its connections ride sqls's `mysql` driver.
+# A mole driver sqls cannot talk to (duckdb, trino, the non-SQL ones) is simply not
+# here; the other engines sqls implements (sqlite3, mssql, h2, vertica, oracle,
+# clickhouse) have no mole driver and so no section to translate.
 @category mole-sqls
-@example "the supported driver map" { sqls drivers } --result {psql: "postgresql", mysql: "mysql", sqlite3: "sqlite3", sqlcmd: "mssql", h2: "h2", vsql: "vertica", sqlplus: "oracle", clickhouse: "clickhouse"}
+@example "the supported driver map" { sqls drivers } --result {psql: "postgresql", mysql: "mysql", mariadb: "mysql"}
 export def "drivers" []: nothing -> record {
   {
     psql: "postgresql"
     mysql: "mysql"
-    sqlite3: "sqlite3"
-    sqlcmd: "mssql"
-    h2: "h2"
-    vsql: "vertica"
-    sqlplus: "oracle"
-    clickhouse: "clickhouse"
+    mariadb: "mysql"
   }
+}
+
+# The sqls driver for a connection record, or null when sqls has none for its
+# mole driver — the one lookup `entry` (which errors) and `config` (which drops)
+# both build on.
+def driver-for [c: record]: nothing -> any {
+  drivers | get -o ($c | get -o driver | default "")
 }
 
 # Translate ONE mole connection record into one sqls `connections:` entry.
@@ -89,11 +88,12 @@ export def "drivers" []: nothing -> record {
 } --result {sslmode: "disable"}
 export def "entry" []: record -> record {
   let c = $in
-  let d = ($c | get -o driver | default "")
-  let sqls_driver = (drivers | get -o $d)
+  let sqls_driver = (driver-for $c)
   if ($sqls_driver | is-empty) {
-    error make {msg: $"sqls has no driver for the '($d)' connection '($c | get -o name | default '?')' — supported: (drivers | columns | str join ', ')"}
+    error make {msg: $"sqls has no driver for the '($c | get -o driver | default '')' connection '($c | get -o name | default '?')' — supported: (drivers | columns | str join ', ')"}
   }
+  # sqls's `port` is a Go int: a YAML `port: "5432"` must not reach it as a string.
+  let port = ($c | get -o port)
   {
     alias: ($c | get -o name)
     driver: $sqls_driver
@@ -101,7 +101,7 @@ export def "entry" []: record -> record {
     user: ($c | get -o user)
     passwd: ($c | get -o password)
     host: ($c | get -o host)
-    port: ($c | get -o port)
+    port: (if $port == null { null } else { $port | into int })
     dbName: ($c | get -o database)
   }
   | merge ($c | get -o sqls | default {})
@@ -122,10 +122,9 @@ export def "config" [
   --lowercase-keywords = true   # sqls top-level `lowercaseKeywords` setting
 ]: list<any> -> record {
   let conns = $in
-  let supported = (drivers | columns)
   {
     lowercaseKeywords: $lowercase_keywords
-    connections: ($conns | where {|c| ($c | get -o driver | default "") in $supported } | each {|c| $c | entry })
+    connections: ($conns | where {|c| (driver-for $c) != null } | each {|c| $c | entry })
   }
 }
 

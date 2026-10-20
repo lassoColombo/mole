@@ -16,8 +16,8 @@ use ./sqls.nu
 # Render mole's connections as a `sqls` language-server config record.
 #
 # Reads every connection from mole's connections.yaml (`conn list`), keeps the ones
-# whose driver sqls supports (psql → postgresql, mysql → mysql; other drivers are
-# dropped), and returns `{lowercaseKeywords, connections}` — the shape sqls's
+# whose driver sqls supports (psql → postgresql, mysql and mariadb → mysql; other
+# drivers are dropped), and returns `{lowercaseKeywords, connections}` — the shape sqls's
 # config.yml expects, in connections.yaml order (sqls treats the first as default).
 #
 # It returns DATA, not a file — render and place it yourself:

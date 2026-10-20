@@ -5,17 +5,20 @@ use ../sqls.nu
 # ---- drivers ------------------------------------------------------------------
 
 @test
-def "drivers maps every sqls-supported driver by cli name" [] {
-  assert equal (sqls drivers) {
-    psql: "postgresql", mysql: "mysql", sqlite3: "sqlite3", sqlcmd: "mssql",
-    h2: "h2", vsql: "vertica", sqlplus: "oracle", clickhouse: "clickhouse"
-  }
+def "drivers maps the mole drivers sqls can talk to" [] {
+  assert equal (sqls drivers) {psql: "postgresql", mysql: "mysql", mariadb: "mysql"}
 }
 
 @test
-def "entry translates a non-postgres/mysql driver" [] {
-  let c = {driver: "sqlplus", name: "o", host: "h", port: 1521, user: "u", password: "p", database: "d"}
-  assert equal (($c | sqls entry) | get driver) "oracle"
+def "entry translates a mariadb connection onto the mysql driver" [] {
+  let c = {driver: "mariadb", name: "m", host: "h", port: 3306, user: "u", password: "p", database: "d"}
+  assert equal (($c | sqls entry) | get driver) "mysql"
+}
+
+@test
+def "entry coerces a string port to an int" [] {
+  let c = {driver: "psql", name: "n", host: "h", port: "5432", user: "u", password: "p", database: "d"}
+  assert equal (($c | sqls entry) | get port) 5432
 }
 
 # ---- entry --------------------------------------------------------------------
@@ -100,9 +103,10 @@ def "config drops unsupported drivers and preserves order" [] {
     {driver: "psql",   name: "a", host: "h", port: 5432, user: "u", password: "p", database: "d"}
     {driver: "duckdb", name: "b", host: "h", port: 0,    user: "u", password: "p", database: "d"}
     {driver: "mysql",  name: "c", host: "h", port: 3306, user: "u", password: "p", database: "d"}
+    {driver: "mariadb", name: "d", host: "h", port: 3306, user: "u", password: "p", database: "d"}
   ]
   let aliases = ($conns | sqls config | get connections | get alias)
-  assert equal $aliases ["a" "c"]
+  assert equal $aliases ["a" "c" "d"]
 }
 
 @test

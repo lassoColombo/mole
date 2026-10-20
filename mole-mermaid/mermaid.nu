@@ -1,9 +1,10 @@
 # mole-mermaid/mermaid.nu — the pure rendering CORE of the mole-mermaid module.
 # Turns a mole SQL schema-cache record into a Mermaid diagram string.
-# PRIVATE: mod.nu imports it (`use ./mermaid.nu`) and exposes exactly ONE public
-# verb, `mole-mermaid er-schema`, built on `mermaid er-diagram`. Users never
-# import this file directly — it stays a separate, pure file purely so the
-# rendering logic is unit-testable and reusable internally.
+# PRIVATE: mod.nu imports it (`use ./mermaid.nu`) and builds its `er-schema` verb
+# on `mermaid er-diagram` (its other verb, `render`, is the Docker-backed image
+# step and lives in mod.nu). Users never import this file directly — it stays a
+# separate, pure file purely so the rendering logic is unit-testable and reusable
+# internally.
 #
 # LAYERING: this file is PURE — it `use`s NOTHING (not mole core, not any
 # submodule, not even mole-sql) and every command is data-in / data-out with no
@@ -25,20 +26,26 @@
 #
 # OUTPUT — a Mermaid `erDiagram` string: one entity per table (its columns carry
 # type, PK/FK/UK markers and comments) and one relationship per foreign key (the
-# left cardinality is `||` when the FK is mandatory, `|o` when nullable). The
-# result is a string — the caller pipes it to a file or a renderer.
+# parent side is `||` when the FK is mandatory, `|o` when nullable; the child side
+# is `o{` for a plain FK and `o|` when the FK columns are themselves a PK/UNIQUE,
+# i.e. one-to-one). The result is a string — the caller pipes it to a file or a
+# renderer.
 #
-# Mermaid's grammar is whitespace-sensitive: entity ids and attribute type/name
-# tokens must be single words, so everything that flows into them is squeezed to
-# [A-Za-z0-9_]. Free-text (comments, relationship labels) goes in quotes instead.
+# Mermaid's grammar is whitespace-sensitive. An ENTITY name may be anything when
+# double-quoted (`"my table"`), so names are quoted whenever they are not a plain
+# word — never squeezed, which would silently merge `my table` with `my_table`.
+# Attribute NAMES must be single words, so those are squeezed to [A-Za-z0-9_];
+# attribute TYPES may also carry `()`/`[]`, so `varchar(255)` survives. Free-text
+# (comments, relationship labels) goes in quotes instead.
 
 # Render a schema-cache record as a Mermaid `erDiagram`.
 #
 # Pipe the record a mole SQL plugin returns from `schema --full`
 # ({tables, columns, constraints}; a `meta` key is tolerated and ignored).
-# Entity ids are schema-qualified only when the schema spans more than one
-# schema, so single-schema diagrams stay terse. Foreign keys whose referenced
-# table lives outside the cached set still draw — Mermaid auto-creates the entity.
+# Entity ids are schema-qualified (`"schema.table"`) only when the schema spans
+# more than one schema, so single-schema diagrams stay terse. Foreign keys whose
+# referenced table lives outside the cached set still draw — Mermaid auto-creates
+# the entity.
 @category mole-mermaid
 @example "an empty schema renders a placeholder erDiagram" {
   {tables: [], columns: [], constraints: []} | mermaid er-diagram
@@ -64,16 +71,13 @@ export def "er-diagram" []: record -> string {
   # present, so single-schema diagrams stay terse.
   let multi_schema = (($tables | get schema | uniq | length) > 1)
 
-  let entities = $tables | each {|t|
-    {schema: $t.schema, table: $t.name, id: (mermaid-entity-id $t.schema $t.name $multi_schema)}
-  }
-
-  let blocks = $entities | each {|e|
+  let blocks = $tables | each {|t|
+    let id = (mermaid-entity-id $t.schema $t.name $multi_schema)
     let cols = $columns
-      | where {|c| $c.schema == $e.schema and $c.table == $e.table }
+      | where {|c| $c.schema == $t.schema and $c.table == $t.name }
       | sort-by position
     let attrs = $cols | each {|col|
-      let keys = column-keys $constraints $e.schema $e.table $col.name
+      let keys = column-keys $constraints $t.schema $t.name $col.name
       let type = mermaid-type ($col | get -o display_type | default ($col | get -o data_type) | default "unknown")
       let cname = mermaid-ident $col.name
       let key_part = if ($keys | is-empty) { "" } else { " " + ($keys | str join ",") }
@@ -81,21 +85,22 @@ export def "er-diagram" []: record -> string {
       $"        ($type) ($cname)($key_part)($comment)"
     }
     if ($attrs | is-empty) {
-      $"    ($e.id) {}"
+      $"    ($id) {}"
     } else {
       let body = $attrs | str join "\n"
-      $"    ($e.id) {\n($body)\n    }"
+      $"    ($id) {\n($body)\n    }"
     }
   }
 
   let rels = $constraints
     | where {|c| $c.type == "FOREIGN KEY" and (($c | get -o ref_table) != null) }
     | each {|c|
-        let child_id = entity-id-for $entities $c.schema $c.table $multi_schema
-        let parent_id = entity-id-for $entities ($c | get -o ref_schema | default $c.schema) ($c | get -o ref_table) $multi_schema
+        let child_id = mermaid-entity-id $c.schema $c.table $multi_schema
+        let parent_id = mermaid-entity-id (ref-schema $tables $c) $c.ref_table $multi_schema
         let left = if (fk-mandatory $columns $c) { "||" } else { "|o" }
+        let right = if (fk-unique $constraints $c) { "o|" } else { "o{" }
         let label = mermaid-rel-label ($c | get -o name)
-        $"    ($parent_id) ($left)--o{ ($child_id) : ($label)"
+        $"    ($parent_id) ($left)--($right) ($child_id) : ($label)"
       }
 
   ["erDiagram"] ++ $blocks ++ $rels | str join "\n"
@@ -103,32 +108,40 @@ export def "er-diagram" []: record -> string {
 
 # ---- helpers (private) --------------------------------------------------------
 
-# Squeeze an arbitrary string into a Mermaid-safe identifier token.
-def mermaid-ident [s: string]: nothing -> string {
+# Squeeze an arbitrary string into a Mermaid-safe single-word token. `--keep`
+# adds characters that may survive besides `[A-Za-z0-9_]` (attribute types may
+# carry `()`/`[]`).
+def mermaid-ident [s: string, --keep: string = ""]: nothing -> string {
   let cleaned = $s
-    | str replace --all --regex '[^A-Za-z0-9_]+' '_'
+    | str replace --all --regex ('[^A-Za-z0-9_' + $keep + ']+') '_'
     | str trim --char '_'
   if ($cleaned | is-empty) { "_" } else { $cleaned }
 }
 
-# Entity id for a (schema, table) pair, schema-qualified only in multi-schema diagrams.
+# Entity id for a (schema, table) pair — a pure function of its inputs, so the
+# same (schema, table) always maps to the same id whether the table is cached or
+# only referenced by a FK. Schema-qualified (`schema.table`) only in multi-schema
+# diagrams. Quoted whenever it is not a plain word, so distinct names stay
+# distinct (`"my table"` ≠ `my_table`) instead of being squeezed together.
 def mermaid-entity-id [schema: string, table: string, multi_schema: bool]: nothing -> string {
-  let raw = if $multi_schema { $"($schema)_($table)" } else { $table }
-  mermaid-ident $raw
+  let raw = if $multi_schema { $"($schema).($table)" } else { $table }
+  if ($raw =~ '^[A-Za-z_][A-Za-z0-9_]*$') { $raw } else { '"' + ($raw | str replace --all '"' "'") + '"' }
 }
 
-# Resolve a (schema, table) to its entity id, falling back to a derived id for
-# referenced tables that live outside the cached set (Mermaid auto-creates them).
-def entity-id-for [entities: table, schema: any, table: string, multi_schema: bool]: nothing -> string {
-  let hit = $entities | where {|e| $e.schema == $schema and $e.table == $table }
-  if ($hit | is-not-empty) {
-    $hit | first | get id
-  } else {
-    mermaid-entity-id ($schema | default "") $table $multi_schema
-  }
+# The schema of the table a FK references. The constraint's own `ref_schema` wins;
+# when a driver left it null, the referenced table is looked up by name across the
+# diagram's tables (unique hit → its schema), else the child's schema is assumed.
+def ref-schema [tables: table, c: record]: nothing -> string {
+  let explicit = ($c | get -o ref_schema)
+  if ($explicit | is-not-empty) { return $explicit }
+  let hits = ($tables | where name == $c.ref_table | get schema | uniq)
+  if ($hits | length) == 1 { $hits | first } else { $c.schema }
 }
 
-def mermaid-type [t: string]: nothing -> string { mermaid-ident $t }
+# An attribute type token: Mermaid lets a type carry `()` and `[]` besides word
+# characters, so `varchar(255)` and `int[]` survive; anything else (spaces in
+# `timestamp with time zone`, the comma in `numeric(10,2)`) is squeezed.
+def mermaid-type [t: string]: nothing -> string { mermaid-ident $t --keep '()\[\]' }
 
 # The PK/FK/UK markers for a column, derived from the table's constraints.
 def column-keys [constraints: table, schema: string, table: string, col: string]: nothing -> list<string> {
@@ -146,6 +159,16 @@ def fk-mandatory [columns: table, c: record]: nothing -> bool {
   let recs = $columns | where {|r| $r.schema == $c.schema and $r.table == $c.table and ($r.name in $c.columns) }
   if ($recs | is-empty) { return true }
   $recs | all {|r| not ($r.nullable | default false) }
+}
+
+# A foreign key is one-to-one when its column set is exactly a PRIMARY KEY or
+# UNIQUE constraint of the child table — each parent row can then have at most
+# one child, so the child side draws `o|` rather than `o{`.
+def fk-unique [constraints: table, c: record]: nothing -> bool {
+  let fk_cols = ($c.columns | sort)
+  $constraints | any {|k|
+    $k.schema == $c.schema and $k.table == $c.table and ($k.type in ["PRIMARY KEY" "UNIQUE"]) and (($k.columns | sort) == $fk_cols)
+  }
 }
 
 # A quoted Mermaid attribute comment (leading space included), or "" when empty.

@@ -23,7 +23,8 @@ assert ($content | str contains 'name="editor"') "installed layout has the edito
 assert ($content | str contains 'floating_panes') "layout declares its own floating_panes (blocks the session's inherited scratch)"
 assert ($content | str contains 'name="query"') "the single floating pane is the query REPL"
 assert ($content | str contains 'width "90%"') "the floating query pane is 90% wide"
-print "ok  install writes the layout (editor + one 90×90 floating query)"
+assert (not ($content =~ 'cwd "/')) "the shipped layout carries no absolute cwd (dev passes --cwd; the file must be portable)"
+print "ok  install writes the layout (editor + one 90×90 floating query, no baked-in cwd)"
 
 # ---- install: refreshes an out-of-date layout, then no-ops when current ----
 $env.XDG_CONFIG_HOME = (mktemp -d)
@@ -51,7 +52,7 @@ assert equal $plan.dir "/tmp/proj" "--dir is honoured"
 # without --dir, the tab (editor + query) roots at the mole QUERY dir, not pwd
 let def_plan = (mole-zellij dev "app" --dry-run)
 assert equal $def_plan.dir ($env.XDG_CONFIG_HOME | path join "mole" "queries") "--dir defaults to the mole query dir"
-assert ($plan.schema_cmd | str contains "mole-psql schema --full -c app") "schema pipeline queries the driver"
+assert ($plan.schema_cmd | str contains 'mole-psql schema --full -c "app"') "schema pipeline queries the driver (connection name quoted)"
 assert ($plan.schema_cmd | str contains "mole-mermaid er-schema") "schema pipeline renders the ER diagram"
 assert ($plan.schema_cmd | str contains "mole-mermaid render -f pdf") "default renders a dark vector PDF (opens in Preview)"
 print "ok  dev --dry-run defaults to a dark vector PDF schema"
@@ -60,6 +61,11 @@ print "ok  dev --dry-run defaults to a dark vector PDF schema"
 let html_plan = (mole-zellij dev "app" --format "html" --dry-run)
 assert ($html_plan.schema_cmd | str contains "mole-mermaid render -f html") "--format html is honoured"
 print "ok  dev --format html overrides the default"
+
+# an unknown format is rejected up front, before any tab is opened
+let bad = (try { mole-zellij dev "app" --format "gif" --dry-run; "no error" } catch {|e| $e.msg })
+assert ($bad | str contains "unknown --format") "dev validates --format before launching"
+print "ok  dev rejects an unknown --format"
 
 # ---- enter: activates the connection dev recorded ----
 $env.XDG_CACHE_HOME = (mktemp -d)

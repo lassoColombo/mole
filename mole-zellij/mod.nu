@@ -33,6 +33,7 @@
 use mole/lib/conn.nu
 use mole/lib/cache.nu
 use mole/lib/config.nu
+use mole/lib/complete.nu
 
 # This package's own directory, captured at parse time (`path self` is parse-only),
 # so `install` can find the shipped ./layouts/mole.kdl regardless of cwd.
@@ -57,20 +58,8 @@ def "layouts-dir" []: nothing -> string {
 # Where the `mole` layout is (or will be) installed.
 def "installed-layout" []: nothing -> string { layouts-dir | path join "mole.kdl" }
 
-# Sync the shipped layout into the zellij layouts dir: install it when missing, and
-# REFRESH it when an out-of-date copy is present (an older mole-zellij shipped a
-# layout that embedded the query pane — leaving it stale is what produced duplicate
-# panes). It is a managed file; `dev` keeps it identical to the shipped version.
-def "ensure-installed" []: nothing -> string {
-  let dest = (installed-layout)
-  let stale = (not ($dest | path exists)) or ((open --raw $dest) != (open --raw (asset-layout)))
-  if $stale {
-    mkdir (layouts-dir)
-    cp (asset-layout) $dest
-    print $"mole-zellij: synced layout → ($dest)"
-  }
-  $dest
-}
+# The schema image formats `dev` can ask mole-mermaid for.
+const FORMATS = [pdf html svg png]
 
 # ---- presentation ------------------------------------------------------------
 
@@ -81,14 +70,10 @@ def "styled-prompt" [text: string]: nothing -> string {
 }
 
 # Fuzzy-pick a connection name across all drivers (used when `dev` gets no name).
+# `complete connection` is core's cross-driver name list — the right pool here,
+# since mole-zellij spans every driver (a driver plugin scopes to its own).
 def "pick-connection" []: nothing -> string {
-  conn list | get -o name | default [] | input list --fuzzy (styled-prompt "mole connection") | default ""
-}
-
-# Cross-driver connection-name completer (mole-zellij spans every driver, unlike a
-# driver plugin which scopes completion to its own).
-def "complete-connection" []: nothing -> list<string> {
-  conn list | get -o name | default []
+  complete connection | input list --fuzzy (styled-prompt "mole connection") | default ""
 }
 
 # The marker file `dev` writes and `enter` reads.
@@ -98,9 +83,11 @@ def "marker-path" []: nothing -> string { cache path "zellij" "current" }
 
 # Install the `mole` zellij layout into ~/.config/zellij/layouts/.
 #
-# `dev` syncs it automatically; run this to do so explicitly. It is a MANAGED file
-# (`dev` keeps it identical to the shipped version): a plain `install` refreshes it
-# when out of date and is a no-op when current; `--force` always rewrites it.
+# `dev` runs this on every launch; run it by hand to do so explicitly. It is a
+# MANAGED file (`dev` keeps it identical to the shipped version — an older
+# mole-zellij shipped a layout that embedded the query pane, and leaving that stale
+# is what produced duplicate panes): a plain `install` refreshes it when out of date
+# and is a silent no-op when current; `--force` always rewrites it.
 @category mole-zellij
 @example "install / refresh the layout" { mole-zellij install }
 @example "force a rewrite" { mole-zellij install --force }
@@ -109,10 +96,7 @@ export def "install" [
 ]: nothing -> string {
   let dest = (installed-layout)
   let current = ($dest | path exists) and ((open --raw $dest) == (open --raw (asset-layout)))
-  if $current and (not $force) {
-    print $"mole-zellij: layout up to date at ($dest)"
-    return $dest
-  }
+  if $current and (not $force) { return $dest }
   mkdir (layouts-dir)
   cp (asset-layout) $dest
   print $"mole-zellij: installed layout → ($dest)"
@@ -145,12 +129,15 @@ export def "install" [
   mole-zellij dev app --dry-run
 }
 export def "dev" [
-  connection?: string@complete-connection   # a mole connection (any driver); omit to fuzzy-pick
+  connection?: string@"complete connection"   # a mole connection (any driver); omit to fuzzy-pick
   --dir(-d): path                            # directory the tab opens in — editor + query REPL (default: the mole query dir)
   --format(-f): string = "pdf"              # schema format: pdf (dark vector, opens in Preview, default) | html (dark browser pan/zoom) | svg | png
   --no-schema                               # don't render/open the schema diagram
   --dry-run                                 # return the plan instead of launching (no side effects)
 ]: nothing -> any {
+  if ($format not-in $FORMATS) {
+    error make {msg: $"dev: unknown --format '($format)' — use ($FORMATS | str join ', ')"}
+  }
   let conn = (if ($connection | is-empty) { pick-connection } else { $connection })
   if ($conn | is-empty) { return }
 
@@ -163,7 +150,10 @@ export def "dev" [
   # pdf default: mole-mermaid renders a dark VECTOR pdf (svg → rsvg-convert) that
   # opens in Preview and zooms far past a browser. (html gives a dark browser
   # pan/zoom page; svg/png are artefacts.)
-  let schema_cmd = $"use ($module); use mole-mermaid; ($module) schema --full -c ($conn) | mole-mermaid er-schema | mole-mermaid render -f ($format)"
+  # The connection name is quoted (it is user data in a command string the child
+  # `nu` parses); `--format` was validated above, the module name derives from the
+  # driver key.
+  let schema_cmd = $"use ($module); use mole-mermaid; ($module) schema --full -c \"($conn)\" | mole-mermaid er-schema | mole-mermaid render -f ($format)"
   let plan = {
     connection: $conn
     driver: $driver
@@ -181,7 +171,7 @@ export def "dev" [
     return
   }
 
-  ensure-installed
+  install | ignore
   # Record the choice so the layout's floating query pane (`mole-zellij enter`) can activate it.
   {driver: $driver, connection: $conn} | cache write (marker-path)
 
