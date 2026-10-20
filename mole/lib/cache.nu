@@ -64,11 +64,15 @@ export def "stale" [
   file: string     # Absolute path to the cache file
   ttl: duration    # Maximum age before the cache is considered stale (e.g. 1hr, 30min)
 ]: nothing -> bool {
-  let data = read $file
-  if ($data | is-empty) { return true }
+  not (fresh (read $file) $ttl)
+}
+
+# Is an already-read cache value fresh: present, stamped, and younger than `ttl`?
+def fresh [data: any, ttl: duration]: nothing -> bool {
+  if ($data | is-empty) { return false }
   let when = $data | get -o meta | get -o refreshed_at
-  if ($when | is-empty) { return true }
-  ((date now) - $when) > $ttl
+  if ($when | is-empty) { return false }
+  ((date now) - $when) <= $ttl
 }
 
 # Serve a cached record, or (re)build it — the one memoize primitive behind every
@@ -89,7 +93,8 @@ export def "fetch" [
   build: closure    # {|| -> record} produces the value to cache
   --refresh         # Rebuild even when the cache is fresh
 ]: nothing -> any {
-  if (not $refresh) and (not (stale $file $ttl)) { return (read $file) }
+  let cached = (if $refresh { null } else { read $file })   # one read serves both the freshness check and the hit
+  if (fresh $cached $ttl) { return $cached }
   let built = (do $build)
   let meta = ($built | get -o meta | default {} | upsert refreshed_at (date now))
   let data = ($built | upsert meta $meta)
