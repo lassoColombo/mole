@@ -56,12 +56,19 @@ The query executes, returns a wrong or empty set, and nothing tells the user.
 can silently touch the wrong rows or, more often, no rows at all while
 reporting success.
 
-### A1. Raw SQL in `--where` is captured as a single predicate token  `[ ]`
+### A1. Raw SQL in `--where` is captured as a single predicate token  `[x]`
 
 - Modules: all SQL drivers (psql, mysql, mariadb, trino, duckdb) via
   `mole-sql/sql.nu` `parse-where` (line 359), `predicate-token` (255),
   `coalesce-preds` (328), `sql-literal` (276).
 - Mode: executed on DuckDB and MySQL.
+- Fixed by removing the guess rather than refining it: `--where` is token-only and
+  errors on anything else; raw SQL has its own `--where-sql` flag (AND-joined with
+  `--where` when both are given). Inside a token the value is a literal by
+  definition; one wrapped in matching quotes (`status='active'`) is unwrapped and
+  always a string, and an unquoted value holding a standalone `AND`/`OR` is
+  rejected as a pasted predicate list. `a=b` therefore renders `a = 'b'` by
+  design; a column comparison is `--where-sql "a = b"`.
 
 `--where` is dual mode: if every comma-separated item parses as
 `col<op>value` it is a token list, otherwise it is raw SQL. The token regex
@@ -94,7 +101,7 @@ Regression test: `sql parse-where "a=1 AND b=2"` returns the raw form;
 `sql parse-where "id=7 OR 1=1"` returns the raw form; `a=1,b=2` still returns
 two tokens.
 
-### A2. Space after a comma folds the next predicate into the previous value  `[ ]`
+### A2. Space after a comma folds the next predicate into the previous value  `[x]`
 
 - Modules: all SQL drivers via `parse-where` (359), `coalesce-preds` (328).
 - Mode: executed on DuckDB and MySQL.
@@ -114,7 +121,7 @@ fold-back behaviour only for items that follow an `in:` token.
 Regression test: `sql parse-where "a=1, b=2"` yields two tokens equal to
 `sql parse-where "a=1,b=2"`.
 
-### A3. Trailing or doubled comma becomes part of the literal  `[ ]`
+### A3. Trailing or doubled comma becomes part of the literal  `[x]`
 
 - Modules: all SQL drivers via `parse-where` (359), `coalesce-preds` (328).
 - Mode: executed on DuckDB and MySQL.
@@ -133,11 +140,13 @@ Regression test: `sql parse-where "status=active,"` equals
 `sql parse-where "status=active"`; `sql parse-where ","` errors or yields no
 predicate.
 
-### A4. `build-having` silently drops tokens it cannot parse  `[ ]`
+### A4. `build-having` silently drops tokens it cannot parse  `[x]`
 
 - Modules: psql, mysql, mariadb, trino, duckdb `stats` via `sql build-having`
   (646).
 - Mode: executed on DuckDB and MySQL.
+- Fixed 2026-10-20: an unparsable token errors, and `build-having --by` rejects a
+  column that is neither a `--by` key nor a requested aggregate's alias.
 
 | input | generated | observed |
 |---|---|---|
@@ -156,7 +165,10 @@ request.
 Regression test: `sql build-having ["count >= 10"] …` errors; an alias that
 is not among the requested aggregates errors.
 
-### A5. Unknown sort suffix is silently ascending  `[ ]`
+### A5. Unknown sort suffix is silently ascending  `[x]`
+
+- Closed fully 2026-10-20: `sort-token` also requires a plain identifier, so
+  `amount desc`, `:desc` and `id; DROP TABLE t` error instead of passing through.
 
 - Modules: all SQL drivers via `sql sort-token` (497), `build-order` (520).
 - Mode: dry-run (rendering is deterministic).
@@ -174,7 +186,7 @@ Suggested fix: error on a suffix other than `asc`/`desc` (case-insensitive).
 
 Regression test: `sql sort-token "amount:dsc"` errors; `amount:DESC` works.
 
-### A6. Mongo accepts SQL-shaped tokens as truthy-field filters  `[ ]`
+### A6. Mongo accepts SQL-shaped tokens as truthy-field filters  `[x]`
 
 - Modules: `mole-mongodb/mongo.nu` `parse-filter-token` (87), `sort-spec`
   (167); `mole-mongodb/mod.nu` `find` (427), `aggregate` (481).
@@ -203,6 +215,8 @@ still yields `{"age": 30}`.
 
 - Modules: `mole-mongodb/mongo.nu` `coerce-scalar` (49).
 - Mode: executed on MongoDB.
+- Partly fixed: integers past ±2^53 render `NumberLong("…")`. Open: the quoted
+  string escape (`address.zip:"10001"`) and `1e400`.
 
 | input | generated | observed |
 |---|---|---|
@@ -221,11 +235,14 @@ Regression test: `mongo coerce-scalar "9007199254740993"` returns
 `NumberLong("9007199254740993")`; `mongo coerce-scalar '"10001"'` returns
 `"10001"`.
 
-### A8. VictoriaMetrics re-quotes PromQL values and swallows comma lists  `[ ]`
+### A8. VictoriaMetrics re-quotes PromQL values and swallows comma lists  `[x]`
 
 - Modules: `mole-promql/promql.nu` `matcher-token` (233), `matchers-tokens`
   (249); `mole-victoriametrics/mod.nu` `select` (362), `vm-scope` (106).
 - Mode: dry-run only.
+- Fixed 2026-10-20: a quoted value is raw PromQL (so `path="a\"b"` is no longer
+  double-escaped either), and an unquoted comma in a matcher value errors with
+  "one matcher per positional".
 
 | input | generated | expected |
 |---|---|---|
@@ -244,7 +261,7 @@ unquoted commas or error on a comma in a matcher value.
 Regression test: `promql matcher-token 'job="api"'` renders `job="api"`;
 `promql matchers-tokens ["job=api,env=prod"]` errors or yields two matchers.
 
-### A9. VictoriaLogs renders an operator token as a bare word filter  `[ ]`
+### A9. VictoriaLogs renders an operator token as a bare word filter  `[x]`
 
 - Modules: `mole-victorialogs/mod.nu` `vl-compose-filter` (248), `select`
   (349); `mole-victorialogs/logsql.nu`.
@@ -272,7 +289,7 @@ expect accumulation.
 Suggested fix: document it in the `--where` help text; nothing to change in
 code unless the flag becomes a list.
 
-### A11. Mongo aggregate alias clash overwrites the group key  `[ ]`
+### A11. Mongo aggregate alias clash overwrites the group key  `[x]`
 
 - Modules: `mole-mongodb/mongo.nu` `build-pipeline` (320),
   `parse-agg-token` (275).
@@ -286,12 +303,21 @@ Suggested fix: error when an alias equals a `--by` field or another alias.
 
 Regression test: `mongo build-pipeline` with that input errors.
 
+### A12. `update` guard checked the raw `--where`, not the built one  `[x]`
+
+- Modules: psql, mysql, mariadb, trino, duckdb `update`.
+- Mode: dry-run. Found after the audit.
+
+`update t "x = 1" --where " "` passed the `--all` guard (a blank string is not
+empty) and rendered `UPDATE t SET x = 1`, touching every row. `delete` already
+guarded on the built clause; `update` now does the same.
+
 ## B. Hard errors
 
 These fail loudly on the engine, so the user sees them, but each is a
 reachable feature that cannot work as offered.
 
-### B1. Empty `in:` list renders `IN ()`  `[ ]`
+### B1. Empty `in:` list renders `IN ()`  `[x]`
 
 - Modules: all SQL drivers via `sql render-eq` (191).
 - Mode: executed on DuckDB and MySQL (syntax error on both).
@@ -300,7 +326,7 @@ reachable feature that cannot work as offered.
 `render-eq` when the list is empty. Regression test: `sql parse-where
 "role=in:"` errors.
 
-### B2. Mongo dotted `--by` keys are rejected by the server  `[ ]`
+### B2. Mongo dotted `--by` keys are rejected by the server  `[x]`
 
 - Modules: `mole-mongodb/mongo.nu` `build-pipeline` (320), `stat-alias` (231);
   `mole-mongodb/mod.nu` `aggregate` (481) and its `--by` completer.
@@ -320,6 +346,9 @@ alias. Regression test: `mongo build-pipeline --by ["address.city"]` renders a
 
 - Modules: all SQL drivers via `sql sql-literal` (276).
 - Mode: executed on DuckDB (errors) and MySQL (silent coercion).
+- Partly fixed: a leading-zero integer stays quoted (`zip = '01234'`), and since
+  2026-10-20 the `1e5`/`+5`/`.5`/`2.5E-3` forms render bare. Open: typing the
+  literal from the schema cache when the table is known.
 
 | input | generated | DuckDB on a text column |
 |---|---|---|
@@ -337,11 +366,17 @@ and to never emit a leading-zero integer bare.
 Regression test: `sql sql-literal "01234"` returns `'01234'`;
 `sql sql-literal "1e5"` returns `1e5`.
 
-### B4. PromQL builder does not validate function arity or step  `[ ]`
+### B4. PromQL builder does not validate function arity or step  `[x]`
 
 - Modules: `mole-promql/promql.nu` `build` (269), `step` (84);
   `mole-victorialogs/logsql.nu` `step` (65).
 - Mode: dry-run only.
+- Fixed 2026-10-20: `step` errors at or below zero; `build` checks range-vector
+  functions and parametric aggregators through injected `--range-funcs`/`--param-aggs`
+  (victoriametrics passes an empty range-function list, so `rate(up)` stays legal
+  there) and validates the metric, `by`/`without` labels and `--range` syntax;
+  `sql page-clause` rejects a negative `--limit`/`--offset` on every SQL verb, and
+  `logsql` does the same for its `limit`/`offset` pipes.
 
 | input | generated |
 |---|---|
@@ -359,7 +394,7 @@ the SQL drivers.
 Regression test: `promql build` with `--func rate` and no range errors;
 `promql step 500ms` errors.
 
-### B5. Mongo date coercion accepts impossible dates  `[ ]`
+### B5. Mongo date coercion accepts impossible dates  `[x]`
 
 - Modules: `mole-mongodb/mongo.nu` `coerce-scalar` (49).
 - Mode: executed on MongoDB (`MongoshInvalidInputError`).
@@ -388,7 +423,7 @@ otherwise leave the string, but document it.
 Regression test: `apply-agg-types` on a `min` request over an integer column
 yields an int.
 
-### C2. Duplicate aggregate requests produce duplicate record keys  `[ ]`
+### C2. Duplicate aggregate requests produce duplicate record keys  `[x]`
 
 - Modules: `sql agg-requests` (570), `build-aggs` (602).
 - Mode: executed on DuckDB.
@@ -441,5 +476,99 @@ pipelines.
 5. A7 and B3: literal typing in Mongo and SQL. Both need a decision on whether
    to consult the schema cache; do them together so the policy matches.
 6. A8 and B4: PromQL quoting, comma handling and arity. Pair with the pending
-   prometheus token refactor in `NEXT_STEPS.md` so both drivers get it once.
+   prometheus token refactor (landed in `0293bd8`) so both drivers get it once.
 7. C1 and C2: aggregate typing. Lowest risk, purely cosmetic for most users.
+
+## D. Second pass, 2026-10-20
+
+Found by re-auditing the working tree after the A/B fixes above, with the same
+method (pure-function probes, `--dry-run`, and live `mongosh --nodb` where a
+Mongo item needed it). Ticked items landed in the same pass; the suites went
+from 357 to 402 tests, and mole-mongodb and mole-victorialogs gained the
+`tests/test_mod.nu` dry-run suites every SQL driver already had.
+
+### D1. A doubled or reordered SQL operator becomes a string literal  `[x]`
+
+`--where a==1` rendered `a = '=1'`, `a=>1` rendered `a = '>1'`, `a!==1` rendered
+`a <> '=1'` (also through `update`/`delete`). `render-predicate` now errors on an
+unquoted value that starts with `=<>~!`; quote the value to mean it literally.
+
+### D2. `select` prompt policy diverged across the SQL drivers  `[x]`
+
+Trino and DuckDB ran the danger regex over the composed SELECT, so a column named
+`use`/`call`/`load` prompted (and silently returned nothing in a non-TTY); the other
+three gate only on `--lock`. All five now follow the psql policy — a composed
+SELECT cannot write — and the Trino/DuckDB `select --yes` flag is gone with it.
+
+### D3. PromQL time windows  `[x]`
+
+`--start` alone reached `/query_range` without an `end` (server error), and
+`--last` with an explicit `--end` anchored on now (start > end). `resolve-range`
+now anchors `--last` on `end`, errors on an inverted window, and takes `--closed`
+for the endpoints needing both bounds. VictoriaLogs shares the helper now.
+`select --time` combined with a range flag errors instead of being dropped.
+
+### D4. Native-histogram series crashed PromQL result decoding  `[x]`
+
+`vector`/`matrix` indexed `value`/`values` unconditionally; a `histogram`/
+`histograms` series now carries the histogram record as the value. Both shapes
+emit `{…labels, timestamp, value}` in the same order.
+
+### D5. Generated clients sent several `match[]` values as one csv param  `[x]`
+
+Latent (every caller passes one selector); fixed in both `client.nu` and
+`regen.nu` so the next multi-selector verb does not inherit it.
+
+### D6. Mongo `--having` was comma-split before parsing  `[x]`
+
+`--having "customer:in:a,b"` became a filter on a phantom field `b`. It is one
+token now.
+
+### D7. Mongo structured verbs could run unguarded JS  `[x]`
+
+A raw `{…}` filter token and the aggregate `param` were spliced into the mongosh
+script verbatim and never danger-checked. `param` must be numeric; find/aggregate/
+count/distinct run `query is-dangerous` over the composed JS (skip with `--yes`);
+the danger regex covers `insert`/`update`/`runCommand`/`adminCommand`/user and
+role management.
+
+### D8. Mongo degenerate and dotted tokens  `[x]`
+
+`role:`, `:admin`, `role:in:`, `age:>=`, `name:~`, `age:=5` rendered silently;
+they error. After the B2 dotted-key rename, `--sort-by`/`--having` typed as
+`address.city` targeted a column that no longer existed; both spellings work.
+`--select` with `--exclude` errors; `count:amount`, a non-numeric param and a
+`_id` alias error; a date must use an uppercase `T` (`ISODate` rejects `t`).
+
+### D9. VictoriaLogs `select --offset` paged a different result set than `--limit`  `[x]`
+
+HTTP `offset` with a `| limit` pipe made page two always empty; `offset` is a
+pipe now. Also: negated bare-range tokens (`-status>=500`) error like A9,
+whitespace-only tokens are dropped, duplicate/clashing stats aliases error, `*`
+is quoted in completed values, and a zoneless value is no longer inferred as a
+local-time datetime.
+
+### D10. Tools  `[x]`
+
+mole-sqls silently dropped every MariaDB connection (no `mariadb` map key) and
+passed `port` untyped. mole-zellij's managed layout hardcoded a home directory
+and `dev` interpolated the connection name unquoted. mole-mermaid squeezed
+`my table` and `my_table` to one entity, always drew many-to-one, and lost
+`varchar(255)`; entity names are quoted now, 1:1 FKs draw `o|`, and a null
+`ref_schema` is resolved by table name.
+
+### D11. Open after this pass  `[ ]`
+
+- The five SQL drivers are one driver written five times (verb bodies, completers,
+  conf/schema-load/probe); the suites have drifted to 17/29/29/9/9 tests. A
+  driver-side shared module parameterized by a spec record would cut each to its
+  dialect head plus signatures. This is a layering decision (an impure, engine-
+  agnostic "driver kit" tier), not a bug fix — decide before adding more SQL verbs.
+- A7 (Mongo quoted-string escape, `1e400`), B3 (schema-typed literals), C1
+  (`min`/`max` typing), A10 (document that a repeated `--where` flag does not
+  accumulate).
+- `complete token` splits on whitespace while `complete flag` is parser-based, so
+  Tab inside a quoted multi-word `--where` sees only the last word.
+- mole-redis is a compose file with no module; delete it or build it.
+- The PromQL default `--step 15sec` exceeds Prometheus's 11k-point cap past ~45h;
+  derive the step from the window when `--step` is not given.
