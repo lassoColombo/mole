@@ -1,7 +1,8 @@
 # mole-psql — PostgreSQL driver plugin.
 #
 # A PLUGIN (data source): supports the postgres technology, registers itself as a
-# driver, and exposes the user verbs `raw-query` / `select` / `stats` / `schema`. It DEPENDS on:
+# driver, and exposes the user verbs `raw-query` / `select` / `stats` / `insert` /
+# `update` / `delete` / `schema`. It DEPENDS on:
 #   - mole core plumbing        (`use mole/lib/*.nu`)
 #   - the generic mole-sql pure LIBRARY (`use mole-sql/sql.nu`)
 # The mole-sql library must be reachable via `NU_LIB_DIRS`.
@@ -243,9 +244,9 @@ def "psql-tables-csv" [context: string]: nothing -> list<string> {
 }
 
 # The table a line targets: `--from` (select/stats), else the leading positional of the
-# write verbs (`update <table>` / `delete <table>`); null when neither is typed yet.
+# write verbs (`insert|update|delete <table>`); null when neither is typed yet.
 def psql-ctx-table [context: string]: nothing -> any {
-  complete flag $context [--from -F] | default (complete lead-arg $context [update delete])
+  complete flag $context [--from -F] | default (complete lead-arg $context [insert update delete])
 }
 
 def "psql-column" [context: string]: nothing -> list<string> {
@@ -277,6 +278,26 @@ def pg-probe [conf: record, sql: string]: nothing -> list<string> {
 # slow / errored → nothing).
 def "psql-where" [context: string]: nothing -> list<any> {
   let plan = (sql where-plan (complete token $context) (psql-column $context) --ops (pg-ops) --dialect $PG_DIALECT --table (psql-ctx-table $context))
+  if ($plan.probe? == null) { return $plan.candidates }
+  let conf = (complete conn-ctx $context "psql")
+  if ($conf | is-empty) { return [] }
+  (try { pg-probe $conf $plan.probe.sql } catch { [] }) | each {|v| $plan.probe.prefix + $v }
+}
+
+# The assignment-token completer of `insert` and `update` (their `...assignments` rest
+# slot). Two stages, planned by the pure `sql assign-plan`: a token without `=` offers
+# the target table's columns NOT yet assigned by the earlier tokens, as `col=`
+# (described by type, plus `required` on an insert line when NOT NULL without a
+# default); after `col=`, the column's live distinct values through the bounded probe
+# (best-effort: unreachable / errored → nothing). The target is the leading positional
+# (an update alias, `"users u"`, is looked up by its base table), the assigned set the
+# positionals after it.
+def "psql-assign" [context: string]: nothing -> list<any> {
+  let table = (psql-ctx-table $context)
+  let cols = (if ($table | is-empty) { [] } else { sql columns-for (psql-catalog $context) (sql base-table $table) })
+  let assigned = (complete positionals $context | skip 1 | each {|t| sql assignment-token $t | get -o col } | compact)
+  let insert = (complete lead-arg $context [insert] | is-not-empty)
+  let plan = (sql assign-plan (complete token $context) $cols --assigned $assigned --table $table --required=$insert)
   if ($plan.probe? == null) { return $plan.candidates }
   let conf = (complete conn-ctx $context "psql")
   if ($conf | is-empty) { return [] }
@@ -581,13 +602,90 @@ export def "stats" [
   | sql apply-agg-types $aggs
 }
 
+# Compose and run a PostgreSQL INSERT: one row from `col=value` tokens, or many rows
+# from a piped table, into a single table.
+#
+# Reads like the statement: `insert <table> col=value …`. The table is the leading
+# positional (completing table names); the rest positionals are `col=value` ASSIGNMENT
+# tokens — the `--where` grammar cut down to `=`, with the same literal rules: a bare
+# value is quoted by shape (`age=30` → `30`, `status=active` → `'active'`), a quoted one
+# is always a string (`zip="01234"`), `col=null` is `NULL`. The columns complete (typed,
+# `required` flagged when NOT NULL without a default) and, after `col=`, the column's
+# existing distinct values do. An EXPRESSION (`now()`, `DEFAULT`, `gen_random_uuid()`)
+# never goes through the token grammar: pass it in `--values-sql`, a record of
+# `{column: "raw sql"}` rendered verbatim.
+#
+# PIPE a table in to insert many rows in ONE statement: each record's keys are the
+# column list and its typed cells render by type (a string is always quoted, a
+# record/list is JSON, null is NULL); any tokens / `--values-sql` entries become
+# CONSTANT columns on every row. Ragged rows (differing key sets) are refused — shape
+# them in Nushell first.
+#
+# `--ignore` skips conflicting rows (`ON CONFLICT DO NOTHING`); `--upsert <cols>` names
+# the conflict target and updates every other inserted column from EXCLUDED
+# (`ON CONFLICT (cols) DO UPDATE SET …`). `--upsert` takes a column list because
+# Postgres needs a conflict target; on mole-mysql/mole-mariadb, which have none, it is
+# a bare switch. `--returning` hands back columns of the inserted rows, typed like a
+# `select` result. INSERT always writes, so it prompts
+# before running (skip with `--yes`); `--dry-run` returns a `{connection, query}` record
+# without running. Connection overridable as in `raw-query`.
+@category mole-psql
+@example "one row from tokens (columns, then existing values, complete)" {
+  mole-psql insert users email=ann@x.io status=active --dry-run | get query
+} --result "INSERT INTO users (email, status) VALUES ('ann@x.io', 'active')"
+@example "many rows from a piped table, in one statement" {
+  [{sku: A1, qty: 3} {sku: B2, qty: 0}] | mole-psql insert stock --dry-run | get query
+} --result "INSERT INTO stock (sku, qty) VALUES ('A1', 3), ('B2', 0)"
+@example "an expression value goes in --values-sql" {
+  mole-psql insert events kind=login --values-sql {at: "now()"} --dry-run | get query
+} --result "INSERT INTO events (kind, at) VALUES ('login', now())"
+@example "upsert on a key, returning the row" {
+  mole-psql insert users email=a@b.c status=active --upsert email --returning id --dry-run | get query
+} --result "INSERT INTO users (email, status) VALUES ('a@b.c', 'active') ON CONFLICT (email) DO UPDATE SET status = EXCLUDED.status RETURNING id"
+@example "run for real — load a CSV, skipping rows that already exist (prompts unless --yes)" {
+  open signups.csv | mole-psql insert users --ignore --returning id,email -c postgres-local-dev --yes
+}
+export def "insert" [
+  table: string@"psql-table"                       # target table (INSERT INTO <table>); single table, no alias
+  ...assignments: string@"psql-assign"             # col=value tokens: the one row, or constant columns on every piped row
+  --values-sql: record = {}                        # {column: "raw sql"}: expression values, verbatim (now(), DEFAULT, …)
+  --ignore                                         # skip conflicting rows (ON CONFLICT DO NOTHING)
+  --upsert: string@"psql-columns-csv"              # conflict-target columns, comma-separated: update the other inserted columns from EXCLUDED
+  --returning: string@"psql-columns-csv"           # RETURNING columns, comma-separated (typed like a select result)
+  --connection(-c): string@complete-connection   # named connection (default: current)
+  --host(-h): string
+  --port(-p): int
+  --user(-u): string
+  --password(-P): string
+  --database(-d): string
+  --set: record = {}
+  --raw(-R)                                         # raw driver output for RETURNING rows: no typing, no null-normalization
+  --dry-run(-n)                                    # return a {connection, query} record instead of running
+  --yes(-y)                                         # skip the confirmation prompt
+] {
+  let parts = (sql insert-values $in --assignments $assignments --values-sql $values_sql --dialect $PG_DIALECT)
+  if $ignore and ($upsert | is-not-empty) { error make {msg: "insert: --ignore and --upsert are mutually exclusive"} }
+  let returning = (complete csv $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
+  let tail = (sql conflict-tail --ignore=$ignore --upsert (complete csv $upsert) --columns $parts.columns)
+  let text = (sql build-insert --table $table --columns $parts.columns --rows $parts.values --tail $tail --returning $returning)
+  let conf = (pg-conf $connection $host $port $user $password $database $set)
+  if $dry_run { return {connection: ($conf | conn redact), query: $text} }
+  if (not (query confirm $"This INSERT will add ($parts.values | length) row\(s\). Run it?" --yes=$yes)) { return }
+  let out = (pg-rows $conf $text)
+  if $raw { return $out }
+  $out | sql type-rows (pg-schema-load $conf) $table $PG_NULLS {|c| pg-type $c }
+}
+
 # Compose and run a single-table PostgreSQL UPDATE.
 #
-# Reads like the statement: `update <table> <assignment>...`. The table is the
-# leading positional (completing table names); the SET assignments follow as
-# positionals — each a verbatim `"col = expr"`, so expressions (`hits = hits + 1`,
-# `updated_at = now()`) all work; you quote identifiers and string literals
-# yourself, and their column names complete against the table. `--where`/`--where-sql` is
+# Reads like the statement: `update <table> col=value …`. The table is the leading
+# positional (completing table names); the rest positionals are `col=value`
+# ASSIGNMENT tokens, the same grammar as `insert`: a bare value is quoted by shape
+# (`age=30` → `30`, `status=active` → `'active'`), a quoted one is always a string
+# (`zip="01234"`), `col=null` is `NULL`. The columns complete and, after `col=`, the
+# column's existing distinct values do. An EXPRESSION (`hits + 1`, `now()`) never goes
+# through the token grammar: pass it in `--values-sql`, a record of
+# `{column: "raw sql"}` rendered verbatim. `--where`/`--where-sql` is
 # the same filter pair as `select`;
 # `--returning` names columns to hand back for
 # the changed rows (Postgres RETURNING), typed exactly like a `select` result.
@@ -601,23 +699,24 @@ export def "stats" [
 # flags / `--set`, as in `raw-query`.
 @category mole-psql
 @example "set a column on the matched rows" {
-  mole-psql update users "status = 'inactive'" --where-sql "last_login < now() - interval '1 year'" --dry-run | get query
+  mole-psql update users status=inactive --where-sql "last_login < now() - interval '1 year'" --dry-run | get query
 } --result "UPDATE users SET status = 'inactive' WHERE last_login < now() - interval '1 year'"
-@example "expression assignment, returning the new value" {
-  mole-psql update users "login_count = login_count + 1" --where-sql "id = 42" --returning id,login_count --dry-run | get query
+@example "an expression goes in --values-sql, returning the new value" {
+  mole-psql update users --values-sql {login_count: "login_count + 1"} --where-sql "id = 42" --returning id,login_count --dry-run | get query
 } --result "UPDATE users SET login_count = login_count + 1 WHERE id = 42 RETURNING id, login_count"
 @example "several assignments at once" {
-  mole-psql update users "status = 'active'" "verified = true" --where-sql "email = 'a@b.c'" --dry-run | get query
+  mole-psql update users status=active verified=true --where-sql "email = 'a@b.c'" --dry-run | get query
 } --result "UPDATE users SET status = 'active', verified = true WHERE email = 'a@b.c'"
 @example "guard: an unfiltered UPDATE needs --all" {
-  mole-psql update users "archived = true" --all --dry-run | get query
+  mole-psql update users archived=true --all --dry-run | get query
 } --result "UPDATE users SET archived = true"
 @example "run for real — RETURNING rows come back DB-typed (prompts unless --yes)" {
-  mole-psql update accounts "balance = balance - 10" --where-sql "id = 1" --returning id,balance -c postgres-local-dev --yes
+  mole-psql update accounts --values-sql {balance: "balance - 10"} --where-sql "id = 1" --returning id,balance -c postgres-local-dev --yes
 }
 export def "update" [
   table: string@"psql-table"                       # target table (UPDATE <table>); single table, an alias is allowed: "users u"
-  ...assignments: string@"psql-column"             # SET assignments, verbatim "col = expr" (at least one required)
+  ...assignments: string@"psql-assign"             # col=value tokens: the SET list (with --values-sql, at least one assignment)
+  --values-sql: record = {}                        # {column: "raw sql"}: expression values, verbatim (hits + 1, now(), …)
   --where(-w): string@"psql-where"                 # WHERE: col<op>value token-list (comma-sep, completable)
   --where-sql: string                              # WHERE as raw SQL, verbatim — AND-joined with --where when both are given
   --returning: string@"psql-columns-csv"           # RETURNING columns, comma-separated (typed like a select result)
@@ -633,13 +732,13 @@ export def "update" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($assignments | is-empty) { error make {msg: "update: at least one SET assignment is required, e.g. update users \"status = 'active'\""} }
+  let sets = (sql render-assignments $assignments --values-sql $values_sql --dialect $PG_DIALECT)
   let returning = (complete csv $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
   let filter = (sql build-where $where $where_sql --dialect $PG_DIALECT --ops (pg-ops))
   if ($filter | is-empty) and (not $all) {
     error make {msg: "update: refusing to update every row without --where/--where-sql (pass --all to override)"}
   }
-  let text = (sql build-update --table $table --set $assignments --where ($filter | default "") --returning ($returning | default []))
+  let text = (sql build-update --table $table --set $sets --where ($filter | default "") --returning ($returning | default []))
   let conf = (pg-conf $connection $host $port $user $password $database $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This UPDATE will modify rows. Run it?" --yes=$yes)) { return }

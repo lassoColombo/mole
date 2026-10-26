@@ -85,9 +85,9 @@ def "dry-run where token-list, raw --where-sql, IN LIKE NULL and the regexp_like
 @test
 def "dry-run update and delete assembly" [] {
   fixture
-  assert equal (mole-trino update users "status = 'inactive'" --where-sql "id = 5" -c trino-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE id = 5"
-  assert equal (mole-trino update t "a = 1" "b = 2" --where-sql "id = 5" -c trino-local-dev --dry-run | get query) "UPDATE t SET a = 1, b = 2 WHERE id = 5"
-  assert equal (mole-trino update users "archived = true" --all -c trino-local-dev --dry-run | get query) "UPDATE users SET archived = true"
+  assert equal (mole-trino update users status=inactive --where-sql "id = 5" -c trino-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE id = 5"
+  assert equal (mole-trino update t a=1 b=2 --where-sql "id = 5" -c trino-local-dev --dry-run | get query) "UPDATE t SET a = 1, b = 2 WHERE id = 5"
+  assert equal (mole-trino update users archived=true --all -c trino-local-dev --dry-run | get query) "UPDATE users SET archived = true"
   assert equal (mole-trino delete sessions --where user_id=7 -c trino-local-dev --dry-run | get query) "DELETE FROM sessions WHERE user_id = 7"
   assert equal (mole-trino delete sessions --where-sql "expires_at < now()" -c trino-local-dev --dry-run | get query) "DELETE FROM sessions WHERE expires_at < now()"
   assert equal (mole-trino delete staging_rows --all -c trino-local-dev --dry-run | get query) "DELETE FROM staging_rows"
@@ -109,8 +109,8 @@ def "guards error" [] {
   assert error { mole-trino select -c trino-local-dev --dry-run }
   assert error { mole-trino select --from t --limit -1 -c trino-local-dev --dry-run }           # negative paging is rejected before the round trip
   assert error { mole-trino select --from t --where "a==1" -c trino-local-dev --dry-run }      # typo'd operator is an error, not a literal
-  assert error { mole-trino update t "x = 1" -c trino-local-dev --dry-run }
-  assert error { mole-trino update t "x = 1" --where " " -c trino-local-dev --dry-run }   # a blank --where is no filter
+  assert error { mole-trino update t x=1 -c trino-local-dev --dry-run }
+  assert error { mole-trino update t x=1 --where " " -c trino-local-dev --dry-run }   # a blank --where is no filter
   assert error { mole-trino delete t --where "," -c trino-local-dev --dry-run }            # nor is a bare comma
   assert error { mole-trino delete t --where-sql " " -c trino-local-dev --dry-run }       # nor a blank raw filter
   assert error { mole-trino update t --where-sql "id = 1" -c trino-local-dev --dry-run }
@@ -126,4 +126,79 @@ def "schema views read the seeded cache" [] {
   assert equal (mole-trino schema --table customer -c trino-local-dev | get columns.name) [custkey name]
   assert equal (mole-trino schema --find cust -c trino-local-dev | where column == custkey | length) 2
   assert equal (mole-trino schema --full --include orders -c trino-local-dev | get tables.name) [orders]
+}
+
+# Drive a completer through the real engine (completers are private, `@`-bound; see
+# DESIGN.md): complete the END of `line` after a `use mole-trino` prelude in a child `nu`
+# that inherits this test's XDG overrides, and return the candidate values.
+def ide-complete [line: string]: nothing -> list<string> {
+  let f = (mktemp -t mole-ide.XXXXXX)
+  let src = $"use mole-trino\n($line)"
+  $src | save --force $f
+  # A list-valued NU_LIB_DIRS is dropped on spawn (see run-tests.nu): hand the child a colon string.
+  let libs = ($env.NU_LIB_DIRS? | default [])
+  let libs = (if ($libs | describe) == "string" { $libs } else { $libs | str join (char esep) })
+  let out = (with-env {NU_LIB_DIRS: $libs} { ^nu --no-config-file --ide-complete ($src | encode utf8 | bytes length) $f | complete })
+  rm $f
+  $out.stdout | from json | get completions | sort
+}
+
+# ---- insert: dry-run SQL assembly + guards + completion ------------------------
+
+@test
+def "dry-run insert renders tokens by shape and pipes rows by type" [] {
+  fixture
+  assert equal (mole-trino insert users email=ann@x.io status=active age=30 zip="01234" deleted=null -c trino-local-dev --dry-run | get query) "INSERT INTO users (email, status, age, zip, deleted) VALUES ('ann@x.io', 'active', 30, '01234', NULL)"
+  assert equal ([{sku: A1, qty: 3} {sku: B2, qty: 0}] | mole-trino insert stock -c trino-local-dev --dry-run | get query) "INSERT INTO stock (sku, qty) VALUES ('A1', 3), ('B2', 0)"
+  assert equal ({sku: A1, qty: "3"} | mole-trino insert stock -c trino-local-dev --dry-run | get query) "INSERT INTO stock (sku, qty) VALUES ('A1', '3')"   # a typed string stays a string
+  assert equal ([{sku: A1, qty: null}] | mole-trino insert stock src=import --values-sql {at: "now()"} -c trino-local-dev --dry-run | get query) "INSERT INTO stock (sku, qty, src, at) VALUES ('A1', NULL, 'import', now())"
+  assert equal (mole-trino insert events kind=login --values-sql {at: "now()"} -c trino-local-dev --dry-run | get query) "INSERT INTO events (kind, at) VALUES ('login', now())"
+  let r = (mole-trino insert t a=1 -c trino-local-dev --dry-run)
+  assert equal ($r.connection | columns | any {|x| $x == "password"}) false
+}
+
+@test
+def "insert refuses nothing ragged rows clashes and non-tokens" [] {
+  fixture
+  assert error { mole-trino insert users -c trino-local-dev --dry-run }                                           # nothing to insert
+  assert error { [{a: 1} {b: 2}] | mole-trino insert t -c trino-local-dev --dry-run }                             # ragged rows
+  assert error { [{a: 1}] | mole-trino insert t a=2 -c trino-local-dev --dry-run }                                 # piped + token clash
+  assert error { mole-trino insert t a=1 --values-sql {a: "2"} -c trino-local-dev --dry-run }                      # token + expression clash
+  assert error { mole-trino insert t "a = 1" -c trino-local-dev --dry-run }                                       # raw SQL is not a token
+  assert error { mole-trino insert t "a>=1" -c trino-local-dev --dry-run }                                        # a comparison is not one
+  assert error { mole-trino insert t a==1 -c trino-local-dev --dry-run }                                          # operator-looking value
+  assert error { mole-trino insert t a=1 a=2 -c trino-local-dev --dry-run }                                       # duplicate column
+}
+
+@test
+def "insert completes the unassigned columns of the target table" [] {
+  fixture
+  seed-schema
+  assert equal (ide-complete "mole-trino insert -c trino-local-dev ") ["tiny.customer" "tiny.orders"]
+  assert equal (ide-complete "mole-trino insert tiny.customer -c trino-local-dev ") ["custkey=" "name="]
+  assert equal (ide-complete "mole-trino insert tiny.customer custkey=x -c trino-local-dev ") ["name="]
+  assert equal (ide-complete "mole-trino insert tiny.customer custkey=x -c trino-local-dev na") ["name="]
+  assert equal (ide-complete "mole-trino insert tiny.customer -c trino-local-dev custkey=") []   # a value probe against an unreachable DB yields nothing, never an error
+}
+
+# ---- update: the insert assignment grammar -----------------------------------
+
+@test
+def "dry-run update renders assignment tokens and values-sql" [] {
+  fixture
+  assert equal (mole-trino update users status=active age=30 zip="01234" note=null --all -c trino-local-dev --dry-run | get query) "UPDATE users SET status = 'active', age = 30, zip = '01234', note = NULL"
+  assert equal (mole-trino update users status=active --values-sql {seen_at: "now()"} --where id=1 -c trino-local-dev --dry-run | get query) "UPDATE users SET status = 'active', seen_at = now() WHERE id = 1"
+  assert error { mole-trino update t "x = 1" --all -c trino-local-dev --dry-run }                    # raw SQL is not an assignment token
+  assert error { mole-trino update t x=1 --values-sql {x: "2"} --all -c trino-local-dev --dry-run }   # one column, two values
+  assert error { mole-trino update t x=1 x=2 --all -c trino-local-dev --dry-run }                    # assigned twice
+  assert error { mole-trino update t --all -c trino-local-dev --dry-run }                            # nothing to set
+}
+
+@test
+def "update completes assignment tokens like insert" [] {
+  fixture
+  seed-schema
+  assert equal (ide-complete "mole-trino update tiny.customer -c trino-local-dev ") ["custkey=" "name="]
+  assert equal (ide-complete "mole-trino update tiny.customer custkey=x -c trino-local-dev ") ["name="]
+  assert equal (ide-complete "mole-trino update \"tiny.customer u\" -c trino-local-dev ") ["custkey=" "name="]   # an alias is looked up by its base table
 }

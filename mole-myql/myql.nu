@@ -224,3 +224,31 @@ export def "lock" [lock: any, lock_of: list<string>, skip_locked: bool, nowait: 
   let wait = if $skip_locked { "SKIP LOCKED" } else if $nowait { "NOWAIT" } else { null }
   sql assemble [$mode (sql join-list $lock_of --prefix "OF ") $wait]
 }
+
+# ---- INSERT conflict tail -----------------------------------------------------
+
+# The MySQL-family upsert tail: `ON DUPLICATE KEY UPDATE c = <new c>` over EVERY
+# inserted column. There is no conflict target — any UNIQUE key fires — so this takes
+# no key list (unlike `sql conflict-tail`). The one engine difference is how the new
+# row is referenced, injected as `--alias`: MySQL 8.0.19+ deprecates `VALUES(c)` for a
+# row alias (`--alias new` → `AS new … c = new.c`); MariaDB has no row alias and keeps
+# `VALUES(c)` (no `--alias`). `INSERT IGNORE` is a statement MODIFIER, not a tail —
+# the verb renders it through `sql build-insert --modifier`.
+@category mole-myql
+@example "MariaDB: VALUES() reads the new row" {
+  myql upsert-tail [email status]
+} --result "ON DUPLICATE KEY UPDATE email = VALUES(email), status = VALUES(status)"
+@example "MySQL 8.0.19+: a row alias reads the new row" {
+  myql upsert-tail [email status] --alias new
+} --result "AS new ON DUPLICATE KEY UPDATE email = new.email, status = new.status"
+export def "upsert-tail" [
+  columns: list<string>     # the inserted columns, all updated on a duplicate key (≥1 required)
+  --alias: string = ""      # row alias for the new row (MySQL 8.0.19+); empty → VALUES(c)
+]: nothing -> string {
+  if ($columns | is-empty) { error make {msg: "myql upsert-tail: at least one column is required"} }
+  if ($alias | is-empty) {
+    "ON DUPLICATE KEY UPDATE " + ($columns | each {|c| $"($c) = VALUES\(($c)\)" } | str join ", ")
+  } else {
+    $"AS ($alias) ON DUPLICATE KEY UPDATE " + ($columns | each {|c| $"($c) = ($alias).($c)" } | str join ", ")
+  }
+}

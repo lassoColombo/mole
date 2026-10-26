@@ -661,3 +661,152 @@ def "page-clause renders validated LIMIT and OFFSET" [] {
     assert error { sql page-clause (-1) null }
     assert error { sql page-clause 5 (-1) }
 }
+
+# ---- insert / update: build / literals / assignment tokens / plan -------------
+
+@test
+def "build-insert composes modifier tail and returning in order" [] {
+    assert equal (sql build-insert --table users --columns [email status] --rows [["'a@b.c'" "'active'"]]) "INSERT INTO users (email, status) VALUES ('a@b.c', 'active')"
+    assert equal (sql build-insert --table t --columns [a] --rows [["1"] ["2"]] --tail "ON CONFLICT DO NOTHING" --returning [id]) "INSERT INTO t (a) VALUES (1), (2) ON CONFLICT DO NOTHING RETURNING id"
+    assert equal (sql build-insert --table t --columns [a b] --rows [["1" "2"]] --modifier IGNORE) "INSERT IGNORE INTO t (a, b) VALUES (1, 2)"
+}
+
+@test
+def "build-insert validates its shape" [] {
+    assert error { sql build-insert --columns [a] --rows [["1"]] }                 # no table
+    assert error { sql build-insert --table t --rows [["1"]] }                     # no columns
+    assert error { sql build-insert --table t --columns [a] }                      # no rows
+    assert error { sql build-insert --table t --columns [a b] --rows [["1"]] }     # a narrow row
+}
+
+@test
+def "value-literal renders by nushell type" [] {
+    assert equal (sql value-literal null) "NULL"
+    assert equal (sql value-literal true) "true"
+    assert equal (sql value-literal 3) "3"
+    assert equal (sql value-literal 2.5) "2.5"
+    assert equal (sql value-literal "30") "'30'"                    # a typed string is never a number
+    assert equal (sql value-literal "O'Brien") "'O''Brien'"
+    assert equal (sql value-literal 'a\b' {backslash_escapes: true}) "'a\\\\b'"
+    assert equal (sql value-literal {a: 1}) "'{\"a\":1}'"
+    assert equal (sql value-literal [1 2]) "'[1,2]'"
+    assert equal (sql value-literal ("2024-01-02T03:04:05+00:00" | into datetime)) "'2024-01-02T03:04:05+00:00'"
+    assert equal (sql value-literal 3hr) "'3hr'"
+}
+
+@test
+def "assignment-token parses col=value only" [] {
+    assert equal (sql assignment-token "status=active") {col: status, value: active}
+    assert equal (sql assignment-token "t.col=") {col: "t.col", value: ""}
+    assert equal (sql assignment-token "a==1") {col: a, value: "=1"}   # parses; token-literal rejects it
+    assert equal (sql assignment-token "age>=30") null
+    assert equal (sql assignment-token "age!=30") null
+    assert equal (sql assignment-token "id") null
+    assert equal (sql assignment-token "1=2") null
+}
+
+@test
+def "token-literal applies the token literal rules" [] {
+    assert equal (sql token-literal "active") "'active'"
+    assert equal (sql token-literal "30") "30"
+    assert equal (sql token-literal "'30'") "'30'"
+    assert equal (sql token-literal '"01234"') "'01234'"
+    assert equal (sql token-literal "null") "NULL"
+    assert equal (sql token-literal "NULL") "NULL"
+    assert equal (sql token-literal "'null'") "'null'"                 # quoted ⇒ the string
+    assert equal (sql token-literal "true") "true"
+    assert equal (sql token-literal "Tom and Jerry") "'Tom and Jerry'"   # no raw-SQL guess in an assignment
+    assert equal (sql token-literal 'a\b' {backslash_escapes: true}) "'a\\\\b'"
+    assert error { sql token-literal "=1" }
+    assert error { sql token-literal ">1" }
+}
+
+@test
+def "parse-assignments rejects non-tokens and duplicates" [] {
+    assert equal (sql parse-assignments [email=a@b.c status=active]) [{col: email, value: "a@b.c"} {col: status, value: active}]
+    assert equal (sql parse-assignments []) []
+    assert error { sql parse-assignments ["age>=30"] }
+    assert error { sql parse-assignments ["a = 1"] }
+    assert error { sql parse-assignments [a=1 a=2] }
+}
+
+@test
+def "insert-values makes one row from tokens and expressions" [] {
+    assert equal (sql insert-values null --assignments [email=a@b.c age=30]) {columns: [email age], values: [["'a@b.c'" "30"]]}
+    assert equal (sql insert-values null --values-sql {at: "now()"}) {columns: [at], values: [["now()"]]}
+    assert equal (sql insert-values null --assignments [a=1] --values-sql {at: "now()"}) {columns: [a at], values: [["1" "now()"]]}
+}
+
+@test
+def "insert-values renders piped rows by type and appends constants" [] {
+    let r = (sql insert-values [{sku: A1, qty: 3} {sku: B2, qty: null}] --assignments [src=import] --values-sql {at: "now()"})
+    assert equal $r {columns: [sku qty src at], values: [["'A1'" "3" "'import'" "now()"] ["'B2'" "NULL" "'import'" "now()"]]}
+    assert equal (sql insert-values {n: "30"}) {columns: [n], values: [["'30'"]]}        # one piped record is one row
+    assert equal (sql insert-values [{s: 'a\b'}] --dialect {backslash_escapes: true}) {columns: [s], values: [["'a\\\\b'"]]}
+}
+
+@test
+def "insert-values refuses nothing ragged rows non-records and clashes" [] {
+    assert error { sql insert-values null }
+    assert error { sql insert-values [] }
+    assert error { sql insert-values "a,b" }                                               # not records
+    assert error { sql insert-values [1 2] }                                               # not records
+    assert error { sql insert-values [{a: 1} {b: 2}] }                                     # ragged
+    assert error { sql insert-values [{a: 1} {a: 1, b: 2}] }                               # ragged (extra key)
+    assert error { sql insert-values [{a: 1}] --assignments [a=2] }                        # piped + token
+    assert error { sql insert-values null --assignments [a=2] --values-sql {a: "1"} }      # token + expr
+    assert error { sql insert-values null --assignments [a=1 a=2] }                        # token twice
+    assert error { sql insert-values null --assignments ["a = 1"] }                        # not a token
+}
+
+@test
+def "render-assignments builds the update SET list" [] {
+    assert equal (sql render-assignments [status=inactive age=30 note=null]) ["status = 'inactive'" "age = 30" "note = NULL"]
+    assert equal (sql render-assignments [status=inactive] --values-sql {hits: "hits + 1"}) ["status = 'inactive'" "hits = hits + 1"]
+    assert equal (sql render-assignments [] --values-sql {at: "now()"}) ["at = now()"]
+    assert equal (sql render-assignments ['s=a\b'] --dialect {backslash_escapes: true}) ["s = 'a\\\\b'"]
+    assert error { sql render-assignments [] }                                     # nothing to set
+    assert error { sql render-assignments ["a = 1"] }                              # raw SQL is not a token
+    assert error { sql render-assignments [a=1 a=2] }                              # assigned twice
+    assert error { sql render-assignments [a=1] --values-sql {a: "2"} }            # token + expr
+    assert error { sql render-assignments [a==1] }                                 # operator-looking value
+}
+
+@test
+def "conflict-tail renders the ansi on conflict clause" [] {
+    assert equal (sql conflict-tail --columns [a]) ""
+    assert equal (sql conflict-tail --ignore --columns [a]) "ON CONFLICT DO NOTHING"
+    assert equal (sql conflict-tail --upsert [email] --columns [email status]) "ON CONFLICT (email) DO UPDATE SET status = EXCLUDED.status"
+    assert equal (sql conflict-tail --upsert [a b] --columns [a b c]) "ON CONFLICT (a, b) DO UPDATE SET c = EXCLUDED.c"
+    assert equal (sql conflict-tail --upsert [email] --columns [email]) "ON CONFLICT (email) DO NOTHING"   # nothing left to SET
+    assert error { sql conflict-tail --ignore --upsert [a] --columns [a] }
+}
+
+@test
+def "assign-plan offers unassigned columns then a value probe" [] {
+    let cols = [
+      {name: id, display_type: integer, nullable: false, default: "nextval('s')"}
+      {name: email, display_type: text, nullable: false, default: null}
+      {name: note, display_type: text, nullable: true, default: null}
+    ]
+    assert equal (sql assign-plan "" $cols --required | get candidates) [{value: "id=", description: integer} {value: "email=", description: "text, required"} {value: "note=", description: text}]
+    assert equal (sql assign-plan "em" $cols --assigned [id] --required | get candidates) [{value: "email=", description: "text, required"} {value: "note=", description: text}]
+    assert equal (sql assign-plan "" $cols --assigned [id note] | get candidates) [{value: "email=", description: text}]   # update: no required flag
+    assert equal (sql assign-plan "" [{name: status}] | get candidates) [{value: "status=", description: ""}]
+    assert equal (sql assign-plan "email=" $cols --table users) {probe: {sql: "SELECT DISTINCT email AS v FROM users LIMIT 50", prefix: "email="}}
+    assert equal (sql assign-plan "email=a" $cols --table users | get probe.prefix) "email="
+    assert equal (sql assign-plan "email=" $cols) {candidates: []}                 # no table → no probe
+    assert equal (sql assign-plan "nope=" $cols --table users) {candidates: []}    # unknown column
+    assert equal (sql assign-plan "a=" [] --table users) {candidates: []}          # unknown table
+    let names = ([status] | each {|x| $x })
+    assert error { sql assign-plan "" $names }                                     # bare names are not column records
+}
+
+@test
+def "unwrap-quoted reads matching quotes only" [] {
+    assert equal (sql unwrap-quoted "'30'") {quoted: true, value: "30"}
+    assert equal (sql unwrap-quoted '"a b"') {quoted: true, value: "a b"}
+    assert equal (sql unwrap-quoted "'") {quoted: false, value: "'"}
+    assert equal (sql unwrap-quoted "'a\"") {quoted: false, value: "'a\""}
+    assert equal (sql unwrap-quoted "30") {quoted: false, value: "30"}
+}

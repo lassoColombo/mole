@@ -304,6 +304,19 @@ export def "str-literal" [value: string, dialect: record = {}]: nothing -> strin
   "'" + $esc + "'"
 }
 
+# A token VALUE's quoting: a value wrapped in matching `'`/`"` quotes is unwrapped and
+# flagged `quoted` (the user meant it literally, as a string whatever its shape);
+# anything else passes through with `quoted: false`. Shared by the WHERE predicates
+# and the INSERT assignments so both token grammars read quotes the same way.
+@category mole-sql
+@example "a quoted value is unwrapped" { sql unwrap-quoted "'30'" } --result {quoted: true, value: "30"}
+@example "a bare value passes through" { sql unwrap-quoted "30" } --result {quoted: false, value: "30"}
+export def "unwrap-quoted" [v: string]: nothing -> record {
+  let q = ($v | str substring 0..0)
+  let quoted = ((($v | str length) >= 2) and ($q in ['"' "'"]) and ($v | str ends-with $q))
+  {quoted: $quoted, value: (if $quoted { $v | str substring 1..<(($v | str length) - 1) } else { $v })}
+}
+
 # Render one parsed predicate ({col, op, value}) as a SQL WHERE term by looking its
 # operator up in the injected `ops` table and running that operator's `render` closure
 # — so the operator VOCABULARY and its SQL are per-dialect (a driver adds `~*`→ILIKE,
@@ -335,18 +348,16 @@ export def "render-predicate" [
 ]: nothing -> string {
   let ops = (if ($ops | is-empty) { ansi-ops } else { $ops })
   let v = ($pred.value | into string)
-  let q = ($v | str substring 0..0)
-  let quoted = ((($v | str length) >= 2) and ($q in ['"' "'"]) and ($v | str ends-with $q))
-  if (not $quoted) and ($v =~ '(?i)\s(and|or)\s') {
+  let u = (unwrap-quoted $v)
+  if (not $u.quoted) and ($v =~ '(?i)\s(and|or)\s') {
     error make {msg: $"'($pred.col)($pred.op)($v)' reads like raw SQL — put it in --where-sql, or quote the value to mean it literally"}
   }
-  if (not $quoted) and ($v =~ '^[=<>~!]') {
+  if (not $u.quoted) and ($v =~ '^[=<>~!]') {
     error make {msg: $"'($pred.col)($pred.op)($v)': the value starts with an operator character — check the operator \(did you mean ($pred.col)>=…?\), or quote the value to mean it literally"}
   }
-  let value = (if $quoted { $v | str substring 1..<(($v | str length) - 1) } else { $v })
-  let lit = (if $quoted { {|x| str-literal $x $dialect } } else { {|x| sql-literal $x $dialect } })
+  let lit = (if $u.quoted { {|x| str-literal $x $dialect } } else { {|x| sql-literal $x $dialect } })
   let spec = ($ops | where token == $pred.op | first)
-  do $spec.render $pred.col $value $lit
+  do $spec.render $pred.col $u.value $lit
 }
 
 # ---- WHERE clause: token-list + raw SQL ---------------------------------------
@@ -504,6 +515,296 @@ export def "where-plan" [
     sql: (assemble [$"SELECT DISTINCT ($p.col) AS v FROM ($table)" (if ($scoped | is-not-empty) { $"WHERE ($scoped)" }) "LIMIT 50"])
     prefix: ($prefix + $p.col + $p.op)
   }}
+}
+
+# ---- INSERT / UPDATE: assignment tokens + piped rows ---------------------------
+# The structured write surface shared by every dialect's `insert` and `update`: both
+# take rest-positional `col=value` ASSIGNMENT tokens (the `--where` grammar cut down to
+# `=`, same literal rules: shape-quoting, a quoted value is always a string, `=null` is
+# NULL, an operator-looking value is an error, never a guess). Expressions (`now()`,
+# `DEFAULT`, `hits + 1`) never go through the token grammar: the raw brother is a
+# `--values-sql {col: "raw sql"}` record rendered verbatim. `insert` also takes a PIPED
+# table whose typed cells render by TYPE (`value-literal`). The pure parts live here —
+# parse, render, build, the ANSI conflict tail and the completion plan; the driver
+# frames anything dialect-only (`INSERT IGNORE`, `ON DUPLICATE KEY UPDATE …`, MySQL's
+# `ORDER BY … LIMIT`) around `build-insert` / `build-update`.
+
+# Build an `INSERT` statement from already-rendered parts, dialect-agnostic.
+#
+# Emits `INSERT [modifier] INTO <table> (<columns>) VALUES (…), (…) [tail] [RETURNING …]`.
+# Every cell in `rows` is a VERBATIM SQL literal/expression (render with `value-literal`
+# / `token-literal` first). `--modifier` sits between INSERT and INTO (MySQL's `IGNORE`);
+# `--tail` is the dialect's conflict clause, verbatim, placed before RETURNING. Mechanical:
+# it validates only the shape — a table, ≥1 column, ≥1 row, every row as wide as the
+# column list — and decides nothing about SQL.
+@category mole-sql
+@example "one row" {
+  sql build-insert --table users --columns [email status] --rows [["'a@b.c'" "'active'"]]
+} --result "INSERT INTO users (email, status) VALUES ('a@b.c', 'active')"
+@example "several rows, a conflict tail and RETURNING" {
+  sql build-insert --table t --columns [a] --rows [["1"] ["2"]] --tail "ON CONFLICT DO NOTHING" --returning [id]
+} --result "INSERT INTO t (a) VALUES (1), (2) ON CONFLICT DO NOTHING RETURNING id"
+export def "build-insert" [
+  --table: string                 # target table (required)
+  --columns: list<string> = []    # column list (≥1 required)
+  --rows: list<any> = []          # rows of rendered literals, each as wide as `columns` (≥1 required)
+  --modifier: string = ""         # keyword(s) between INSERT and INTO (MySQL `IGNORE`); dropped when empty
+  --tail: string = ""             # conflict clause, verbatim, before RETURNING; dropped when empty
+  --returning: list<string> = []  # RETURNING columns (Postgres/DuckDB/MariaDB); dropped when empty
+]: nothing -> string {
+  if ($table | is-empty) { error make {msg: "sql build-insert: --table <table> is required"} }
+  if ($columns | is-empty) { error make {msg: "sql build-insert: at least one column is required"} }
+  if ($rows | is-empty) { error make {msg: "sql build-insert: at least one row is required"} }
+  let width = ($columns | length)
+  for r in $rows {
+    if ($r | length) != $width { error make {msg: $"sql build-insert: a row has ($r | length) values for ($width) columns"} }
+  }
+  let values = ($rows | each {|r| "(" + ($r | str join ", ") + ")" } | str join ", ")
+  assemble [
+    "INSERT"
+    $modifier
+    $"INTO ($table)"
+    ("(" + ($columns | str join ", ") + ")")
+    $"VALUES ($values)"
+    $tail
+    (join-list $returning --prefix "RETURNING ")
+  ]
+}
+
+# A TYPED Nushell cell → a SQL literal, by its Nushell type (the piped-rows half of
+# `insert`; the token half is `token-literal`). `null` → `NULL`; bool/int/float bare; a
+# string ALWAYS quoted (a CSV's `"30"` stays `'30'` — typed data gets no shape guessing,
+# the DB coerces); a datetime → its RFC 3339 form with offset, quoted; a record/list/
+# table → its JSON, quoted (for json/jsonb columns); anything else (duration, filesize,
+# …) → its string form, quoted. String escaping is the dialect's (`str-literal`).
+@category mole-sql
+@example "null, bool and numbers stay bare" {
+  [null true 3 2.5] | each {|v| sql value-literal $v }
+} --result ["NULL" "true" "3" "2.5"]
+@example "a string is always quoted, whatever its shape" { sql value-literal "30" } --result "'30'"
+@example "a record is its JSON, quoted" { sql value-literal {a: 1} } --result "'{\"a\":1}'"
+export def "value-literal" [
+  value: any
+  dialect: record = {}   # {backslash_escapes: bool}, as for `str-literal`
+]: nothing -> string {
+  match ($value | describe --detailed | get type) {
+    "nothing" => "NULL"
+    "bool" => ($value | into string)
+    "int" | "float" => ($value | into string)
+    "string" => (str-literal $value $dialect)
+    "datetime" => (str-literal ($value | format date "%Y-%m-%dT%H:%M:%S%.f%:z") $dialect)
+    "record" | "list" | "table" => (str-literal ($value | to json --raw) $dialect)
+    _ => (str-literal ($value | into string) $dialect)
+  }
+}
+
+# Parse one `col=value` assignment token into {col, value}, or null when the token is
+# not one. The column is a plain (optionally dotted) identifier followed DIRECTLY by `=`
+# — so `a>=1`, `a!=1`, `a<=1` are NOT assignments (the operator char is not part of a
+# column name) and `a==1` parses with the value `=1`, which `token-literal` rejects.
+@category mole-sql
+@example "an assignment token" { sql assignment-token "status=active" } --result {col: status, value: active}
+@example "a comparison is not one" { sql assignment-token "age>=30" } --result null
+export def "assignment-token" [token: string]: nothing -> any {
+  let m = ($token | parse --regex '^(?P<col>[a-zA-Z_][a-zA-Z0-9_.]*)=(?P<value>.*)$')
+  if ($m | is-empty) { null } else { $m | first }
+}
+
+# An assignment token's VALUE (a string the user typed) → a SQL literal: the `--where`
+# literal rules — a quoted value is unwrapped and always a string; a bare `null` is
+# `NULL`; a bare value is shape-quoted by `sql-literal`; a value starting with an
+# operator character (`a==1`, `a=>1`) is a typo'd operator and an error. There is no
+# raw-SQL guess: an expression belongs in `--values-sql`. The token twin of
+# `value-literal`, which renders a TYPED cell instead.
+@category mole-sql
+@example "a word is quoted, a number bare, a quoted number a string" {
+  ["active" "30" "'30'"] | each {|v| sql token-literal $v }
+} --result ["'active'" "30" "'30'"]
+@example "null is NULL" { sql token-literal "null" } --result NULL
+export def "token-literal" [
+  value: string
+  dialect: record = {}   # {backslash_escapes: bool}
+  --col: string = ""     # the column, for the error message only
+]: nothing -> string {
+  let u = (unwrap-quoted $value)
+  if $u.quoted { return (str-literal $u.value $dialect) }
+  if ($value | str lowercase) == "null" { return "NULL" }
+  if ($value =~ '^[=<>~!]') {
+    error make {msg: $"'($col)=($value)': the value starts with an operator character — an assignment takes col=value only; quote the value to mean it literally"}
+  }
+  sql-literal $value $dialect
+}
+
+# Parse the rest-positional assignment tokens into {col, value} records. Errors, naming
+# the token, on anything that is not `col=value` (a comparison, a bare word, raw SQL)
+# and on a column assigned twice.
+@category mole-sql
+@example "tokens parse to assignment records" {
+  sql parse-assignments [email=a@b.c status=active]
+} --result [{col: email, value: "a@b.c"}, {col: status, value: active}]
+export def "parse-assignments" [tokens: list<string>]: nothing -> list<any> {
+  for t in $tokens {
+    if ((assignment-token ($t | str trim)) == null) {
+      error make {msg: $"not an assignment token: '($t)' — use col=value, e.g. status=active; an expression goes in --values-sql"}
+    }
+  }
+  let out = ($tokens | each {|t| assignment-token ($t | str trim) })
+  let dup = ($out | each {|a| $a.col } | uniq --repeated)
+  if ($dup | is-not-empty) { error make {msg: $"column assigned more than once: ($dup | str join ', ')"} }
+  $out
+}
+
+# The constant assignments of a write, in order: the `col=value` tokens
+# (`token-literal`) then the `--values-sql` expressions (verbatim), as {col, sql}.
+# Errors on a non-token, on a column two tokens assign, and on a column given both as
+# a token and in `--values-sql`. The one assignment grammar behind `insert-values`
+# and `render-assignments`.
+def "assignment-pairs" [tokens: list<string>, values_sql: record, dialect: record]: nothing -> list<any> {
+  let assigned = (parse-assignments $tokens)
+  let clash = ($assigned | each {|a| $a.col } | where {|c| $c in ($values_sql | columns) })
+  if ($clash | is-not-empty) { error make {msg: $"column given both as a token and in --values-sql: ($clash | str join ', ')"} }
+  let from_tokens = ($assigned | each {|a| {col: $a.col, sql: (token-literal $a.value $dialect --col $a.col)} })
+  $from_tokens ++ ($values_sql | items {|k, v| {col: $k, sql: ($v | into string)} })
+}
+
+# The `(columns, values)` of an INSERT from the verb's three inputs: piped rows (typed
+# cells → `value-literal`), assignment tokens (`token-literal`) and `--values-sql`
+# expressions (verbatim). `rows` is the verb's `$in` as it arrives — nothing, one
+# record, or a table. With no piped rows the tokens + expressions are the ONE row; with
+# piped rows they are CONSTANT columns appended to every row (`open rows.csv | insert
+# events source=import`). Errors when nothing is given, when the piped input is not
+# records, when the piped rows are ragged (their key sets differ — a missing key would
+# have to become NULL or DEFAULT, neither of which is right everywhere; shape them in
+# Nushell first), and when a column is given twice (two tokens, a token and an
+# expression, or piped and assigned — a silent override would be a surprise).
+@category mole-sql
+@example "tokens alone make one row" {
+  sql insert-values null --assignments [email=a@b.c age=30]
+} --result {columns: [email age], values: [["'a@b.c'" "30"]]}
+@example "piped rows carry the tokens and expressions as constants" {
+  sql insert-values [{sku: A1, qty: 3} {sku: B2, qty: null}] --assignments [src=import] --values-sql {at: "now()"}
+} --result {columns: [sku qty src at], values: [["'A1'" "3" "'import'" "now()"] ["'B2'" "NULL" "'import'" "now()"]]}
+export def "insert-values" [
+  rows: any                          # the piped input: nothing, a record, or a table of records
+  --assignments: list<string> = []   # col=value tokens, as typed
+  --values-sql: record = {}          # {col: "raw sql"} — rendered verbatim
+  --dialect: record = {}             # {backslash_escapes: bool}, for the literals
+]: nothing -> record {
+  let rows = (match ($rows | describe --detailed | get type) {
+    "nothing" => []
+    "record" => [$rows]
+    "list" => $rows
+    _ => (error make {msg: "insert: pipe in a record or a table of records"})
+  })
+  if ($rows | any {|r| ($r | describe --detailed | get type) != "record" }) {
+    error make {msg: "insert: pipe in a record or a table of records"}
+  }
+  let consts = (assignment-pairs $assignments $values_sql $dialect)
+  if ($rows | is-empty) and ($consts | is-empty) {
+    error make {msg: "insert: nothing to insert — give col=value tokens, --values-sql, or pipe rows in"}
+  }
+  let const_cols = ($consts | each {|c| $c.col })
+  let piped_cols = (if ($rows | is-empty) { [] } else { $rows | first | columns })
+  for r in $rows {
+    if (($r | columns | sort) != ($piped_cols | sort)) {
+      let a = ($piped_cols | str join ", ")
+      let b = ($r | columns | str join ", ")
+      error make {msg: $"insert: piped rows are ragged \([($a)] vs [($b)]\) — give every row the same columns \(e.g. `default`\) first"}
+    }
+  }
+  let clash = ($piped_cols | where {|c| $c in $const_cols })
+  if ($clash | is-not-empty) { error make {msg: $"column both piped and assigned: ($clash | str join ', ')"} }
+  let const_sql = ($consts | each {|c| $c.sql })
+  let values = if ($rows | is-empty) {
+    [$const_sql]
+  } else {
+    $rows | each {|r| ($piped_cols | each {|c| value-literal ($r | get $c) $dialect }) ++ $const_sql }
+  }
+  {columns: ($piped_cols ++ $const_cols), values: $values}
+}
+
+# The SET list of an UPDATE from the verb's two inputs: `col=value` tokens
+# (`token-literal`) then `--values-sql` expressions (verbatim), as `"col = <sql>"`
+# strings ready for `build-update --set`. The same grammar and the same errors as
+# `insert-values` (a non-token, a column given twice), plus one of its own: an UPDATE
+# must set something, so both inputs empty is an error.
+@category mole-sql
+@example "tokens render by shape, expressions verbatim" {
+  sql render-assignments [status=inactive] --values-sql {hits: "hits + 1"}
+} --result ["status = 'inactive'" "hits = hits + 1"]
+export def "render-assignments" [
+  tokens: list<string>        # col=value tokens, as typed
+  --values-sql: record = {}   # {col: "raw sql"} — rendered verbatim
+  --dialect: record = {}      # {backslash_escapes: bool}, for the literals
+]: nothing -> list<string> {
+  let pairs = (assignment-pairs $tokens $values_sql $dialect)
+  if ($pairs | is-empty) {
+    error make {msg: "update: nothing to set — give col=value tokens (e.g. status=active) or --values-sql {col: \"expr\"}"}
+  }
+  $pairs | each {|p| $"($p.col) = ($p.sql)" }
+}
+
+# The ANSI `ON CONFLICT` tail of an INSERT (Postgres, DuckDB): `--ignore` is
+# `ON CONFLICT DO NOTHING`; `--upsert <cols>` names the conflict target and updates
+# every OTHER inserted column from EXCLUDED (`ON CONFLICT (cols) DO UPDATE SET c =
+# EXCLUDED.c`), degrading to `DO NOTHING` when the target covers every inserted column,
+# since an empty SET is a syntax error. `""` when neither, so `build-insert --tail`
+# drops it. The MySQL family has no conflict target: see `myql upsert-tail`.
+@category mole-sql
+@example "skip conflicting rows" { sql conflict-tail --ignore } --result "ON CONFLICT DO NOTHING"
+@example "upsert on a key" {
+  sql conflict-tail --upsert [email] --columns [email status]
+} --result "ON CONFLICT (email) DO UPDATE SET status = EXCLUDED.status"
+@example "neither is no tail" { sql conflict-tail --columns [a] } --result ""
+export def "conflict-tail" [
+  --ignore                       # ON CONFLICT DO NOTHING
+  --upsert: list<string> = []    # conflict-target columns: DO UPDATE the others from EXCLUDED
+  --columns: list<string> = []   # the inserted columns (the SET candidates)
+]: nothing -> string {
+  if $ignore and ($upsert | is-not-empty) { error make {msg: "sql conflict-tail: --ignore and --upsert are mutually exclusive"} }
+  if $ignore { return "ON CONFLICT DO NOTHING" }
+  if ($upsert | is-empty) { return "" }
+  let sets = ($columns | where {|c| $c not-in $upsert } | each {|c| $"($c) = EXCLUDED.($c)" })
+  let action = (if ($sets | is-empty) { "DO NOTHING" } else { "DO UPDATE SET " + ($sets | str join ", ") })
+  $"ON CONFLICT \(($upsert | str join ', ')\) ($action)"
+}
+
+# Plan the completion of a `col=value` assignment token (the cursor word) for `insert`
+# and `update` — the assignment twin of `where-plan`, with two stages. A token without
+# `=` offers the target's columns NOT yet assigned on the line, as `col=` candidates
+# described by the column's type; under `--required` (insert) a column that is NOT NULL
+# without a default also reads `required`, so the must-fill columns are visible without
+# opening `schema` (an identity column reads as required too — the cache does not tell
+# them apart). A `col=` token returns a probe — `SELECT DISTINCT col … LIMIT 50`,
+# unscoped (the other assignments describe new values, not a filter) — the driver runs
+# and prefixes. `cols` are ONE table's column RECORDS (`columns-for`), unlike
+# `where-plan`'s name pool, which may span tables.
+@category mole-sql
+@example "a fresh insert token offers the unassigned columns, required flagged" {
+  sql assign-plan "" [{name: id, display_type: integer, nullable: false, default: null} {name: email, display_type: text, nullable: true, default: null}] --assigned [email] --required
+} --result {candidates: [{value: "id=", description: "integer, required"}]}
+@example "col= becomes a distinct-value probe" {
+  sql assign-plan "status=" [{name: status}] --table users
+} --result {probe: {sql: "SELECT DISTINCT status AS v FROM users LIMIT 50", prefix: "status="}}
+export def "assign-plan" [
+  seg: string                   # the cursor token
+  cols: list<record>            # the target table's column records (`columns-for`)
+  --assigned: list<string> = [] # columns already assigned by earlier tokens on the line
+  --table: string               # the table to probe; none → the value stage completes nothing
+  --required                    # flag NOT NULL columns without a default as `required` (insert)
+]: nothing -> record {
+  let a = (assignment-token $seg)
+  if ($a == null) {
+    let cands = ($cols | where {|c| $c.name not-in $assigned } | each {|c|
+      let req = ($required and (($c | get -o nullable) == false) and (($c | get -o default) == null))
+      let ty = ($c | get -o display_type | default ($c | get -o data_type) | default "")
+      let desc = ([$ty (if $req { "required" })] | where {|x| $x | is-not-empty } | str join ", ")
+      {value: ($c.name + "="), description: $desc}
+    })
+    return {candidates: $cands}
+  }
+  if ($table | is-empty) or ($a.col not-in ($cols | each {|c| $c.name })) { return {candidates: []} }
+  {probe: {sql: $"SELECT DISTINCT ($a.col) AS v FROM ($table) LIMIT 50", prefix: ($a.col + "=")}}
 }
 
 # ---- ORDER BY tokens (col[:asc|:desc]) ----------------------------------------

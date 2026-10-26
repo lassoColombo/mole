@@ -1,7 +1,7 @@
 # mole-duckdb — DuckDB driver plugin.
 #
 # A PLUGIN (data source): supports the duckdb technology, registers itself as a
-# driver, and exposes the user verbs `raw-query` / `select` / `stats` / `schema`. It DEPENDS on:
+# driver, and exposes the user verbs `raw-query` / `select` / `stats` / `insert` / `update` / `delete` / `schema`. It DEPENDS on:
 #   - mole core plumbing        (`use mole/lib/*.nu`)
 #   - the generic mole-sql pure LIBRARY (`use mole-sql/sql.nu`)
 # The mole-sql library must be reachable via `NU_LIB_DIRS`.
@@ -249,9 +249,9 @@ def "duckdb-tables-csv" [context: string]: nothing -> list<string> {
 }
 
 # The table a line targets: `--from` (select/stats), else the leading positional of the
-# write verbs (`update <table>` / `delete <table>`); null when neither is typed yet.
+# write verbs (`insert|update|delete <table>`); null when neither is typed yet.
 def duckdb-ctx-table [context: string]: nothing -> any {
-  complete flag $context [--from -F] | default (complete lead-arg $context [update delete])
+  complete flag $context [--from -F] | default (complete lead-arg $context [insert update delete])
 }
 
 def "duckdb-column" [context: string]: nothing -> list<string> {
@@ -285,6 +285,26 @@ def duck-probe [conf: record, sql: string]: nothing -> list<string> {
 # slow / errored → nothing).
 def "duckdb-where" [context: string]: nothing -> list<any> {
   let plan = (sql where-plan (complete token $context) (duckdb-column $context) --ops (duck-ops) --dialect $DUCK_DIALECT --table (duckdb-ctx-table $context))
+  if ($plan.probe? == null) { return $plan.candidates }
+  let conf = (complete conn-ctx $context "duckdb")
+  if ($conf | is-empty) { return [] }
+  (try { duck-probe $conf $plan.probe.sql } catch { [] }) | each {|v| $plan.probe.prefix + $v }
+}
+
+# The assignment-token completer of `insert` and `update` (their `...assignments` rest
+# slot). Two stages, planned by the pure `sql assign-plan`: a token without `=` offers
+# the target table's columns NOT yet assigned by the earlier tokens, as `col=`
+# (described by type, plus `required` on an insert line when NOT NULL without a
+# default); after `col=`, the column's live distinct values through the bounded probe
+# (best-effort: unreachable / errored → nothing). The target is the leading positional
+# (an update alias, `"users u"`, is looked up by its base table), the assigned set the
+# positionals after it.
+def "duckdb-assign" [context: string]: nothing -> list<any> {
+  let table = (duckdb-ctx-table $context)
+  let cols = (if ($table | is-empty) { [] } else { sql columns-for (duckdb-catalog $context) (sql base-table $table) })
+  let assigned = (complete positionals $context | skip 1 | each {|t| sql assignment-token $t | get -o col } | compact)
+  let insert = (complete lead-arg $context [insert] | is-not-empty)
+  let plan = (sql assign-plan (complete token $context) $cols --assigned $assigned --table $table --required=$insert)
   if ($plan.probe? == null) { return $plan.candidates }
   let conf = (complete conn-ctx $context "duckdb")
   if ($conf | is-empty) { return [] }
@@ -548,13 +568,87 @@ export def "stats" [
   | sql apply-agg-types $aggs
 }
 
+# Compose and run a DuckDB INSERT: one row from `col=value` tokens, or many rows
+# from a piped table, into a single table.
+#
+# Reads like the statement: `insert <table> col=value …`. The table is the leading
+# positional (completing table names); the rest positionals are `col=value` ASSIGNMENT
+# tokens — the `--where` grammar cut down to `=`, with the same literal rules: a bare
+# value is quoted by shape (`age=30` → `30`, `status=active` → `'active'`), a quoted one
+# is always a string (`zip="01234"`), `col=null` is `NULL`. The columns complete (typed,
+# `required` flagged when NOT NULL without a default) and, after `col=`, the column's
+# existing distinct values do. An EXPRESSION (`now()`, `DEFAULT`, a function call) never
+# goes through the token grammar: pass it in `--values-sql`, a record of
+# `{column: "raw sql"}` rendered verbatim.
+#
+# PIPE a table in to insert many rows in ONE statement: each record's keys are the
+# column list and its typed cells render by type (a string is always quoted, a
+# record/list is JSON, null is NULL); any tokens / `--values-sql` entries become
+# CONSTANT columns on every row. Ragged rows (differing key sets) are refused — shape
+# them in Nushell first.
+#
+# `--ignore` skips conflicting rows (`ON CONFLICT DO NOTHING`); `--upsert <cols>` names
+# the conflict target and updates every other inserted column from EXCLUDED
+# (`ON CONFLICT (cols) DO UPDATE SET …`). `--upsert` takes a column list because
+# DuckDB needs a conflict target; on mole-mysql/mole-mariadb, which have none, it is
+# a bare switch. `--returning` hands back columns of the inserted rows, typed like a
+# `select` result. INSERT always writes, so it prompts
+# before running (skip with `--yes`); `--dry-run` returns a `{connection, query}` record
+# without running. Connection overridable as in `raw-query`.
+@category mole-duckdb
+@example "one row from tokens (columns, then existing values, complete)" {
+  mole-duckdb insert users email=ann@x.io status=active --dry-run | get query
+} --result "INSERT INTO users (email, status) VALUES ('ann@x.io', 'active')"
+@example "many rows from a piped table, in one statement" {
+  [{sku: A1, qty: 3} {sku: B2, qty: 0}] | mole-duckdb insert stock --dry-run | get query
+} --result "INSERT INTO stock (sku, qty) VALUES ('A1', 3), ('B2', 0)"
+@example "an expression value goes in --values-sql" {
+  mole-duckdb insert events kind=login --values-sql {at: "now()"} --dry-run | get query
+} --result "INSERT INTO events (kind, at) VALUES ('login', now())"
+@example "upsert on a key, returning the row" {
+  mole-duckdb insert users email=a@b.c status=active --upsert email --returning id --dry-run | get query
+} --result "INSERT INTO users (email, status) VALUES ('a@b.c', 'active') ON CONFLICT (email) DO UPDATE SET status = EXCLUDED.status RETURNING id"
+@example "run for real — load a CSV (prompts unless --yes)" {
+  open signups.csv | mole-duckdb insert users --ignore --returning id,email -c duckdb-local-dev --yes
+}
+export def "insert" [
+  table: string@"duckdb-table"               # target table (INSERT INTO <table>); single table, no alias
+  ...assignments: string@"duckdb-assign"         # col=value tokens: the one row, or constant columns on every piped row
+  --values-sql: record = {}                        # {column: "raw sql"}: expression values, verbatim (now(), DEFAULT, …)
+  --ignore                                         # skip conflicting rows (ON CONFLICT DO NOTHING)
+  --upsert: string@"duckdb-columns-csv"        # conflict-target columns, comma-separated: update the other inserted columns from EXCLUDED
+  --returning: string@"duckdb-columns-csv"     # RETURNING columns, comma-separated (typed like a select result)
+  --connection(-c): string@complete-connection   # named connection (default: current)
+  --path(-p): string                               # database file path (or :memory:)
+  --database(-d): string                           # database file path (alias of --path)
+  --set: record = {}
+  --raw(-R)                                         # raw driver output for RETURNING rows: no typing, no null-normalization
+  --dry-run(-n)                                    # return a {connection, query} record instead of running
+  --yes(-y)                                         # skip the confirmation prompt
+] {
+  let parts = (sql insert-values $in --assignments $assignments --values-sql $values_sql --dialect $DUCK_DIALECT)
+  if $ignore and ($upsert | is-not-empty) { error make {msg: "insert: --ignore and --upsert are mutually exclusive"} }
+  let returning = (complete csv $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
+  let tail = (sql conflict-tail --ignore=$ignore --upsert (complete csv $upsert) --columns $parts.columns)
+  let text = (sql build-insert --table $table --columns $parts.columns --rows $parts.values --tail $tail --returning $returning)
+  let conf = (duck-conf $connection $path $database $set)
+  if $dry_run { return {connection: ($conf | conn redact), query: $text} }
+  if (not (query confirm $"This INSERT will add ($parts.values | length) row\(s\). Run it?" --yes=$yes)) { return }
+  let out = (duck-rows $conf $text)
+  if $raw { return $out }
+  $out | sql type-rows (duck-schema-load $conf) $table $DUCK_NULLS {|c| duck-type $c }
+}
+
 # Compose and run a single-table DuckDB UPDATE.
 #
-# Reads like the statement: `update <table> <assignment>...`. The table is the
-# leading positional (completing table names); the SET assignments follow as
-# positionals — each a verbatim `"col = expr"`, so expressions (`hits = hits + 1`)
-# all work; you quote identifiers and string literals yourself, and their column
-# names complete against the table. `--where`/`--where-sql` is
+# Reads like the statement: `update <table> col=value …`. The table is the leading
+# positional (completing table names); the rest positionals are `col=value`
+# ASSIGNMENT tokens, the same grammar as `insert`: a bare value is quoted by shape
+# (`age=30` → `30`, `status=active` → `'active'`), a quoted one is always a string
+# (`zip="01234"`), `col=null` is `NULL`. The columns complete and, after `col=`, the
+# column's existing distinct values do. An EXPRESSION (`hits + 1`, `now()`) never goes
+# through the token grammar: pass it in `--values-sql`, a record of
+# `{column: "raw sql"}` rendered verbatim. `--where`/`--where-sql` is
 # the same filter pair as `select`; `--returning` names columns to hand
 # back for the changed rows (DuckDB RETURNING), typed exactly like a `select` result.
 # There is NO join support — the target is the single table; reach for `raw-query`
@@ -566,17 +660,18 @@ export def "stats" [
 # `--connection` + `--path` / `--database` / `--set`.
 @category mole-duckdb
 @example "set a column on the matched rows" {
-  mole-duckdb update users "status = 'inactive'" --where-sql "id = 5" --dry-run | get query
+  mole-duckdb update users status=inactive --where-sql "id = 5" --dry-run | get query
 } --result "UPDATE users SET status = 'inactive' WHERE id = 5"
-@example "expression assignment, returning the new value" {
-  mole-duckdb update users "login_count = login_count + 1" --where-sql "id = 42" --returning id,login_count --dry-run | get query
+@example "an expression goes in --values-sql, returning the new value" {
+  mole-duckdb update users --values-sql {login_count: "login_count + 1"} --where-sql "id = 42" --returning id,login_count --dry-run | get query
 } --result "UPDATE users SET login_count = login_count + 1 WHERE id = 42 RETURNING id, login_count"
 @example "guard: an unfiltered UPDATE needs --all" {
-  mole-duckdb update users "archived = true" --all --dry-run | get query
+  mole-duckdb update users archived=true --all --dry-run | get query
 } --result "UPDATE users SET archived = true"
 export def "update" [
   table: string@"duckdb-table"                     # target table (UPDATE <table>); single table, an alias is allowed: "users u"
-  ...assignments: string@"duckdb-column"           # SET assignments, verbatim "col = expr" (at least one required)
+  ...assignments: string@"duckdb-assign"           # col=value tokens: the SET list (with --values-sql, at least one assignment)
+  --values-sql: record = {}                        # {column: "raw sql"}: expression values, verbatim (hits + 1, now(), …)
   --where(-w): string@"duckdb-where"               # WHERE: col<op>value token-list (comma-sep, completable)
   --where-sql: string                              # WHERE as raw SQL, verbatim — AND-joined with --where when both are given
   --returning: string@"duckdb-columns-csv"         # RETURNING columns, comma-separated (typed like a select result)
@@ -589,13 +684,13 @@ export def "update" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($assignments | is-empty) { error make {msg: "update: at least one SET assignment is required, e.g. update users \"status = 'active'\""} }
+  let sets = (sql render-assignments $assignments --values-sql $values_sql --dialect $DUCK_DIALECT)
   let returning = (complete csv $returning)   # comma-joined string → list (Nushell can't complete inside `[...]`)
   let filter = (sql build-where $where $where_sql --dialect $DUCK_DIALECT --ops (duck-ops))
   if ($filter | is-empty) and (not $all) {
     error make {msg: "update: refusing to update every row without --where/--where-sql (pass --all to override)"}
   }
-  let text = (sql build-update --table $table --set $assignments --where ($filter | default "") --returning ($returning | default []))
+  let text = (sql build-update --table $table --set $sets --where ($filter | default "") --returning ($returning | default []))
   let conf = (duck-conf $connection $path $database $set)
   if $dry_run { return {connection: ($conf | conn redact), query: $text} }
   if (not (query confirm "This UPDATE will modify rows. Run it?" --yes=$yes)) { return }

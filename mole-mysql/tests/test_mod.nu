@@ -1,6 +1,7 @@
 use std/assert
 use std/testing *
 use mole-mysql
+use mole/lib/cache.nu
 
 # Point mole at a throwaway config holding a mysql + a mariadb connection, so
 # `select` can resolve one and render dry-run SQL without a live database (and so
@@ -16,6 +17,20 @@ def --env fixture [] {
   | to yaml
   | save --force ([$d mole connections.yaml] | path join)
   $env.XDG_CONFIG_HOME = $d
+}
+
+# Seed the schema cache the driver would have built for mysql-local-dev/app, with a real
+# `refreshed_at` so `cache fetch` serves it instead of introspecting.
+def seed-schema [] {
+  {
+    meta: {connection: mysql-local-dev, database: app, driver: mysql, refreshed_at: (date now)}
+    tables: [{schema: app, name: users, type: "BASE TABLE", comment: null, row_estimate: 5}]
+    columns: [
+      {schema: app, table: users, name: id,    position: 1, data_type: int,     udt_name: int,     nullable: false, default: null, char_max_length: null, numeric_precision: 10, numeric_scale: 0, comment: null, display_type: int}
+      {schema: app, table: users, name: email, position: 2, data_type: varchar, udt_name: varchar, nullable: false, default: null, char_max_length: 255, numeric_precision: null, numeric_scale: null, comment: null, display_type: "varchar(255)"}
+    ]
+    constraints: []
+  } | cache write (cache path "mysql" "mysql-local-dev__app")
 }
 
 # ---- dry-run SQL assembly: the verb wires the myql renderers correctly ---------
@@ -124,25 +139,25 @@ def "from is required" [] {
 @test
 def "dry-run update sets one column filtered" [] {
   fixture
-  assert equal (mole-mysql update users "status = 'inactive'" --where-sql "id = 5" -c mysql-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE id = 5"
+  assert equal (mole-mysql update users status=inactive --where-sql "id = 5" -c mysql-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE id = 5"
 }
 
 @test
 def "dry-run update joins several assignments" [] {
   fixture
-  assert equal (mole-mysql update t "a = 1" "b = b + 1" --where-sql "id = 5" -c mysql-local-dev --dry-run | get query) "UPDATE t SET a = 1, b = b + 1 WHERE id = 5"
+  assert equal (mole-mysql update t a=1 --values-sql {b: "b + 1"} --where-sql "id = 5" -c mysql-local-dev --dry-run | get query) "UPDATE t SET a = 1, b = b + 1 WHERE id = 5"
 }
 
 @test
 def "dry-run update with order-by and limit" [] {
   fixture
-  assert equal (mole-mysql update jobs "priority = priority + 1" --where-sql "queued = 1" --sort-by created_at:asc --limit 100 -c mysql-local-dev --dry-run | get query) "UPDATE jobs SET priority = priority + 1 WHERE queued = 1 ORDER BY created_at ASC LIMIT 100"
+  assert equal (mole-mysql update jobs --values-sql {priority: "priority + 1"} --where-sql "queued = 1" --sort-by created_at:asc --limit 100 -c mysql-local-dev --dry-run | get query) "UPDATE jobs SET priority = priority + 1 WHERE queued = 1 ORDER BY created_at ASC LIMIT 100"
 }
 
 @test
 def "dry-run update --all allows an unfiltered write" [] {
   fixture
-  assert equal (mole-mysql update users "archived = 1" --all -c mysql-local-dev --dry-run | get query) "UPDATE users SET archived = 1"
+  assert equal (mole-mysql update users archived=1 --all -c mysql-local-dev --dry-run | get query) "UPDATE users SET archived = 1"
 }
 
 # ---- delete: dry-run SQL assembly (table is the leading positional) ------------
@@ -171,7 +186,7 @@ def "dry-run delete builds the filter from predicate tokens" [] {
 @test
 def "dry-run update redacts the password and tags the mysql driver" [] {
   fixture
-  let c = (mole-mysql update t "x = 1" --where-sql "id = 1" -c mysql-local-dev --dry-run | get connection)
+  let c = (mole-mysql update t x=1 --where-sql "id = 1" -c mysql-local-dev --dry-run | get connection)
   assert equal ($c | columns | any {|x| $x == "password"}) false
   assert equal $c.driver "mysql"
 }
@@ -185,8 +200,8 @@ def "update requires at least one assignment" [] {
 @test
 def "update refuses an unfiltered write without --all" [] {
   fixture
-  assert error { mole-mysql update t "x = 1" -c mysql-local-dev --dry-run }
-  assert error { mole-mysql update t "x = 1" --where " " -c mysql-local-dev --dry-run }   # a blank --where is no filter
+  assert error { mole-mysql update t x=1 -c mysql-local-dev --dry-run }
+  assert error { mole-mysql update t x=1 --where " " -c mysql-local-dev --dry-run }   # a blank --where is no filter
   assert error { mole-mysql delete t --where "," -c mysql-local-dev --dry-run }            # nor is a bare comma
   assert error { mole-mysql delete t --where-sql " " -c mysql-local-dev --dry-run }       # nor a blank raw filter
 }
@@ -225,4 +240,94 @@ def "dry-run stats grand total distinct count the group-concat dialect aggregate
   assert equal (mole-mysql stats --from orders --by region -c mysql-local-dev --dry-run | get query) "SELECT region, count(*) AS count FROM orders GROUP BY region"
   assert error { mole-mysql stats --from orders --by region --offset 1 -c mysql-local-dev --dry-run }   # MySQL rejects a bare OFFSET
   assert error { mole-mysql stats -c mysql-local-dev --dry-run }
+}
+
+# Drive a completer through the real engine (completers are private, `@`-bound; see
+# DESIGN.md): complete the END of `line` after a `use mole-mysql` prelude in a child `nu`
+# that inherits this test's XDG overrides, and return the candidate values.
+def ide-complete [line: string]: nothing -> list<string> {
+  let f = (mktemp -t mole-ide.XXXXXX)
+  let src = $"use mole-mysql\n($line)"
+  $src | save --force $f
+  # A list-valued NU_LIB_DIRS is dropped on spawn (see run-tests.nu): hand the child a colon string.
+  let libs = ($env.NU_LIB_DIRS? | default [])
+  let libs = (if ($libs | describe) == "string" { $libs } else { $libs | str join (char esep) })
+  let out = (with-env {NU_LIB_DIRS: $libs} { ^nu --no-config-file --ide-complete ($src | encode utf8 | bytes length) $f | complete })
+  rm $f
+  $out.stdout | from json | get completions | sort
+}
+
+# ---- insert: dry-run SQL assembly + guards + completion ------------------------
+
+@test
+def "dry-run insert renders tokens by shape and pipes rows by type" [] {
+  fixture
+  assert equal (mole-mysql insert users email=ann@x.io status=active age=30 zip="01234" deleted=null -c mysql-local-dev --dry-run | get query) "INSERT INTO users (email, status, age, zip, deleted) VALUES ('ann@x.io', 'active', 30, '01234', NULL)"
+  assert equal ([{sku: A1, qty: 3} {sku: B2, qty: 0}] | mole-mysql insert stock -c mysql-local-dev --dry-run | get query) "INSERT INTO stock (sku, qty) VALUES ('A1', 3), ('B2', 0)"
+  assert equal ({sku: A1, qty: "3"} | mole-mysql insert stock -c mysql-local-dev --dry-run | get query) "INSERT INTO stock (sku, qty) VALUES ('A1', '3')"   # a typed string stays a string
+  assert equal ([{sku: A1, qty: null}] | mole-mysql insert stock src=import --values-sql {at: "now()"} -c mysql-local-dev --dry-run | get query) "INSERT INTO stock (sku, qty, src, at) VALUES ('A1', NULL, 'import', now())"
+  assert equal (mole-mysql insert events kind=login --values-sql {at: "now()"} -c mysql-local-dev --dry-run | get query) "INSERT INTO events (kind, at) VALUES ('login', now())"
+  let r = (mole-mysql insert t a=1 -c mysql-local-dev --dry-run)
+  assert equal ($r.connection | columns | any {|x| $x == "password"}) false
+}
+
+@test
+def "insert refuses nothing ragged rows clashes and non-tokens" [] {
+  fixture
+  assert error { mole-mysql insert users -c mysql-local-dev --dry-run }                                           # nothing to insert
+  assert error { [{a: 1} {b: 2}] | mole-mysql insert t -c mysql-local-dev --dry-run }                             # ragged rows
+  assert error { [{a: 1}] | mole-mysql insert t a=2 -c mysql-local-dev --dry-run }                                 # piped + token clash
+  assert error { mole-mysql insert t a=1 --values-sql {a: "2"} -c mysql-local-dev --dry-run }                      # token + expression clash
+  assert error { mole-mysql insert t "a = 1" -c mysql-local-dev --dry-run }                                       # raw SQL is not a token
+  assert error { mole-mysql insert t "a>=1" -c mysql-local-dev --dry-run }                                        # a comparison is not one
+  assert error { mole-mysql insert t a==1 -c mysql-local-dev --dry-run }                                          # operator-looking value
+  assert error { mole-mysql insert t a=1 a=2 -c mysql-local-dev --dry-run }                                       # duplicate column
+}
+
+@test
+def "insert escapes backslashes in the mysql dialect" [] {
+  fixture
+  assert equal (mole-mysql insert t p='a\b' -c mysql-local-dev --dry-run | get query) "INSERT INTO t (p) VALUES ('a\\\\b')"
+  assert equal ([{p: 'a\b'}] | mole-mysql insert t -c mysql-local-dev --dry-run | get query) "INSERT INTO t (p) VALUES ('a\\\\b')"
+}
+
+@test
+def "dry-run insert ignore and upsert in the row alias form" [] {
+  fixture
+  assert equal (mole-mysql insert users email=a@b.c --ignore -c mysql-local-dev --dry-run | get query) "INSERT IGNORE INTO users (email) VALUES ('a@b.c')"
+  assert equal (mole-mysql insert users email=a@b.c status=active --upsert -c mysql-local-dev --dry-run | get query) "INSERT INTO users (email, status) VALUES ('a@b.c', 'active') AS new ON DUPLICATE KEY UPDATE email = new.email, status = new.status"
+  assert error { mole-mysql insert users email=a --ignore --upsert -c mysql-local-dev --dry-run }
+}
+
+@test
+def "insert completes the unassigned columns of the target table" [] {
+  fixture
+  seed-schema
+  assert equal (ide-complete "mole-mysql insert -c mysql-local-dev ") ["app.users"]
+  assert equal (ide-complete "mole-mysql insert app.users -c mysql-local-dev ") ["email=" "id="]
+  assert equal (ide-complete "mole-mysql insert app.users id=x -c mysql-local-dev ") ["email="]
+  assert equal (ide-complete "mole-mysql insert app.users id=x -c mysql-local-dev em") ["email="]
+  assert equal (ide-complete "mole-mysql insert app.users -c mysql-local-dev id=") []   # a value probe against an unreachable DB yields nothing, never an error
+}
+
+# ---- update: the insert assignment grammar -----------------------------------
+
+@test
+def "dry-run update renders assignment tokens and values-sql" [] {
+  fixture
+  assert equal (mole-mysql update users status=active age=30 zip="01234" note=null --all -c mysql-local-dev --dry-run | get query) "UPDATE users SET status = 'active', age = 30, zip = '01234', note = NULL"
+  assert equal (mole-mysql update users status=active --values-sql {seen_at: "now()"} --where id=1 -c mysql-local-dev --dry-run | get query) "UPDATE users SET status = 'active', seen_at = now() WHERE id = 1"
+  assert error { mole-mysql update t "x = 1" --all -c mysql-local-dev --dry-run }                    # raw SQL is not an assignment token
+  assert error { mole-mysql update t x=1 --values-sql {x: "2"} --all -c mysql-local-dev --dry-run }   # one column, two values
+  assert error { mole-mysql update t x=1 x=2 --all -c mysql-local-dev --dry-run }                    # assigned twice
+  assert error { mole-mysql update t --all -c mysql-local-dev --dry-run }                            # nothing to set
+}
+
+@test
+def "update completes assignment tokens like insert" [] {
+  fixture
+  seed-schema
+  assert equal (ide-complete "mole-mysql update app.users -c mysql-local-dev ") ["email=" "id="]
+  assert equal (ide-complete "mole-mysql update app.users id=x -c mysql-local-dev ") ["email="]
+  assert equal (ide-complete "mole-mysql update \"app.users u\" -c mysql-local-dev ") ["email=" "id="]   # an alias is looked up by its base table
 }

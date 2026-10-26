@@ -1,7 +1,7 @@
 # mole-mariadb — MariaDB driver plugin.
 #
 # A PLUGIN (data source): registers the `mariadb` driver and exposes the user
-# verbs `raw-query` / `select` / `stats` / `schema` / `set-connection`. SIBLING of
+# verbs `raw-query` / `select` / `stats` / `insert` / `update` / `delete` / `schema` / `set-connection`. SIBLING of
 # mole-mysql: MariaDB speaks the MySQL wire protocol and the MySQL dialect, so the
 # two drivers share everything dialect-shaped through mole-myql (information_schema
 # SQL, clause renderers, the tinyint(1)→bool + numeric/date coercions) and the
@@ -123,9 +123,9 @@ def "mariadb-tables-csv" [context: string]: nothing -> list<string> {
 }
 
 # The table a line targets: `--from` (select/stats), else the leading positional of the
-# write verbs (`update <table>` / `delete <table>`); null when neither is typed yet.
+# write verbs (`insert|update|delete <table>`); null when neither is typed yet.
 def mariadb-ctx-table [context: string]: nothing -> any {
-  complete flag $context [--from -F] | default (complete lead-arg $context [update delete])
+  complete flag $context [--from -F] | default (complete lead-arg $context [insert update delete])
 }
 
 def "mariadb-column" [context: string]: nothing -> list<string> {
@@ -156,6 +156,26 @@ def ma-probe [conf: record, sql: string]: nothing -> list<string> {
 # slow / errored → nothing).
 def "mariadb-where" [context: string]: nothing -> list<any> {
   let plan = (sql where-plan (complete token $context) (mariadb-column $context) --ops (myql ops) --dialect (myql dialect) --table (mariadb-ctx-table $context))
+  if ($plan.probe? == null) { return $plan.candidates }
+  let conf = (complete conn-ctx $context "mariadb")
+  if ($conf | is-empty) { return [] }
+  (try { ma-probe $conf $plan.probe.sql } catch { [] }) | each {|v| $plan.probe.prefix + $v }
+}
+
+# The assignment-token completer of `insert` and `update` (their `...assignments` rest
+# slot). Two stages, planned by the pure `sql assign-plan`: a token without `=` offers
+# the target table's columns NOT yet assigned by the earlier tokens, as `col=`
+# (described by type, plus `required` on an insert line when NOT NULL without a
+# default); after `col=`, the column's live distinct values through the bounded probe
+# (best-effort: unreachable / errored → nothing). The target is the leading positional
+# (an update alias, `"users u"`, is looked up by its base table), the assigned set the
+# positionals after it.
+def "mariadb-assign" [context: string]: nothing -> list<any> {
+  let table = (mariadb-ctx-table $context)
+  let cols = (if ($table | is-empty) { [] } else { sql columns-for (mariadb-catalog $context) (sql base-table $table) })
+  let assigned = (complete positionals $context | skip 1 | each {|t| sql assignment-token $t | get -o col } | compact)
+  let insert = (complete lead-arg $context [insert] | is-not-empty)
+  let plan = (sql assign-plan (complete token $context) $cols --assigned $assigned --table $table --required=$insert)
   if ($plan.probe? == null) { return $plan.candidates }
   let conf = (complete conn-ctx $context "mariadb")
   if ($conf | is-empty) { return [] }
@@ -453,13 +473,93 @@ export def "stats" [
   | sql apply-agg-types $aggs
 }
 
+# Compose and run a MariaDB INSERT: one row from `col=value` tokens, or many rows
+# from a piped table, into a single table.
+#
+# Reads like the statement: `insert <table> col=value …`. The table is the leading
+# positional (completing table names); the rest positionals are `col=value` ASSIGNMENT
+# tokens — the `--where` grammar cut down to `=`, with the same literal rules: a bare
+# value is quoted by shape (`age=30` → `30`, `status=active` → `'active'`), a quoted one
+# is always a string (`zip="01234"`), `col=null` is `NULL`. The columns complete (typed,
+# `required` flagged when NOT NULL without a default) and, after `col=`, the column's
+# existing distinct values do. An EXPRESSION (`now()`, `DEFAULT`, a function call) never
+# goes through the token grammar: pass it in `--values-sql`, a record of
+# `{column: "raw sql"}` rendered verbatim.
+#
+# PIPE a table in to insert many rows in ONE statement: each record's keys are the
+# column list and its typed cells render by type (a string is always quoted, a
+# record/list is JSON, null is NULL); any tokens / `--values-sql` entries become
+# CONSTANT columns on every row. Ragged rows (differing key sets) are refused — shape
+# them in Nushell first.
+#
+# `--ignore` turns the statement into `INSERT IGNORE` (conflicting rows are skipped —
+# note IGNORE also downgrades other errors, e.g. truncation, to warnings);
+# `--upsert` appends `ON DUPLICATE KEY UPDATE c = VALUES(c)` over every inserted
+# column. It is a bare switch here, unlike the column list mole-psql/mole-duckdb take,
+# because MariaDB has no conflict target: any UNIQUE key fires. `--returning` hands
+# back columns of the inserted rows (MariaDB 10.5+), typed like a `select` result.
+# INSERT always writes, so it prompts before running (skip with `--yes`); `--dry-run`
+# returns a `{connection, query}` record without running. Connection overridable as
+# in `raw-query`.
+@category mole-mariadb
+@example "one row from tokens (columns, then existing values, complete)" {
+  mole-mariadb insert users email=ann@x.io status=active --dry-run | get query
+} --result "INSERT INTO users (email, status) VALUES ('ann@x.io', 'active')"
+@example "many rows from a piped table, in one statement" {
+  [{sku: A1, qty: 3} {sku: B2, qty: 0}] | mole-mariadb insert stock --dry-run | get query
+} --result "INSERT INTO stock (sku, qty) VALUES ('A1', 3), ('B2', 0)"
+@example "an expression value goes in --values-sql" {
+  mole-mariadb insert events kind=login --values-sql {at: "now()"} --dry-run | get query
+} --result "INSERT INTO events (kind, at) VALUES ('login', now())"
+@example "upsert: any unique key fires, every inserted column is updated" {
+  mole-mariadb insert users email=a@b.c status=active --upsert --dry-run | get query
+} --result "INSERT INTO users (email, status) VALUES ('a@b.c', 'active') ON DUPLICATE KEY UPDATE email = VALUES(email), status = VALUES(status)"
+@example "skip rows that already exist, returning the inserted ids" {
+  mole-mariadb insert users email=a@b.c --ignore --returning id --dry-run | get query
+} --result "INSERT IGNORE INTO users (email) VALUES ('a@b.c') RETURNING id"
+@example "run for real — load a CSV (prompts unless --yes)" {
+  open signups.csv | mole-mariadb insert users --ignore --returning id,email -c mariadb-local-dev --yes
+}
+export def "insert" [
+  table: string@"mariadb-table"              # target table (INSERT INTO <table>); single table, no alias
+  ...assignments: string@"mariadb-assign"        # col=value tokens: the one row, or constant columns on every piped row
+  --values-sql: record = {}                        # {column: "raw sql"}: expression values, verbatim (now(), DEFAULT, …)
+  --ignore                                         # INSERT IGNORE: skip conflicting rows (and downgrade other errors to warnings)
+  --upsert                                         # ON DUPLICATE KEY UPDATE every inserted column (a switch: any unique key fires)
+  --returning: string@"mariadb-columns-csv"    # RETURNING columns, comma-separated (MariaDB 10.5+; typed like a select result)
+  --connection(-c): string@complete-connection   # named connection (default: current)
+  --host(-h): string
+  --port(-p): int
+  --user(-u): string
+  --password(-P): string
+  --database(-d): string
+  --set: record = {}
+  --raw(-R)                                         # raw driver output for RETURNING rows: no typing, no null-normalization
+  --dry-run(-n)                                    # return a {connection, query} record instead of running
+  --yes(-y)                                         # skip the confirmation prompt
+] {
+  let parts = (sql insert-values $in --assignments $assignments --values-sql $values_sql --dialect (myql dialect))
+  if $ignore and $upsert { error make {msg: "insert: --ignore and --upsert are mutually exclusive"} }
+  let tail = (if $upsert { myql upsert-tail $parts.columns } else { "" })
+  let text = (sql build-insert --table $table --columns $parts.columns --rows $parts.values --modifier (if $ignore { "IGNORE" } else { "" }) --tail $tail --returning (complete csv $returning))
+  let conf = (ma-conf $connection $host $port $user $password $database $set)
+  if $dry_run { return {connection: ($conf | conn redact), query: $text} }
+  if (not (query confirm $"This INSERT will add ($parts.values | length) row\(s\). Run it?" --yes=$yes)) { return }
+  let out = (ma-rows $conf $text)
+  if $raw { return $out }
+  $out | sql type-rows (ma-schema-load $conf) $table (myql nulls) {|c| ma-type $c }
+}
+
 # Compose and run a single-table MariaDB UPDATE.
 #
-# Reads like the statement: `update <table> <assignment>...`. The table is the
-# leading positional (completing table names); the SET assignments follow as
-# positionals — each a verbatim `"col = expr"`, so expressions (`hits = hits + 1`,
-# `updated_at = now()`) all work; you quote identifiers and string literals
-# yourself, and their column names complete against the table. `--where`/`--where-sql` is
+# Reads like the statement: `update <table> col=value …`. The table is the leading
+# positional (completing table names); the rest positionals are `col=value`
+# ASSIGNMENT tokens, the same grammar as `insert`: a bare value is quoted by shape
+# (`age=30` → `30`, `status=active` → `'active'`), a quoted one is always a string
+# (`zip="01234"`), `col=null` is `NULL`. The columns complete and, after `col=`, the
+# column's existing distinct values do. An EXPRESSION (`hits + 1`, `now()`) never goes
+# through the token grammar: pass it in `--values-sql`, a record of
+# `{column: "raw sql"}` rendered verbatim. `--where`/`--where-sql` is
 # the same filter pair as `select`. MariaDB
 # scopes a single-table UPDATE with an
 # optional `ORDER BY ... LIMIT` (`--sort-by` / `--limit`) — the bounded-rewrite
@@ -473,20 +573,21 @@ export def "stats" [
 # flags / `--set`, as in `raw-query`.
 @category mole-mariadb
 @example "set a column on the matched rows" {
-  mole-mariadb update users "status = 'inactive'" --where-sql "id = 5" --dry-run | get query
+  mole-mariadb update users status=inactive --where-sql "id = 5" --dry-run | get query
 } --result "UPDATE users SET status = 'inactive' WHERE id = 5"
 @example "several assignments at once" {
-  mole-mariadb update users "status = 'active'" "verified = 1" --where-sql "email = 'a@b.c'" --dry-run | get query
+  mole-mariadb update users status=active verified=1 --where-sql "email = 'a@b.c'" --dry-run | get query
 } --result "UPDATE users SET status = 'active', verified = 1 WHERE email = 'a@b.c'"
 @example "bounded rewrite: ORDER BY ... LIMIT" {
-  mole-mariadb update jobs "priority = priority + 1" --where-sql "queued = 1" --sort-by created_at:asc --limit 100 --dry-run | get query
+  mole-mariadb update jobs --values-sql {priority: "priority + 1"} --where-sql "queued = 1" --sort-by created_at:asc --limit 100 --dry-run | get query
 } --result "UPDATE jobs SET priority = priority + 1 WHERE queued = 1 ORDER BY created_at ASC LIMIT 100"
 @example "guard: an unfiltered UPDATE needs --all" {
-  mole-mariadb update users "archived = 1" --all --dry-run | get query
+  mole-mariadb update users archived=1 --all --dry-run | get query
 } --result "UPDATE users SET archived = 1"
 export def "update" [
   table: string@"mariadb-table"                    # target table (UPDATE <table>); single table, an alias is allowed: "users u"
-  ...assignments: string@"mariadb-column"          # SET assignments, verbatim "col = expr" (at least one required)
+  ...assignments: string@"mariadb-assign"          # col=value tokens: the SET list (with --values-sql, at least one assignment)
+  --values-sql: record = {}                        # {column: "raw sql"}: expression values, verbatim (hits + 1, now(), …)
   --where(-w): string@"mariadb-where"              # WHERE: col<op>value token-list (comma-sep, completable)
   --where-sql: string                              # WHERE as raw SQL, verbatim — AND-joined with --where when both are given
   --sort-by(-s): string@"mariadb-sort"               # ORDER BY terms: col[:desc], comma-separated (with --limit)
@@ -502,13 +603,13 @@ export def "update" [
   --dry-run(-n)                                    # return a {connection, query} record instead of running
   --yes(-y)                                         # skip the confirmation prompt
 ] {
-  if ($assignments | is-empty) { error make {msg: "update: at least one SET assignment is required, e.g. update users \"status = 'active'\""} }
+  let sets = (sql render-assignments $assignments --values-sql $values_sql --dialect (myql dialect))
   let filter = (sql build-where $where $where_sql --dialect (myql dialect) --ops (myql ops))
   if ($filter | is-empty) and (not $all) {
     error make {msg: "update: refusing to update every row without --where/--where-sql (pass --all to override)"}
   }
   let text = (sql assemble [
-    (sql build-update --table $table --set $assignments --where ($filter | default ""))
+    (sql build-update --table $table --set $sets --where ($filter | default ""))
     (sql build-order (complete csv $sort_by))
     (sql page-clause $limit null)
   ])

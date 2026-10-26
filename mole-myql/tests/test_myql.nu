@@ -120,3 +120,13 @@ def "lock renders the legacy LOCK IN SHARE MODE and null when unset" [] {
     assert equal (myql lock "share-mode" [] false false) "LOCK IN SHARE MODE"
     assert equal (myql lock null [] false false) null
 }
+
+# ---- INSERT conflict tail -----------------------------------------------------
+
+@test
+def "upsert-tail renders on duplicate key update per engine" [] {
+    assert equal (myql upsert-tail [email status]) "ON DUPLICATE KEY UPDATE email = VALUES(email), status = VALUES(status)"
+    assert equal (myql upsert-tail [email status] --alias new) "AS new ON DUPLICATE KEY UPDATE email = new.email, status = new.status"
+    assert equal (myql upsert-tail [a] --alias r) "AS r ON DUPLICATE KEY UPDATE a = r.a"
+    assert error { myql upsert-tail [] }
+}

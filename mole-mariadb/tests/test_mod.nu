@@ -1,6 +1,7 @@
 use std/assert
 use std/testing *
 use mole-mariadb
+use mole/lib/cache.nu
 
 # Point mole at a throwaway config holding a mariadb + a mysql connection, so
 # `select` can resolve one and render dry-run SQL without a live database (and so
@@ -16,6 +17,20 @@ def --env fixture [] {
   | to yaml
   | save --force ([$d mole connections.yaml] | path join)
   $env.XDG_CONFIG_HOME = $d
+}
+
+# Seed the schema cache the driver would have built for mariadb-local-dev/app, with a real
+# `refreshed_at` so `cache fetch` serves it instead of introspecting.
+def seed-schema [] {
+  {
+    meta: {connection: mariadb-local-dev, database: app, driver: mariadb, refreshed_at: (date now)}
+    tables: [{schema: app, name: users, type: "BASE TABLE", comment: null, row_estimate: 5}]
+    columns: [
+      {schema: app, table: users, name: id,    position: 1, data_type: int,     udt_name: int,     nullable: false, default: null, char_max_length: null, numeric_precision: 10, numeric_scale: 0, comment: null, display_type: int}
+      {schema: app, table: users, name: email, position: 2, data_type: varchar, udt_name: varchar, nullable: false, default: null, char_max_length: 255, numeric_precision: null, numeric_scale: null, comment: null, display_type: "varchar(255)"}
+    ]
+    constraints: []
+  } | cache write (cache path "mariadb" "mariadb-local-dev__app")
 }
 
 # ---- dry-run SQL: MariaDB renders the identical MySQL-dialect SQL --------------
@@ -124,25 +139,25 @@ def "from is required" [] {
 @test
 def "dry-run update sets one column filtered" [] {
   fixture
-  assert equal (mole-mariadb update users "status = 'inactive'" --where-sql "id = 5" -c mariadb-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE id = 5"
+  assert equal (mole-mariadb update users status=inactive --where-sql "id = 5" -c mariadb-local-dev --dry-run | get query) "UPDATE users SET status = 'inactive' WHERE id = 5"
 }
 
 @test
 def "dry-run update joins several assignments" [] {
   fixture
-  assert equal (mole-mariadb update t "a = 1" "b = b + 1" --where-sql "id = 5" -c mariadb-local-dev --dry-run | get query) "UPDATE t SET a = 1, b = b + 1 WHERE id = 5"
+  assert equal (mole-mariadb update t a=1 --values-sql {b: "b + 1"} --where-sql "id = 5" -c mariadb-local-dev --dry-run | get query) "UPDATE t SET a = 1, b = b + 1 WHERE id = 5"
 }
 
 @test
 def "dry-run update with order-by and limit" [] {
   fixture
-  assert equal (mole-mariadb update jobs "priority = priority + 1" --where-sql "queued = 1" --sort-by created_at:asc --limit 100 -c mariadb-local-dev --dry-run | get query) "UPDATE jobs SET priority = priority + 1 WHERE queued = 1 ORDER BY created_at ASC LIMIT 100"
+  assert equal (mole-mariadb update jobs --values-sql {priority: "priority + 1"} --where-sql "queued = 1" --sort-by created_at:asc --limit 100 -c mariadb-local-dev --dry-run | get query) "UPDATE jobs SET priority = priority + 1 WHERE queued = 1 ORDER BY created_at ASC LIMIT 100"
 }
 
 @test
 def "dry-run update --all allows an unfiltered write" [] {
   fixture
-  assert equal (mole-mariadb update users "archived = 1" --all -c mariadb-local-dev --dry-run | get query) "UPDATE users SET archived = 1"
+  assert equal (mole-mariadb update users archived=1 --all -c mariadb-local-dev --dry-run | get query) "UPDATE users SET archived = 1"
 }
 
 # ---- delete: dry-run SQL assembly (table is the leading positional) ------------
@@ -171,7 +186,7 @@ def "dry-run delete builds the filter from predicate tokens" [] {
 @test
 def "dry-run update redacts the password and tags the mariadb driver" [] {
   fixture
-  let c = (mole-mariadb update t "x = 1" --where-sql "id = 1" -c mariadb-local-dev --dry-run | get connection)
+  let c = (mole-mariadb update t x=1 --where-sql "id = 1" -c mariadb-local-dev --dry-run | get connection)
   assert equal ($c | columns | any {|x| $x == "password"}) false
   assert equal $c.driver "mariadb"
 }
@@ -185,8 +200,8 @@ def "update requires at least one assignment" [] {
 @test
 def "update refuses an unfiltered write without --all" [] {
   fixture
-  assert error { mole-mariadb update t "x = 1" -c mariadb-local-dev --dry-run }
-  assert error { mole-mariadb update t "x = 1" --where " " -c mariadb-local-dev --dry-run }   # a blank --where is no filter
+  assert error { mole-mariadb update t x=1 -c mariadb-local-dev --dry-run }
+  assert error { mole-mariadb update t x=1 --where " " -c mariadb-local-dev --dry-run }   # a blank --where is no filter
   assert error { mole-mariadb delete t --where "," -c mariadb-local-dev --dry-run }            # nor is a bare comma
   assert error { mole-mariadb delete t --where-sql " " -c mariadb-local-dev --dry-run }       # nor a blank raw filter
 }
@@ -225,4 +240,95 @@ def "dry-run stats grand total distinct count the group-concat dialect aggregate
   assert equal (mole-mariadb stats --from orders --by region -c mariadb-local-dev --dry-run | get query) "SELECT region, count(*) AS count FROM orders GROUP BY region"
   assert error { mole-mariadb stats --from orders --by region --offset 1 -c mariadb-local-dev --dry-run }   # MariaDB rejects a bare OFFSET
   assert error { mole-mariadb stats -c mariadb-local-dev --dry-run }
+}
+
+# Drive a completer through the real engine (completers are private, `@`-bound; see
+# DESIGN.md): complete the END of `line` after a `use mole-mariadb` prelude in a child `nu`
+# that inherits this test's XDG overrides, and return the candidate values.
+def ide-complete [line: string]: nothing -> list<string> {
+  let f = (mktemp -t mole-ide.XXXXXX)
+  let src = $"use mole-mariadb\n($line)"
+  $src | save --force $f
+  # A list-valued NU_LIB_DIRS is dropped on spawn (see run-tests.nu): hand the child a colon string.
+  let libs = ($env.NU_LIB_DIRS? | default [])
+  let libs = (if ($libs | describe) == "string" { $libs } else { $libs | str join (char esep) })
+  let out = (with-env {NU_LIB_DIRS: $libs} { ^nu --no-config-file --ide-complete ($src | encode utf8 | bytes length) $f | complete })
+  rm $f
+  $out.stdout | from json | get completions | sort
+}
+
+# ---- insert: dry-run SQL assembly + guards + completion ------------------------
+
+@test
+def "dry-run insert renders tokens by shape and pipes rows by type" [] {
+  fixture
+  assert equal (mole-mariadb insert users email=ann@x.io status=active age=30 zip="01234" deleted=null -c mariadb-local-dev --dry-run | get query) "INSERT INTO users (email, status, age, zip, deleted) VALUES ('ann@x.io', 'active', 30, '01234', NULL)"
+  assert equal ([{sku: A1, qty: 3} {sku: B2, qty: 0}] | mole-mariadb insert stock -c mariadb-local-dev --dry-run | get query) "INSERT INTO stock (sku, qty) VALUES ('A1', 3), ('B2', 0)"
+  assert equal ({sku: A1, qty: "3"} | mole-mariadb insert stock -c mariadb-local-dev --dry-run | get query) "INSERT INTO stock (sku, qty) VALUES ('A1', '3')"   # a typed string stays a string
+  assert equal ([{sku: A1, qty: null}] | mole-mariadb insert stock src=import --values-sql {at: "now()"} -c mariadb-local-dev --dry-run | get query) "INSERT INTO stock (sku, qty, src, at) VALUES ('A1', NULL, 'import', now())"
+  assert equal (mole-mariadb insert events kind=login --values-sql {at: "now()"} -c mariadb-local-dev --dry-run | get query) "INSERT INTO events (kind, at) VALUES ('login', now())"
+  let r = (mole-mariadb insert t a=1 -c mariadb-local-dev --dry-run)
+  assert equal ($r.connection | columns | any {|x| $x == "password"}) false
+}
+
+@test
+def "insert refuses nothing ragged rows clashes and non-tokens" [] {
+  fixture
+  assert error { mole-mariadb insert users -c mariadb-local-dev --dry-run }                                           # nothing to insert
+  assert error { [{a: 1} {b: 2}] | mole-mariadb insert t -c mariadb-local-dev --dry-run }                             # ragged rows
+  assert error { [{a: 1}] | mole-mariadb insert t a=2 -c mariadb-local-dev --dry-run }                                 # piped + token clash
+  assert error { mole-mariadb insert t a=1 --values-sql {a: "2"} -c mariadb-local-dev --dry-run }                      # token + expression clash
+  assert error { mole-mariadb insert t "a = 1" -c mariadb-local-dev --dry-run }                                       # raw SQL is not a token
+  assert error { mole-mariadb insert t "a>=1" -c mariadb-local-dev --dry-run }                                        # a comparison is not one
+  assert error { mole-mariadb insert t a==1 -c mariadb-local-dev --dry-run }                                          # operator-looking value
+  assert error { mole-mariadb insert t a=1 a=2 -c mariadb-local-dev --dry-run }                                       # duplicate column
+}
+
+@test
+def "insert escapes backslashes in the mysql dialect" [] {
+  fixture
+  assert equal (mole-mariadb insert t p='a\b' -c mariadb-local-dev --dry-run | get query) "INSERT INTO t (p) VALUES ('a\\\\b')"
+  assert equal ([{p: 'a\b'}] | mole-mariadb insert t -c mariadb-local-dev --dry-run | get query) "INSERT INTO t (p) VALUES ('a\\\\b')"
+}
+
+@test
+def "dry-run insert ignore upsert in the VALUES form and returning" [] {
+  fixture
+  assert equal (mole-mariadb insert users email=a@b.c --ignore -c mariadb-local-dev --dry-run | get query) "INSERT IGNORE INTO users (email) VALUES ('a@b.c')"
+  assert equal (mole-mariadb insert users email=a@b.c status=active --upsert -c mariadb-local-dev --dry-run | get query) "INSERT INTO users (email, status) VALUES ('a@b.c', 'active') ON DUPLICATE KEY UPDATE email = VALUES(email), status = VALUES(status)"
+  assert equal (mole-mariadb insert users email=a@b.c --ignore --returning id,email -c mariadb-local-dev --dry-run | get query) "INSERT IGNORE INTO users (email) VALUES ('a@b.c') RETURNING id, email"
+  assert error { mole-mariadb insert users email=a --ignore --upsert -c mariadb-local-dev --dry-run }
+}
+
+@test
+def "insert completes the unassigned columns of the target table" [] {
+  fixture
+  seed-schema
+  assert equal (ide-complete "mole-mariadb insert -c mariadb-local-dev ") ["app.users"]
+  assert equal (ide-complete "mole-mariadb insert app.users -c mariadb-local-dev ") ["email=" "id="]
+  assert equal (ide-complete "mole-mariadb insert app.users id=x -c mariadb-local-dev ") ["email="]
+  assert equal (ide-complete "mole-mariadb insert app.users id=x -c mariadb-local-dev em") ["email="]
+  assert equal (ide-complete "mole-mariadb insert app.users -c mariadb-local-dev id=") []   # a value probe against an unreachable DB yields nothing, never an error
+}
+
+# ---- update: the insert assignment grammar -----------------------------------
+
+@test
+def "dry-run update renders assignment tokens and values-sql" [] {
+  fixture
+  assert equal (mole-mariadb update users status=active age=30 zip="01234" note=null --all -c mariadb-local-dev --dry-run | get query) "UPDATE users SET status = 'active', age = 30, zip = '01234', note = NULL"
+  assert equal (mole-mariadb update users status=active --values-sql {seen_at: "now()"} --where id=1 -c mariadb-local-dev --dry-run | get query) "UPDATE users SET status = 'active', seen_at = now() WHERE id = 1"
+  assert error { mole-mariadb update t "x = 1" --all -c mariadb-local-dev --dry-run }                    # raw SQL is not an assignment token
+  assert error { mole-mariadb update t x=1 --values-sql {x: "2"} --all -c mariadb-local-dev --dry-run }   # one column, two values
+  assert error { mole-mariadb update t x=1 x=2 --all -c mariadb-local-dev --dry-run }                    # assigned twice
+  assert error { mole-mariadb update t --all -c mariadb-local-dev --dry-run }                            # nothing to set
+}
+
+@test
+def "update completes assignment tokens like insert" [] {
+  fixture
+  seed-schema
+  assert equal (ide-complete "mole-mariadb update app.users -c mariadb-local-dev ") ["email=" "id="]
+  assert equal (ide-complete "mole-mariadb update app.users id=x -c mariadb-local-dev ") ["email="]
+  assert equal (ide-complete "mole-mariadb update \"app.users u\" -c mariadb-local-dev ") ["email=" "id="]   # an alias is looked up by its base table
 }
